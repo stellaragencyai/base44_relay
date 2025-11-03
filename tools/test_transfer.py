@@ -3,7 +3,7 @@
 import os, json, hmac, hashlib, time, uuid, requests
 from dotenv import load_dotenv, find_dotenv
 
-# --- Load ROOT .env regardless of CWD ---
+# Load ROOT .env regardless of CWD
 ENV_PATH = find_dotenv(filename=".env", usecwd=True)
 if ENV_PATH:
     load_dotenv(ENV_PATH, override=True)
@@ -20,10 +20,9 @@ SUB_UID    = (os.getenv("BYBIT_SUB_UID") or "").strip()  # optional
 BASE = "https://api-testnet.bybit.com" if NETWORK == "testnet" else "https://api.bybit.com"
 RECV_WINDOW = "20000"
 
-# One session, explicitly bypass system proxies (fixes weird 404 from local proxy placeholders)
 session = requests.Session()
-session.trust_env = False  # ignore HTTP(S)_PROXY env vars
-session.proxies = {}       # no proxy
+session.trust_env = False  # ignore system proxies
+session.proxies = {}
 
 def sign_v5(ts: str, body_json: str) -> str:
     prehash = f"{ts}{API_KEY}{RECV_WINDOW}{body_json}"
@@ -41,13 +40,12 @@ def headers(ts: str, body_json: str) -> dict:
         h["X-BAPI-SUB-ACCOUNT-UID"] = SUB_UID
     return h
 
-def get_public_time():
+def sanity():
     r = session.get(f"{BASE}/v5/market/time", timeout=15)
     print(f"[test] GET /v5/market/time → {r.status_code} {r.text[:120]}")
 
 def check_api_key():
-    ts = str(int(time.time() * 1000))
-    body = ""  # GET: empty body in signing
+    ts, body = str(int(time.time()*1000)), ""
     h = {
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-SIGN": sign_v5(ts, body),
@@ -56,24 +54,22 @@ def check_api_key():
     }
     if SUB_UID:
         h["X-BAPI-SUB-ACCOUNT-UID"] = SUB_UID
-    url = f"{BASE}/v5/user/query-api"
-    r = session.get(url, headers=h, timeout=20)
+    r = session.get(f"{BASE}/v5/user/query-api", headers=h, timeout=20)
     print(f"[test] GET /v5/user/query-api → {r.status_code} {r.text[:200]}")
 
-def transfer(coin: str, amount: float):
+def transfer_internal(coin: str, amount: float, frm="UNIFIED", to="FUND"):
     if not API_KEY or not API_SECRET:
-        print("[test/error] Missing BYBIT_API_KEY or BYBIT_API_SECRET in .env")
-        return
-    ts = str(int(time.time() * 1000))
+        print("[test/error] Missing BYBIT_API_KEY or BYBIT_API_SECRET in .env"); return
+    ts = str(int(time.time()*1000))
     payload = {
         "transferId": str(uuid.uuid4()),
         "coin": coin,
         "amount": str(amount),
-        "fromAccountType": "UNIFIED",
-        "toAccountType": "FUND"
+        "fromAccountType": frm,  # UNIFIED / SPOT / CONTRACT / OPTION / INVESTMENT / FUND
+        "toAccountType": to
     }
     body = json.dumps(payload, separators=(",", ":"))
-    url = f"{BASE}/v5/asset/transfer"
+    url = f"{BASE}/v5/asset/transfer/inter-transfer"  # <-- correct endpoint
     print(f"[test] POST {url}")
     print(f"[test] Req body: {body}")
     r = session.post(url, headers=headers(ts, body), data=body, timeout=20)
@@ -81,6 +77,7 @@ def transfer(coin: str, amount: float):
 
 if __name__ == "__main__":
     print(f"[test] network={NETWORK} base={BASE}")
-    get_public_time()     # connectivity sanity
-    check_api_key()       # key validity & perms
-    transfer("USDT", 1.0) # do a tiny transfer
+    sanity()
+    check_api_key()
+    # Try a tiny internal transfer UNIFIED -> FUND
+    transfer_internal("USDT", 1.0, "UNIFIED", "FUND")
