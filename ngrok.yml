@@ -1,0 +1,9 @@
+version: "2"
+authtoken: 34ntn4NGQUJc5VG9MODKLnYvKe6_6J4CkxFQnGo6cNqgLguYP
+region: us
+tunnels:
+  base44:
+    addr: 8080
+    proto: http
+    schemes: [https]
+    
