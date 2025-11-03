@@ -1,0 +1,88 @@
+{
+  "meta": {
+    "version": "1.0",
+    "updated": "2025-11-03"
+  },
+  "subs": {
+    "MAIN": {
+      "name": "Main",
+      "uid": "",
+      "role": "discretionary",
+      "strategy": "A0_manual",
+      "risk": {
+        "initial_risk_pct": 0.0015,
+        "daily_loss_cap_pct": 0.010,
+        "max_concurrent_initial_risk_pct": 0.06
+      },
+      "symbols": {
+        "whitelist": ["PUMPFUNUSDT", "HBARUSDT", "ADAUSDT", "SOLUSDT"],
+        "max_leverage": 75
+      },
+      "guardrails": {
+        "global_breaker_dd_pct": 0.03,
+        "news_lockout_sec": 600,
+        "funding_lockout_min": 10
+      }
+    },
+    "SUB7": {
+      "name": "Canary",
+      "uid": "",
+      "role": "canary",
+      "strategy": "A7_canary",
+      "risk": {
+        "initial_risk_pct": 0.0005,
+        "daily_loss_cap_pct": 0.008,
+        "max_concurrent_initial_risk_pct": 0.02
+      },
+      "symbols": {
+        "whitelist": ["PUMPFUNUSDT", "HBARUSDT", "DOGEUSDT"],
+        "max_leverage": 75
+      },
+      "guardrails": {
+        "global_breaker_dd_pct": 0.03,
+        "news_lockout_sec": 600,
+        "funding_lockout_min": 10
+      }
+    },
+    "SUB2": {
+      "name": "Breakout",
+      "uid": "",
+      "role": "breakout",
+      "strategy": "A2_breakout",
+      "risk": {
+        "initial_risk_pct": 0.0025,
+        "daily_loss_cap_pct": 0.012,
+        "max_concurrent_initial_risk_pct": 0.04
+      },
+      "symbols": {
+        "whitelist": ["SOLUSDT", "APTUSDT", "LINKUSDT", "PUMPFUNUSDT"],
+        "max_leverage": 50
+      },
+      "guardrails": {
+        "global_breaker_dd_pct": 0.03,
+        "news_lockout_sec": 600,
+        "funding_lockout_min": 10
+      }
+    },
+    "SUB1": {
+      "name": "Trend",
+      "uid": "",
+      "role": "trend",
+      "strategy": "A1_trend",
+      "risk": {
+        "initial_risk_pct": 0.0035,
+        "daily_loss_cap_pct": 0.012,
+        "max_concurrent_initial_risk_pct": 0.04
+      },
+      "symbols": {
+        "whitelist": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT"],
+        "max_leverage": 25
+      },
+      "guardrails": {
+        "global_breaker_dd_pct": 0.03,
+        "news_lockout_sec": 600,
+        "funding_lockout_min": 10
+      }
+    }
+  }
+}

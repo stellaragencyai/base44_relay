@@ -1,0 +1,28 @@
+name: A1_trend
+timeframes:
+  bias: "1h"
+  signal: "15m"
+  execution: "5m"
+filters:
+  adx_min: 18
+  atr_percent_min: 0.8
+  volume_zscore_min: 0.5
+entries:
+  mode: "pullback"
+  confirm_ma: "EMA50>EMA200"
+  rsi_bounds: [35, 65]
+  structure: "HHHL for longs, LHLL for shorts"
+risk:
+  per_trade_risk_pct: "{{risk.initial_risk_pct}}"
+  sl_mode: "atr"
+  sl_atr_mult: 1.5
+  trail_mode: "chandelier"
+  trail_atr_mult: 2.0
+tp:
+  ladder_count: 50
+  ladder_span_rr: [0.8, 3.0]
+  reduce_only: true
+  maker_only: true
+misc:
+  cancel_on_breaker: true
+  post_only: true

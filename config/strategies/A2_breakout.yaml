@@ -1,0 +1,27 @@
+name: A2_breakout
+timeframes:
+  bias: "1h"
+  signal: "5m"
+  execution: "1m"
+filters:
+  adx_min: 20
+  atr_percent_min: 1.0
+  volume_zscore_min: 1.0
+entries:
+  mode: "breakout"
+  trigger: "range_high/low + buffer"
+  buffer_ticks: 2
+risk:
+  per_trade_risk_pct: "{{risk.initial_risk_pct}}"
+  sl_mode: "struct"
+  sl_buffer_ticks: 3
+  trail_mode: "none"
+tp:
+  ladder_count: 50
+  ladder_span_rr: [1.0, 4.0]
+  front_load_pct: 0.35
+  reduce_only: true
+  maker_only: true
+misc:
+  cancel_on_breaker: true
+  post_only: true

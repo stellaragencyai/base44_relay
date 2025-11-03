@@ -1,0 +1,27 @@
+name: A7_canary
+timeframes:
+  bias: "30m"
+  signal: "5m"
+  execution: "1m"
+filters:
+  adx_min: 14
+  atr_percent_min: 0.5
+  volume_zscore_min: 0.0
+entries:
+  mode: "impulse-probe"
+  trigger: "micro-break with volume uptick"
+  limit_slippage_bps: 8
+risk:
+  per_trade_risk_pct: "{{risk.initial_risk_pct}}"
+  sl_mode: "atr"
+  sl_atr_mult: 1.2
+  trail_mode: "breakeven_then_none"
+  breakeven_rr: 0.7
+tp:
+  ladder_count: 20
+  ladder_span_rr: [0.6, 2.0]
+  reduce_only: true
+  maker_only: true
+misc:
+  cancel_on_breaker: true
+  post_only: true
