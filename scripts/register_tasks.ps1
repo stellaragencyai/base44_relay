@@ -132,3 +132,16 @@ foreach ($uid in $subs) {
 }
 
 Write-Host "All tasks registered/updated."
+
+# Funding & Fees Tracker — master
+$taskNameFFM = "B44_funding_fees_master"
+$innerFFM = "& { Set-Location '$BotsDir'; . '$VenvAct'; Remove-Item Env:\FF_MEMBER_ID -ErrorAction SilentlyContinue; python 'funding_fees_tracker.py' }"
+$argsFFM = "-WindowStyle Minimized -NoProfile -ExecutionPolicy Bypass -Command ""$innerFFM"""
+Register-Or-UpdateTask -TaskName $taskNameFFM -Command "powershell.exe" -Arguments $argsFFM -WorkingDirectory $BotsDir
+
+# Funding & Fees Tracker — per-sub (duplicate this block for each UID you want)
+$uid = "302355261"   # <-- replace with a real UID
+$taskNameFFS = "B44_funding_fees_sub_$uid"
+$innerFFS = "& { Set-Location '$BotsDir'; . '$VenvAct'; `\$env:FF_MEMBER_ID='$uid'; python 'funding_fees_tracker.py' }"
+$argsFFS  = "-WindowStyle Minimized -NoProfile -ExecutionPolicy Bypass -Command ""$innerFFS"""
+Register-Or-UpdateTask -TaskName $taskNameFFS -Command "powershell.exe" -Arguments $argsFFS -WorkingDirectory $BotsDir
