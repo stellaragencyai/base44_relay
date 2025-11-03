@@ -37,7 +37,7 @@ $settings = New-ScheduledTaskSettingsSet `
 
 # Register or update
 try {
-  $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+  Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null
   Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($trigLogon,$trigStartup) -Settings $settings | Out-Null
   Write-Host "Updated scheduled task '$TaskName'."
 } catch {
