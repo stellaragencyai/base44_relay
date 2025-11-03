@@ -2,14 +2,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Notifier Bot (core) — DC-safe, token-validated, env-safe
+Notifier Bot (core) — DC-safe, token-validated, env-safe, override-friendly
 
 Adds:
 - Root .env discovery via find_dotenv
+- load_dotenv(..., override=True) so .env actually wins over stale OS/session vars
 - Token regex validation + masked preview
 - getMe probe with clear diagnostics
 - Optional getUpdates fetch to help discover chat_id
-- Timezone-aware timestamps (no utcnow deprecation)
+- BOM/whitespace detector for TELEGRAM_BOT_TOKEN
+- Timezone-aware timestamps
 """
 
 from __future__ import annotations
@@ -23,16 +25,16 @@ from typing import Any, Iterable, Optional, List
 
 import requests
 
-# dotenv: load root .env reliably
+# dotenv: load root .env reliably and OVERRIDE existing env
 try:
     from dotenv import load_dotenv, find_dotenv
     _ENV_PATH = find_dotenv(filename=".env", usecwd=True)
     if _ENV_PATH:
-        load_dotenv(_ENV_PATH)
-        print(f"[notifier] Loaded .env: {_ENV_PATH}")
+        load_dotenv(_ENV_PATH, override=True)
+        print(f"[notifier] Loaded .env (override=True): {_ENV_PATH}")
     else:
-        load_dotenv()
-        print("[notifier/warn] No project .env found via find_dotenv; relying on process env.")
+        load_dotenv(override=True)
+        print("[notifier/warn] No project .env found via find_dotenv; relying on process env (override=True).")
 except Exception:
     _ENV_PATH = None
     print("[notifier/warn] python-dotenv not available; relying on process env.")
@@ -59,7 +61,6 @@ _DEFAULT_NOTIFY = (os.getenv("TELEGRAM_NOTIFY", "1") or "1") != "0"
 _MAX_RETRIES = max(0, int((os.getenv("TELEGRAM_MAX_RETRIES", "3") or "3")))
 _BACKOFF_BASE_MS = max(50, int((os.getenv("TELEGRAM_BACKOFF_BASE_MS", "400") or "400")))
 _RATE_LIMIT_TPS = max(0.1, float((os.getenv("TELEGRAM_RATE_LIMIT_TPS", "1.5") or "1.5")))
-
 _TZ = (os.getenv("TZ", "UTC") or "UTC")
 
 # ------------------------------------------------------------------------------
@@ -75,6 +76,14 @@ def _mask_token(tok: str) -> str:
 
 def _valid_token(tok: str) -> bool:
     return bool(_TOKEN_RE.match(tok))
+
+def _bom_prefix_debug(tok: str) -> str:
+    """Show code points of first/last few chars to catch BOM/garbage."""
+    if not tok:
+        return "len=0"
+    prv = [f"{ord(c):#06x}" for c in tok[:3]]
+    nxt = [f"{ord(c):#06x}" for c in tok[-3:]]
+    return f"len={len(tok)} first={prv} last={nxt}"
 
 _API_BASE = f"https://api.telegram.org/bot{_TELEGRAM_BOT_TOKEN}" if _TELEGRAM_BOT_TOKEN else "https://api.telegram.org/bot"
 
@@ -213,9 +222,10 @@ def tg_diag(verbose_updates: bool = False) -> bool:
     Returns True if token looks valid (getMe ok).
     """
     masked = _mask_token(_TELEGRAM_BOT_TOKEN)
-    _console_print("notifier/info:", f"Token preview: {masked}")
+    _console_print("notifier/info:", f"Token preview: {masked} ({_bom_prefix_debug(_TELEGRAM_BOT_TOKEN)})")
     if not _valid_token(_TELEGRAM_BOT_TOKEN):
         _console_print("notifier/error:", "Bot token format is invalid. Get a fresh token from @BotFather.")
+        _console_print("notifier/help:", "Ensure .env is UTF-8 (NO BOM) and line is exactly TELEGRAM_BOT_TOKEN=<token>")
         return False
 
     r = _get_telegram("getMe")
@@ -235,7 +245,7 @@ def tg_diag(verbose_updates: bool = False) -> bool:
         if code == 401:
             _console_print("notifier/help:", "Unauthorized: token is wrong or revoked.")
         elif code == 404:
-            _console_print("notifier/help:", "Not Found: endpoint didn’t recognize your token. Usually bad/mistyped token.")
+            _console_print("notifier/help:", "Not Found: malformed/empty token hitting wrong endpoint. Check BOM/whitespace.")
         else:
             _console_print("notifier/help:", "Fix token in .env (TELEGRAM_BOT_TOKEN) and try again.")
         return False
@@ -243,7 +253,6 @@ def tg_diag(verbose_updates: bool = False) -> bool:
     me = data.get("result", {})
     _console_print("notifier/success:", f"getMe ok. Bot: @{me.get('username')} id={me.get('id')}")
 
-    # Show chat ids we will use
     if _TELEGRAM_CHAT_IDS:
         _console_print("notifier/info:", f"Destinations: {', '.join(map(str, _TELEGRAM_CHAT_IDS))}")
     else:
@@ -258,7 +267,7 @@ def tg_diag(verbose_updates: bool = False) -> bool:
             except Exception:
                 _console_print("notifier/info:", "getUpdates returned non-JSON; skipping print.")
         else:
-            _console_print("notifier/info:", "getUpdates not available or empty (send /start to your bot, then try again).")
+            _console_print("notifier/info:", "getUpdates empty. Send /start to your bot, then try again.")
     return True
 
 # ------------------------------------------------------------------------------
@@ -277,9 +286,7 @@ def tg_send(msg: str,
             thread_id: Optional[int] = None,
             reply_to: Optional[int] = None,
             priority: str = "info") -> None:
-    """
-    Send a message to console and Telegram (if configured). Never raises upstream.
-    """
+    """Send a message to console and Telegram (if configured). Never raises upstream."""
     try:
         prefix = {
             "error": "❌",
@@ -352,9 +359,7 @@ def tg_healthcheck(name: str = "notifier") -> None:
     tg_send(f"✅ {name} alive @ { _now_iso() }", priority="success")
 
 def tg_validate(verbose_updates: bool = False) -> bool:
-    """
-    Validate token & send a test message. Returns True if at least one chat succeeded.
-    """
+    """Validate token & send a test message. Returns True if at least one chat succeeded."""
     if not tg_diag(verbose_updates=verbose_updates):
         return False
 
@@ -389,7 +394,7 @@ def tg_validate(verbose_updates: bool = False) -> bool:
                 elif "forbidden" in desc:
                     _console_print("notifier/help:", "Bot is blocked or not a member of the group/channel.")
                 elif code == 404 or "not found" in desc:
-                    _console_print("notifier/help:", "Not Found: usually a malformed token hitting the wrong endpoint.")
+                    _console_print("notifier/help:", "Not Found: usually malformed/empty token or BOM at start of line.")
                 else:
                     _console_print("notifier/help:", "See Telegram API response above for details.")
             except Exception:
