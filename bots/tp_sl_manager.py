@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 — TP/SL Manager (final)
-- Auto Stop Loss (structure-first, ATR fallback, last-resort tick buffer)
-- 5 TP Fixed-R with regime-aware grids and allocations 15/20/25/30/35
-- Spread-aware maker offset, reduce-only, post-only
-- BE after TP2, then LADDERED SL: TP3->SL to TP2, TP4->SL to TP3, TP5->SL to TP4
-- Optional multi-subaccount monitoring via SUB_UIDS
-- .env loaded explicitly from project root to avoid path issues
+Base44 — TP/SL Manager (final + 75x-ready)
+
+Enhancements in this version:
+- Optional enforcement that we only manage symbols whose maxLeverage >= min_max_leverage (default off).
+- Pulls maxLeverage from instruments info and logs why a symbol is skipped if policy is on.
+- Optional symbol_blocklist so you can exclude any tickers fast.
+- Keeps all your prior behavior:
+  - Auto Stop Loss (structure-first, ATR fallback, last-resort tick buffer)
+  - 5 TP Fixed-R with regime-aware grids and allocations 15/20/25/30/35
+  - Spread-aware maker offset, reduce-only, post-only
+  - BE after TP2, then LADDERED SL: TP3->SL to TP2, TP4->SL to TP3, TP5->SL to TP4
+  - Optional multi-subaccount monitoring via SUB_UIDS
+  - .env loaded explicitly from project root to avoid path issues
 
 Requires:
-  pip install pybit python-dotenv requests
+  pip install pybit python-dotenv requests pyyaml
 .env in repo root:
   BYBIT_API_KEY=xxxx
   BYBIT_API_SECRET=xxxx
-  BYBIT_ENV=testnet        # or mainnet
+  BYBIT_ENV=mainnet          # or testnet
   TELEGRAM_BOT_TOKEN=1234:abc   # optional
   TELEGRAM_CHAT_ID=123456       # optional
   SUB_UIDS=111111,222222        # optional CSV for subs you manually trade
+
+Optional policy to act ONLY on 75x instruments:
+  (set via .env or edit CFG below)
+    require_min_max_leverage=True
+    min_max_leverage=75
 """
 
 import os
@@ -96,9 +107,16 @@ CFG = {
     "trail_extra_be_tick_per_step": 1,
     "trail_max_be_buffer_ticks": 6,
 
+    # market/category
     "category": "linear",
-    "listen_symbols": "*",   # or list of symbols
-    "per_symbol": {}
+
+    # symbol handling
+    "listen_symbols": "*",           # "*" = all symbols the account trades
+    "symbol_blocklist": [],          # optional explicit excludes (["XYZUSDT", ...])
+
+    # NEW: leverage policy
+    "require_min_max_leverage": False,  # when True, only manage symbols whose maxLeverage >= min_max_leverage
+    "min_max_leverage": 75,
 }
 
 # ---------- env / clients ----------
@@ -106,6 +124,15 @@ BYBIT_KEY = os.getenv("BYBIT_API_KEY", "")
 BYBIT_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BYBIT_ENV = os.getenv("BYBIT_ENV", "mainnet").lower().strip()
 SUB_UIDS = [s.strip() for s in os.getenv("SUB_UIDS", "").split(",") if s.strip()]
+
+# Allow env overrides for new leverage policy
+if os.getenv("REQUIRE_MIN_MAX_LEVERAGE"):
+    CFG["require_min_max_leverage"] = os.getenv("REQUIRE_MIN_MAX_LEVERAGE", "false").strip().lower() in ("1","true","yes","on")
+if os.getenv("MIN_MAX_LEVERAGE"):
+    try:
+        CFG["min_max_leverage"] = int(os.getenv("MIN_MAX_LEVERAGE"))
+    except Exception:
+        pass
 
 if not (BYBIT_KEY and BYBIT_SECRET):
     raise SystemExit("Missing BYBIT_API_KEY/BYBIT_API_SECRET in .env at project root.")
@@ -132,12 +159,13 @@ def send_tg(msg: str):
     except Exception as e:
         log.warning(f"telegram/error: {e}")
 
-# ---------- precision ----------
+# ---------- precision / symbol meta ----------
 @dataclass
 class SymbolFilters:
     tick_size: Decimal
     step_size: Decimal
     min_order_qty: Decimal
+    max_leverage: int
 
 def get_symbol_filters(symbol: str, extra: dict) -> SymbolFilters:
     res = http.get_instruments_info(category=CFG["category"], symbol=symbol, **extra)
@@ -145,11 +173,15 @@ def get_symbol_filters(symbol: str, extra: dict) -> SymbolFilters:
     if not lst:
         raise RuntimeError(f"symbol info not found for {symbol}")
     item = lst[0]
-    return SymbolFilters(
-        Decimal(item["priceFilter"]["tickSize"]),
-        Decimal(item["lotSizeFilter"]["qtyStep"]),
-        Decimal(item["lotSizeFilter"]["minOrderQty"])
-    )
+    tick = Decimal(item["priceFilter"]["tickSize"])
+    step = Decimal(item["lotSizeFilter"]["qtyStep"])
+    minq = Decimal(item["lotSizeFilter"]["minOrderQty"])
+    lev = 0
+    try:
+        lev = int(Decimal(str(item.get("leverageFilter", {}).get("maxLeverage", "0"))))
+    except Exception:
+        lev = 0
+    return SymbolFilters(tick, step, minq, lev)
 
 def round_to_step(q: Decimal, step: Decimal) -> Decimal:
     steps = (q / step).to_integral_value(rounding=ROUND_DOWN)
@@ -370,6 +402,22 @@ def account_iter():
     for uid in SUB_UIDS:
         yield (f"sub:{uid}", {"subUid": uid})
 
+# ---------- leverage policy ----------
+def symbol_allowed_by_policy(symbol: str, extra: dict) -> Tuple[bool, Optional[str], Optional[SymbolFilters]]:
+    """Return (allowed, reason_if_blocked, filters)"""
+    if CFG["symbol_blocklist"] and symbol.upper() in {s.upper() for s in CFG["symbol_blocklist"]}:
+        return (False, "blocked by symbol_blocklist", None)
+    try:
+        filters = get_symbol_filters(symbol, extra)
+    except Exception as e:
+        return (False, f"no instrument meta: {e}", None)
+
+    if CFG["require_min_max_leverage"]:
+        need = int(CFG["min_max_leverage"])
+        if filters.max_leverage < need:
+            return (False, f"maxLeverage {filters.max_leverage} < required {need}", filters)
+    return (True, None, filters)
+
 # ---------- regime & targets ----------
 def regime_and_targets(symbol: str, entry: Decimal, stop: Decimal, side_open: str, extra: dict) -> Tuple[str, List[float], List[Decimal], Optional[float]]:
     candles = get_klines(symbol, CFG["regime_candle_tf"], CFG["regime_candle_count"], extra) if CFG["regime_enabled"] else []
@@ -391,7 +439,15 @@ def regime_and_targets(symbol: str, entry: Decimal, stop: Decimal, side_open: st
 
 # ---------- core placement ----------
 def place_5_tps_for(account_key: str, extra: dict, symbol: str, side: str, entry: Decimal, qty: Decimal, pos_idx: int):
-    filters = get_symbol_filters(symbol, extra)
+    allowed, reason, filters = symbol_allowed_by_policy(symbol, extra)
+    if not allowed:
+        log.info(f"{account_key}:{symbol} skipped by policy: {reason}")
+        send_tg(f"⏸️ {account_key}:{symbol} skipped — {reason}")
+        with STATE.lock:
+            # still track pos so we don't spam; mark as 'placed' to suppress loops
+            STATE.pos[(account_key, symbol)]["tp_placed"] = True
+        return
+
     tick, step, minq = filters.tick_size, filters.step_size, filters.min_order_qty
 
     stop = ensure_stop(symbol, side, entry, pos_idx, tick, extra)
@@ -432,7 +488,8 @@ def place_5_tps_for(account_key: str, extra: dict, symbol: str, side: str, entry
 
     alloc_str = ", ".join([f"{int(w*100)}%" for w in CFG["tp_allocations"]])
     px_str = ", ".join([str(round_price_to_tick(Decimal(p), tick)) for p in tp_prices])
-    send_tg(f"✅ {account_key}:{symbol} placed {placed}/5 TPs\nRegime:{regime}\nEntry:{entry} Stop:{stop}\nAlloc:{alloc_str}\nTPs:{px_str}")
+    extra_note = f" | maxLev≥{CFG['min_max_leverage']}" if CFG["require_min_max_leverage"] else ""
+    send_tg(f"✅ {account_key}:{symbol} placed {placed}/5 TPs{extra_note}\nRegime:{regime}\nEntry:{entry} Stop:{stop}\nAlloc:{alloc_str}\nTPs:{px_str}")
 
 def set_sl(account_key: str, extra: dict, symbol: str, pos_idx: int, new_sl: Decimal):
     try:
@@ -486,6 +543,8 @@ def load_positions_once():
                 symbol = p["symbol"]
                 if CFG["listen_symbols"] != "*" and symbol not in CFG["listen_symbols"]:
                     continue
+                if CFG["symbol_blocklist"] and symbol.upper() in {s.upper() for s in CFG["symbol_blocklist"]}:
+                    continue
                 size = Decimal(p.get("size") or "0")
                 if size == 0:
                     continue
@@ -505,11 +564,15 @@ def bootstrap_existing():
         with STATE.lock:
             keys = [k for k in STATE.pos.keys() if k[0] == acct_key]
         for _, symbol in keys:
-            with STATE.lock:
-                s = STATE.pos[(acct_key, symbol)]
-            filters = get_symbol_filters(symbol, extra)
-            ensure_stop(symbol, s["side"], Decimal(s["entry"]), s["pos_idx"], filters.tick_size, extra)
-            place_5_tps_for(acct_key, extra, symbol, s["side"], Decimal(s["entry"]), s["qty"], s["pos_idx"])
+            allowed, reason, filters = symbol_allowed_by_policy(symbol, extra)
+            if not allowed:
+                log.info(f"{acct_key}:{symbol} skipped at bootstrap by policy: {reason}")
+                with STATE.lock:
+                    STATE.pos[(acct_key, symbol)]["tp_placed"] = True
+                continue
+            tick = filters.tick_size
+            ensure_stop(symbol, STATE.pos[(acct_key, symbol)]["side"], Decimal(STATE.pos[(acct_key, symbol)]["entry"]), STATE.pos[(acct_key, symbol)]["pos_idx"], tick, extra)
+            place_5_tps_for(acct_key, extra, symbol, STATE.pos[(acct_key, symbol)]["side"], Decimal(STATE.pos[(acct_key, symbol)]["entry"]), STATE.pos[(acct_key, symbol)]["qty"], STATE.pos[(acct_key, symbol)]["pos_idx"])
 
 # ---------- WS handler ----------
 def ws_private_handler(message):
@@ -562,8 +625,14 @@ def ws_private_handler(message):
                             "tp_prices": STATE.pos.get((acct_key, symbol), {}).get("tp_prices", []),
                         }
                     if new_pos or not STATE.pos[(acct_key, symbol)]["tp_placed"]:
-                        filters = get_symbol_filters(symbol, extra)
-                        ensure_stop(symbol, side, entry, pos_idx, filters.tick_size, extra)
+                        allowed, reason, filters = symbol_allowed_by_policy(symbol, extra)
+                        if not allowed:
+                            log.info(f"{acct_key}:{symbol} skipped by policy on new/updated pos: {reason}")
+                            with STATE.lock:
+                                STATE.pos[(acct_key, symbol)]["tp_placed"] = True
+                            continue
+                        tick = filters.tick_size
+                        ensure_stop(symbol, side, entry, pos_idx, tick, extra)
                         place_5_tps_for(acct_key, extra, symbol, side, entry, size, pos_idx)
 
     except Exception as e:
@@ -571,7 +640,9 @@ def ws_private_handler(message):
 
 # ---------- main ----------
 def bootstrap():
-    send_tg("🟢 TP/SL Manager online (auto-SL, 5TP, laddered SL, multi-account).")
+    lev_note = f"(policy: maxLev≥{CFG['min_max_leverage']})" if CFG["require_min_max_leverage"] else "(policy: all symbols)"
+    send_tg(f"🟢 TP/SL Manager online {lev_note}.")
+    log.info(f"TP/SL Manager started {lev_note}")
     load_positions_once()
     bootstrap_existing()
     try:
