@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 Relay — Hardened (Flask)
+Base44 Relay — Hardened + Diagnostics (Flask)
 - Auth: Bearer or x-relay-token
 - Generic proxy: POST /bybit/proxy  (Bybit v5 only)
 - Native helpers:  GET /bybit/wallet/balance, /bybit/positions, /bybit/tickers, /bybit/subuids
 - Legacy shims:    /v1/wallet/balance, /v1/order/realtime, /v1/position/list → mapped to v5
-- Diagnostics:     /health, /heartbeat, /diag/bybit (auth sanity), /diag/time (clock check)
-- Telegram heartbeat supported
+- Diagnostics:     /health, /diag/time (clock), /diag/bybit (auth sanity), /heartbeat (TG)
 
 .env keys:
   RELAY_TOKEN=...
@@ -31,10 +30,11 @@ import json
 import hashlib
 import logging
 from typing import Optional, Tuple, Dict, Any
+
+import requests
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from dotenv import load_dotenv
-import requests
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config / Env
@@ -54,7 +54,7 @@ BYBIT_API_SECRET = (os.getenv("BYBIT_API_SECRET") or "").strip()
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID   = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
-RECV_WINDOW     = (os.getenv("BYBIT_RECV_WINDOW") or "10000").strip()  # give ourselves more headroom
+RECV_WINDOW     = (os.getenv("BYBIT_RECV_WINDOW") or "10000").strip()  # generous headroom
 TIMEOUT_S       = float(os.getenv("RELAY_TIMEOUT") or "25")
 
 if not RELAY_TOKEN:
@@ -132,7 +132,6 @@ def _canonical_query(params: Optional[dict]) -> str:
     return "&".join(pairs)
 
 def _bybit_headers(ts: str, sign: str) -> Dict[str, str]:
-    # X-BAPI-SIGN-TYPE can be sent as 2, but it’s optional for most accounts.
     return {
         "X-BAPI-API-KEY": BYBIT_API_KEY,
         "X-BAPI-SIGN": sign,
@@ -164,11 +163,12 @@ def _http_call(method: str, path: str, params: Optional[dict], body: Optional[di
     url = f"{BYBIT_BASE}{path}"
     try:
         if method == "GET":
-            # Send actual query params (requests will encode), but sign over canonical unencoded
+            # Send encoded query params on wire; sign over canonical unencoded
             r = requests.get(url, params=params or {}, headers=headers, timeout=TIMEOUT_S)
         else:
             r = requests.post(url, json=body or {}, headers=headers, timeout=TIMEOUT_S)
-        # Try JSON, otherwise return text
+
+        # Parse JSON if possible
         try:
             data = r.json()
         except Exception:
@@ -186,6 +186,7 @@ def _http_call(method: str, path: str, params: Optional[dict], body: Optional[di
                 data = {**data, **hint}
             else:
                 data = {"raw": data, **hint}
+
         return r.status_code, data
     except requests.RequestException as e:
         return 599, {"error": "request_exception", "detail": str(e)}
@@ -196,14 +197,14 @@ def bybit_proxy_internal(payload: dict) -> Dict[str, Any]:
     params = payload.get("params") or {}
     body   = payload.get("body") or {}
 
-    # call twice like your original, but only retry on transient
+    # Primary call
     status_p, body_p = _http_call(method, path, params, body)
+    # Retry only on transient-ish statuses
     if status_p in (408, 425, 429, 500, 502, 503, 504, 599):
         status_f, body_f = _http_call(method, path, params, body)
     else:
         status_f, body_f = status_p, body_p
 
-    # annotate top error
     top_error = None
     if isinstance(body_p, dict) and (body_p.get("retCode") not in (0, None)):
         top_error = "bybit_error"
@@ -236,17 +237,18 @@ def health():
         bybit_base=BYBIT_BASE,
         api_key_present=bool(BYBIT_API_KEY),
         recvWindow=RECV_WINDOW,
+        hasDiagTime=True
     )
 
 @app.get("/diag/time")
 def diag_time():
     # quick sanity for local clock skew
-    return _json_ok(localEpochMs=int(time.time() * 1000))
+    return jsonify({"ok": True, "localEpochMs": int(time.time() * 1000)})
 
 @app.get("/diag/bybit")
 @require_auth
 def diag_bybit():
-    """Cheap auth sanity: call a harmless v5 endpoint that requires a valid signature."""
+    """Auth sanity: calls a harmless v5 endpoint requiring valid signature."""
     prox = bybit_proxy_internal({
         "method": "GET",
         "path": "/v5/account/wallet-balance",
@@ -279,9 +281,7 @@ def bybit_proxy():
 @app.get("/bybit/wallet/balance")
 @require_auth
 def wallet_balance_native():
-    params = {
-        "accountType": request.args.get("accountType", "UNIFIED")
-    }
+    params = {"accountType": request.args.get("accountType", "UNIFIED")}
     coin   = request.args.get("coin")
     subUid = request.args.get("subUid")
     if coin: params["coin"] = coin
@@ -361,7 +361,7 @@ def get_equity_curve():
 @app.get("/v1/wallet/balance")
 @require_auth
 def legacy_wallet_balance():
-    # map to v5 to kill 401s on old path
+    # map to v5 to avoid 401s on old path
     params = {"accountType": request.args.get("accountType", "UNIFIED")}
     coin   = request.args.get("coin")
     subUid = request.args.get("subUid")
@@ -414,11 +414,11 @@ def compat_market_tickers_v5():
 # Entrypoint
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Single source of truth; no 8080 surprise
     host = os.getenv("RELAY_HOST", "127.0.0.1")
     try:
         port = int(os.getenv("RELAY_PORT", "5000"))
     except ValueError:
         port = 5000
     log.info(f"Starting Base44 Relay on http://{host}:{port} → {BYBIT_BASE}")
+    log.info(f"Loaded from: {os.path.abspath(__file__)}")
     app.run(host=host, port=port, debug=False)
