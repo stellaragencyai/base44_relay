@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 — TP/SL Manager (final + 75x-ready)
+Base44 — TP/SL Manager (final + breaker-aware + 75x-ready)
 
-Enhancements in this version:
-- Optional enforcement that we only manage symbols whose maxLeverage >= min_max_leverage (default off).
-- Pulls maxLeverage from instruments info and logs why a symbol is skipped if policy is on.
-- Optional symbol_blocklist so you can exclude any tickers fast.
-- Keeps all your prior behavior:
-  - Auto Stop Loss (structure-first, ATR fallback, last-resort tick buffer)
-  - 5 TP Fixed-R with regime-aware grids and allocations 15/20/25/30/35
-  - Spread-aware maker offset, reduce-only, post-only
-  - BE after TP2, then LADDERED SL: TP3->SL to TP2, TP4->SL to TP3, TP5->SL to TP4
-  - Optional multi-subaccount monitoring via SUB_UIDS
-  - .env loaded explicitly from project root to avoid path issues
+Keeps your original features:
+- Auto Stop Loss (structure-first, ATR fallback, last-resort tick buffer)
+- 5 TP Fixed-R with regime-aware grids and allocations 15/20/25/30/35
+- Spread-aware maker offset, reduce-only, post-only
+- BE after TP2, then LADDERED SL: TP3->SL to TP2, TP4->SL to TP3, TP5->SL to TP4
+- Optional multi-subaccount monitoring via SUB_UIDS
+- .env loaded explicitly from project root to avoid path issues
+
+Enhancements:
+- Breaker-aware: if `.state/risk_state.json` says breach=true, we ENSURE SL but DO NOT place new TPs.
+- Optional leverage policy: act only on symbols whose maxLeverage >= MIN_MAX_LEVERAGE (default off).
+- Optional symbol blocklist.
 
 Requires:
   pip install pybit python-dotenv requests pyyaml
@@ -26,12 +27,12 @@ Requires:
   SUB_UIDS=111111,222222        # optional CSV for subs you manually trade
 
 Optional policy to act ONLY on 75x instruments:
-  (set via .env or edit CFG below)
-    require_min_max_leverage=True
-    min_max_leverage=75
+  REQUIRE_MIN_MAX_LEVERAGE=true
+  MIN_MAX_LEVERAGE=75
 """
 
 import os
+import json
 import time
 import logging
 import threading
@@ -158,6 +159,16 @@ def send_tg(msg: str):
         )
     except Exception as e:
         log.warning(f"telegram/error: {e}")
+
+# --- breaker flag (shared with risk_daemon) ---
+_BREAKER_FILE = Path(__file__).resolve().parents[1] / ".state" / "risk_state.json"
+
+def breaker_active() -> bool:
+    try:
+        js = json.loads(_BREAKER_FILE.read_text(encoding="utf-8"))
+        return bool(js.get("breach"))
+    except Exception:
+        return False
 
 # ---------- precision / symbol meta ----------
 @dataclass
@@ -448,6 +459,15 @@ def place_5_tps_for(account_key: str, extra: dict, symbol: str, side: str, entry
             STATE.pos[(account_key, symbol)]["tp_placed"] = True
         return
 
+    # Breaker guard: ensure SL, do not place TPs
+    if breaker_active():
+        tick = filters.tick_size
+        stop = ensure_stop(symbol, side, entry, pos_idx, tick, extra)
+        with STATE.lock:
+            STATE.pos[(account_key, symbol)]["tp_placed"] = True
+        send_tg(f"⛔ {account_key}:{symbol} breaker active — SL ensured at {stop}, TPs paused.")
+        return
+
     tick, step, minq = filters.tick_size, filters.step_size, filters.min_order_qty
 
     stop = ensure_stop(symbol, side, entry, pos_idx, tick, extra)
@@ -570,6 +590,13 @@ def bootstrap_existing():
                 with STATE.lock:
                     STATE.pos[(acct_key, symbol)]["tp_placed"] = True
                 continue
+            if breaker_active():
+                tick = filters.tick_size
+                ensure_stop(symbol, STATE.pos[(acct_key, symbol)]["side"], Decimal(STATE.pos[(acct_key, symbol)]["entry"]), STATE.pos[(acct_key, symbol)]["pos_idx"], tick, extra)
+                with STATE.lock:
+                    STATE.pos[(acct_key, symbol)]["tp_placed"] = True
+                send_tg(f"⛔ {acct_key}:{symbol} breaker active — SL ensured, TPs paused.")
+                continue
             tick = filters.tick_size
             ensure_stop(symbol, STATE.pos[(acct_key, symbol)]["side"], Decimal(STATE.pos[(acct_key, symbol)]["entry"]), STATE.pos[(acct_key, symbol)]["pos_idx"], tick, extra)
             place_5_tps_for(acct_key, extra, symbol, STATE.pos[(acct_key, symbol)]["side"], Decimal(STATE.pos[(acct_key, symbol)]["entry"]), STATE.pos[(acct_key, symbol)]["qty"], STATE.pos[(acct_key, symbol)]["pos_idx"])
@@ -630,6 +657,13 @@ def ws_private_handler(message):
                             log.info(f"{acct_key}:{symbol} skipped by policy on new/updated pos: {reason}")
                             with STATE.lock:
                                 STATE.pos[(acct_key, symbol)]["tp_placed"] = True
+                            continue
+                        if breaker_active():
+                            tick = filters.tick_size
+                            ensure_stop(symbol, side, entry, pos_idx, tick, extra)
+                            with STATE.lock:
+                                STATE.pos[(acct_key, symbol)]["tp_placed"] = True
+                            send_tg(f"⛔ {acct_key}:{symbol} breaker active — SL ensured, TPs paused.")
                             continue
                         tick = filters.tick_size
                         ensure_stop(symbol, side, entry, pos_idx, tick, extra)
