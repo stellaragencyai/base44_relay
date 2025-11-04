@@ -12,7 +12,7 @@ Base44 Relay — Finalized (Flask)
 
 .env keys (same folder as this file):
   RELAY_TOKEN=...
-  ALLOWED_ORIGINS=http://localhost:3000
+  ALLOWED_ORIGINS=http://localhost:5000
   BYBIT_ENV=testnet   # or mainnet
   BYBIT_BASE=         # optional; auto-picked from BYBIT_ENV if empty
   BYBIT_API_KEY=...
