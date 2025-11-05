@@ -1,0 +1,65 @@
+{
+  "ts": 1762385417327,
+  "instruments": {
+    "ADAUSDT": {
+      "tickSize": 0.0001,
+      "lotStep": 1.0,
+      "minQty": 1.0,
+      "maxLeverage": 75.0
+    },
+    "APTUSDT": {
+      "tickSize": 0.001,
+      "lotStep": 0.01,
+      "minQty": 0.01,
+      "maxLeverage": 50.0
+    },
+    "AVAXUSDT": {
+      "tickSize": 0.001,
+      "lotStep": 0.1,
+      "minQty": 0.1,
+      "maxLeverage": 50.0
+    },
+    "BTCUSDT": {
+      "tickSize": 0.1,
+      "lotStep": 0.001,
+      "minQty": 0.001,
+      "maxLeverage": 100.0
+    },
+    "DOGEUSDT": {
+      "tickSize": 1e-05,
+      "lotStep": 1.0,
+      "minQty": 1.0,
+      "maxLeverage": 75.0
+    },
+    "ETHUSDT": {
+      "tickSize": 0.01,
+      "lotStep": 0.01,
+      "minQty": 0.01,
+      "maxLeverage": 100.0
+    },
+    "HBARUSDT": {
+      "tickSize": 1e-05,
+      "lotStep": 1.0,
+      "minQty": 1.0,
+      "maxLeverage": 75.0
+    },
+    "LINKUSDT": {
+      "tickSize": 0.001,
+      "lotStep": 0.1,
+      "minQty": 0.1,
+      "maxLeverage": 50.0
+    },
+    "PUMPFUNUSDT": {
+      "tickSize": 1e-06,
+      "lotStep": 100.0,
+      "minQty": 100.0,
+      "maxLeverage": 75.0
+    },
+    "SOLUSDT": {
+      "tickSize": 0.01,
+      "lotStep": 0.1,
+      "minQty": 0.1,
+      "maxLeverage": 100.0
+    }
+  }
+}
