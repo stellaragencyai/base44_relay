@@ -1,41 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 — TP/SL Manager (final + breaker-aware + PnL summary)
+Base44 — TP/SL Manager (final + breaker-aware + PnL summary + resilient WS)
 
-Keeps your original features:
-- Auto Stop Loss (structure-first, ATR fallback, last-resort tick buffer)
-- 5 TP Fixed-R with regime-aware grids and allocations 15/20/25/30/35
-- Spread-aware maker offset, reduce-only, post-only
-- BE after TP2, then LADDERED SL: TP3->SL to TP2, TP4->SL to TP3, TP5->SL to TP4
-- Optional multi-subaccount monitoring via SUB_UIDS
-- .env loaded explicitly from project root to avoid path issues
-
-Enhancements in this version:
-- Passes api_key/api_secret to BOTH HTTP and WebSocket (fixes UnauthorizedException on private streams).
-- Breaker-aware: if `.state/risk_state.json` has breach=true, we ENSURE SL and DO NOT place new TPs.
-- Per-rung notional + weighted average exit + total expected PnL reported to Telegram on ladder placement.
-- Safer state dir handling, better logging, minor resilience tweaks.
+What's new in this build:
+- WebSocket resilience:
+  • Explicit ping_interval=15s and ping_timeout=10s
+  • Heartbeat watchdog: if no WS message for 25s → reconnect
+  • Auto-resubscribe to order/position/execution streams
+  • Exponential backoff on repeated failures (max 60s)
+- Keeps the settleCoin fix for position listing (no more 10001)
+- Keeps PnL/avg-exit summary, breaker-awareness, regime-aware fixed-R ladder
 
 Requires:
   pip install pybit python-dotenv requests pyyaml
-
-.env in repo root:
-  BYBIT_API_KEY=xxxx
-  BYBIT_API_SECRET=xxxx
-  BYBIT_ENV=mainnet          # or testnet
-  TELEGRAM_BOT_TOKEN=1234:abc   # optional
-  TELEGRAM_CHAT_ID=123456       # optional
-  SUB_UIDS=111111,222222        # optional CSV for subs you manually trade
-
-Optional policy to act ONLY on 75x instruments:
-  REQUIRE_MIN_MAX_LEVERAGE=true
-  MIN_MAX_LEVERAGE=75
 """
 
 import os
 import json
 import time
+import math
 import logging
 import threading
 from pathlib import Path
@@ -47,24 +31,18 @@ import requests
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP, WebSocket
 
-# Increase Decimal precision for PnL sums on tiny qtys
 getcontext().prec = 28
 
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("tp5")
 
-# ---------- force-load .env from project root ----------
-# bots/tp_sl_manager.py -> parents[1] is repo root
+# ---------- env/root ----------
 REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(dotenv_path=REPO_ROOT / ".env")
 
-# ensure .state dir exists
 STATE_DIR = REPO_ROOT / ".state"
-try:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:
-    pass
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------- config ----------
 CFG = {
@@ -101,7 +79,7 @@ CFG = {
     "fallback_single_tp_when_tiny": True,
     "single_tp_level_fixed_r": 1.0,
 
-    # SL logic (auto)
+    # SL logic
     "sl_atr_mult_fallback": 1.0,
     "sl_atr_buffer": 0.2,
     "sl_kline_tf": "5",
@@ -109,28 +87,30 @@ CFG = {
     "sl_swing_lookback": 20,
     "sl_min_tick_buffer": 3,
 
-    # BE and trailing (trailing kept but laddered SL will dominate)
+    # BE and trailing
     "be_after_tp_index": 2,
     "be_buffer_ticks": 1,
-    "enable_trailing_after_be": True,
-    "trail_check_interval_sec": 1.5,
-    "trail_step_r": 0.5,
-    "trail_start_atr_mult": 0.7,
-    "trail_tighten_per_step": 0.1,
-    "trail_tighten_max_atr_mult": 1.4,
-    "trail_extra_be_tick_per_step": 1,
-    "trail_max_be_buffer_ticks": 6,
 
     # market/category
     "category": "linear",
 
     # symbol handling
-    "listen_symbols": "*",           # "*" = all symbols the account trades
-    "symbol_blocklist": [],          # optional explicit excludes (["XYZUSDT", ...])
+    "listen_symbols": "*",
+    "symbol_blocklist": [],
 
     # leverage policy
-    "require_min_max_leverage": False,  # when True, only manage symbols whose maxLeverage >= min_max_leverage
+    "require_min_max_leverage": False,
     "min_max_leverage": 75,
+
+    # Bybit settle coins to scan
+    "settle_coins": ["USDT", "USDC"],
+
+    # WS resilience
+    "ws_ping_interval": 15,
+    "ws_ping_timeout": 10,
+    "ws_silence_watchdog_secs": 25,
+    "ws_backoff_start": 2,
+    "ws_backoff_max": 60,
 }
 
 # ---------- env / clients ----------
@@ -139,7 +119,6 @@ BYBIT_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BYBIT_ENV = os.getenv("BYBIT_ENV", "mainnet").lower().strip()
 SUB_UIDS = [s.strip() for s in os.getenv("SUB_UIDS", "").split(",") if s.strip()]
 
-# Allow env overrides for leverage policy
 if os.getenv("REQUIRE_MIN_MAX_LEVERAGE"):
     CFG["require_min_max_leverage"] = os.getenv("REQUIRE_MIN_MAX_LEVERAGE", "false").strip().lower() in ("1","true","yes","on")
 if os.getenv("MIN_MAX_LEVERAGE"):
@@ -151,44 +130,32 @@ if os.getenv("MIN_MAX_LEVERAGE"):
 if not (BYBIT_KEY and BYBIT_SECRET):
     raise SystemExit("Missing BYBIT_API_KEY/BYBIT_API_SECRET in .env at project root.")
 
-# Create HTTP/WS clients with credentials
-if BYBIT_ENV == "testnet":
-    http = HTTP(testnet=True, api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
-    ws_private = WebSocket(testnet=True, channel_type="private", api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
-else:
-    http = HTTP(testnet=False, api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
-    ws_private = WebSocket(testnet=False, channel_type="private", api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
+http = HTTP(testnet=(BYBIT_ENV == "testnet"), api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
 def _tg_send(payload: dict):
+    if not (TG_TOKEN and TG_CHAT): 
+        return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json=payload,
-            timeout=6
-        )
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json=payload, timeout=6)
     except Exception as e:
         log.warning(f"telegram/error: {e}")
 
 def send_tg(msg: str):
-    if not (TG_TOKEN and TG_CHAT):
+    if not (TG_TOKEN and TG_CHAT): 
         return
     if len(msg) <= 3900:
         _tg_send({"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"})
-        return
-    # split long messages
-    parts = []
-    while msg:
-        parts.append(msg[:3900])
-        msg = msg[3900:]
-    for p in parts:
-        _tg_send({"chat_id": TG_CHAT, "text": p, "parse_mode": "HTML"})
+    else:
+        while msg:
+            chunk = msg[:3900]
+            msg = msg[3900:]
+            _tg_send({"chat_id": TG_CHAT, "text": chunk, "parse_mode": "HTML"})
 
-# --- breaker flag (shared with risk_daemon) ---
+# --- breaker flag ---
 _BREAKER_FILE = STATE_DIR / "risk_state.json"
-
 def breaker_active() -> bool:
     try:
         if not _BREAKER_FILE.exists():
@@ -388,11 +355,9 @@ def ensure_stop(symbol: str, side: str, entry: Decimal, pos_idx: int, tick: Deci
     except Exception as e:
         log.debug(f"check SL failed: {e}")
 
-    stop = compute_structure_stop(symbol, side, entry, tick, extra)
-    if stop is None:
-        stop = compute_fallback_atr_stop(symbol, side, entry, tick, extra)
-    if stop is None:
-        stop = last_resort_stop(side, entry, tick)
+    stop = compute_structure_stop(symbol, side, entry, tick, extra) \
+        or compute_fallback_atr_stop(symbol, side, entry, tick, extra) \
+        or last_resort_stop(side, entry, tick)
 
     try:
         http.set_trading_stop(category=CFG["category"], symbol=symbol, positionIdx=str(pos_idx), stopLoss=str(stop), **extra)
@@ -403,10 +368,6 @@ def ensure_stop(symbol: str, side: str, entry: Decimal, pos_idx: int, tick: Deci
 
 # ---------- PnL math ----------
 def compute_plan_stats(entry: Decimal, side: str, tp_prices: List[Decimal], sizes: List[Decimal]) -> Tuple[Decimal, Decimal, List[Tuple[Decimal, Decimal]]]:
-    """
-    Returns: (total_pnl_usdt, weighted_avg_exit, rung_stats)
-    rung_stats: list of (notional_usdt, pnl_usdt) for each rung
-    """
     total_qty = sum(sizes)
     if total_qty <= 0:
         return Decimal("0"), entry, [(Decimal("0"), Decimal("0")) for _ in sizes]
@@ -414,11 +375,8 @@ def compute_plan_stats(entry: Decimal, side: str, tp_prices: List[Decimal], size
     total_pnl = Decimal("0")
     weighted_sum = Decimal("0")
     for px, q in zip(tp_prices, sizes):
-        notional = px * q  # linear perp: notional ≈ price * qty (USDT)
-        if side == "long":
-            pnl = (px - entry) * q
-        else:
-            pnl = (entry - px) * q
+        notional = px * q
+        pnl = (px - entry) * q if side == "long" else (entry - px) * q
         rung_stats.append((notional, pnl))
         total_pnl += pnl
         weighted_sum += px * q
@@ -432,10 +390,6 @@ def place_tp(http_cli: HTTP, symbol: str, close_side: str, px: Decimal, qty: Dec
     px = px - tick * maker_ticks if close_side == "Sell" else px + tick * maker_ticks
     body = dict(
         category=CFG["category"], symbol=symbol, side=close_side, orderType="Limit",
-        qty=str(qty.normalize()), price=str(px.normalize())),
-    # build body cleanly (avoid stray commas)
-    body = dict(
-        category=CFG["category"], symbol=symbol, side=close_side, orderType="Limit",
         qty=str(qty.normalize()), price=str(px.normalize()),
         timeInForce="PostOnly" if CFG["maker_post_only"] else "GoodTillCancel",
         reduceOnly=True
@@ -446,7 +400,6 @@ def place_tp(http_cli: HTTP, symbol: str, close_side: str, px: Decimal, qty: Dec
             r = http_cli.place_order(**body, **extra)
             if r.get("retCode") == 0:
                 return True
-            # if not ok, try nudging one tick inside band
             if attempt < retries:
                 px = px - tick if close_side == "Sell" else px + tick
                 body["price"] = str(px)
@@ -459,7 +412,6 @@ def place_tp(http_cli: HTTP, symbol: str, close_side: str, px: Decimal, qty: Dec
 # ---------- state ----------
 class PositionState:
     def __init__(self):
-        # key: (account_key, symbol)
         self.pos: Dict[Tuple[str, str], Dict] = {}
         self.lock = threading.Lock()
 
@@ -478,14 +430,12 @@ class PolicyCheck:
     filters: Optional['SymbolFilters']
 
 def symbol_allowed_by_policy(symbol: str, extra: dict) -> PolicyCheck:
-    """Return a PolicyCheck with permission and filters."""
     if CFG["symbol_blocklist"] and symbol.upper() in {s.upper() for s in CFG["symbol_blocklist"]}:
         return PolicyCheck(False, "blocked by symbol_blocklist", None)
     try:
         filters = get_symbol_filters(symbol, extra)
     except Exception as e:
         return PolicyCheck(False, f"no instrument meta: {e}", None)
-
     if CFG["require_min_max_leverage"]:
         need = int(CFG["min_max_leverage"])
         if filters.max_leverage < need:
@@ -521,7 +471,6 @@ def place_5_tps_for(account_key: str, extra: dict, symbol: str, side: str, entry
             STATE.pos[(account_key, symbol)]["tp_placed"] = True
         return
 
-    # Breaker guard: ensure SL, do not place TPs
     if breaker_active():
         tick = check.filters.tick_size
         stop = ensure_stop(symbol, side, entry, pos_idx, tick, extra)
@@ -557,11 +506,10 @@ def place_5_tps_for(account_key: str, extra: dict, symbol: str, side: str, entry
         if place_tp(http, symbol, close_side, px, q, tick, extra):
             placed += 1
 
-    # compute plan stats for Telegram
     total_pnl, avg_exit, rung_stats = compute_plan_stats(entry, side, tp_prices, sizes)
     rung_lines = []
     for i, (px, q, (notional, pnl)) in enumerate(zip(tp_prices, sizes, rung_stats), start=1):
-        if q <= 0: 
+        if q <= 0:
             rung_lines.append(f"TP{i}: {px} | qty 0")
         else:
             rung_lines.append(f"TP{i}: {px} | qty {q.normalize()} | notion {notional.normalize()} | pnl {pnl.normalize()}")
@@ -618,7 +566,6 @@ def handle_tp_fill(account_key: str, extra: dict, ev: dict):
     filled_px = ev.get("avgPrice") or ev.get("execPrice") or ev.get("price")
     send_tg(f"🎯 {account_key}:{symbol} TP filled {filled_count}/5 @ {filled_px}")
 
-    # Move to BE after TP2 (once)
     if filled_count >= CFG["be_after_tp_index"]:
         with STATE.lock:
             if not s.get("be_moved"):
@@ -626,9 +573,8 @@ def handle_tp_fill(account_key: str, extra: dict, ev: dict):
                 s["be_moved"] = True
                 set_sl(account_key, extra, symbol, pos_idx, be_price)
 
-    # Laddered SL: TP3 -> SL to TP2; TP4 -> SL to TP3; TP5 -> SL to TP4
     if filled_count >= 3 and tp_prices:
-        prev_index = min(filled_count - 1, 4) - 1  # TP3->index 1, TP4->2, TP5->3
+        prev_index = min(filled_count - 1, 4) - 1
         if prev_index >= 0:
             ladder_price = Decimal(str(tp_prices[prev_index]))
             set_sl(account_key, extra, symbol, pos_idx, ladder_price)
@@ -636,28 +582,31 @@ def handle_tp_fill(account_key: str, extra: dict, ev: dict):
 # ---------- bootstrap ----------
 def load_positions_once():
     for acct_key, extra in account_iter():
-        try:
-            res = http.get_positions(category=CFG["category"], **extra)
-            arr = res.get("result", {}).get("list", [])
-            for p in arr:
-                symbol = p["symbol"]
-                if CFG["listen_symbols"] != "*" and symbol not in CFG["listen_symbols"]:
-                    continue
-                if CFG["symbol_blocklist"] and symbol.upper() in {s.upper() for s in CFG["symbol_blocklist"]}:
-                    continue
-                size = Decimal(p.get("size") or "0")
-                if size == 0:
-                    continue
-                side = "long" if p.get("side","").lower() == "buy" else "short"
-                entry = Decimal(p.get("avgPrice") or "0")
-                pos_idx = int(p.get("positionIdx") or 0)
-                with STATE.lock:
-                    STATE.pos[(acct_key, symbol)] = {
-                        "side": side, "qty": size, "entry": entry, "pos_idx": pos_idx,
-                        "tp_placed": False, "tp_filled": 0
-                    }
-        except Exception as e:
-            log.error(f"load pos {acct_key} error: {e}")
+        for coin in CFG["settle_coins"]:
+            try:
+                res = http.get_positions(category=CFG["category"], settleCoin=coin, **extra)
+                arr = res.get("result", {}).get("list", []) or []
+                for p in arr:
+                    symbol = p.get("symbol")
+                    if not symbol:
+                        continue
+                    if CFG["listen_symbols"] != "*" and symbol not in CFG["listen_symbols"]:
+                        continue
+                    if CFG["symbol_blocklist"] and symbol.upper() in {s.upper() for s in CFG["symbol_blocklist"]}:
+                        continue
+                    size = Decimal(p.get("size") or "0")
+                    if size == 0:
+                        continue
+                    side = "long" if p.get("side","").lower() == "buy" else "short"
+                    entry = Decimal(p.get("avgPrice") or "0")
+                    pos_idx = int(p.get("positionIdx") or 0)
+                    with STATE.lock:
+                        STATE.pos[(acct_key, symbol)] = {
+                            "side": side, "qty": size, "entry": entry, "pos_idx": pos_idx,
+                            "tp_placed": False, "tp_filled": 0
+                        }
+            except Exception as e:
+                log.error(f"load pos {acct_key} {coin} error: {e}")
 
 def bootstrap_existing():
     for acct_key, extra in account_iter():
@@ -679,8 +628,18 @@ def bootstrap_existing():
                 continue
             place_5_tps_for(acct_key, extra, symbol, STATE.pos[(acct_key, symbol)]["side"], Decimal(STATE.pos[(acct_key, symbol)]["entry"]), STATE.pos[(acct_key, symbol)]["qty"], STATE.pos[(acct_key, symbol)]["pos_idx"])
 
-# ---------- WS handler ----------
+# ---------- WS resilience ----------
+_last_msg_ts = 0.0
+_ws_lock = threading.Lock()
+_ws_obj: Optional[WebSocket] = None
+_stop_ws = False
+
+def _update_heartbeat():
+    global _last_msg_ts
+    _last_msg_ts = time.time()
+
 def ws_private_handler(message):
+    _update_heartbeat()
     try:
         if not isinstance(message, dict):
             return
@@ -689,7 +648,6 @@ def ws_private_handler(message):
         if not data:
             return
 
-        # Execution/order fills
         if "execution" in topic or "order" in topic:
             for ev in data:
                 symbol = ev.get("symbol")
@@ -697,14 +655,12 @@ def ws_private_handler(message):
                 reduce_only = str(ev.get("reduceOnly", "")).lower()
                 if not (("filled" in status or "trade" in status) and ("true" in reduce_only or reduce_only == "")):
                     continue
-                # Deliver to all accounts tracking this symbol
                 with STATE.lock:
                     accounts = [ak for (ak, sym) in STATE.pos.keys() if sym == symbol]
                 for acct_key in accounts:
                     extra = {} if acct_key == "main" else {"subUid": acct_key.split(":")[1]}
                     handle_tp_fill(acct_key, extra, ev)
 
-        # Position updates
         if "position" in topic:
             for p in data:
                 symbol = p.get("symbol")
@@ -748,25 +704,127 @@ def ws_private_handler(message):
     except Exception as e:
         log.error(f"ws handler error: {e}")
 
+def _spawn_ws():
+    """Create and subscribe the private WS with auth and ping settings."""
+    global _ws_obj
+    with _ws_lock:
+        _ws_obj = WebSocket(
+            testnet=(BYBIT_ENV == "testnet"),
+            channel_type="private",
+            api_key=BYBIT_KEY,
+            api_secret=BYBIT_SECRET,
+            ping_interval=CFG["ws_ping_interval"],
+            ping_timeout=CFG["ws_ping_timeout"]
+        )
+        _update_heartbeat()
+        _ws_obj.order_stream(callback=ws_private_handler)
+        _ws_obj.position_stream(callback=ws_private_handler)
+        _ws_obj.execution_stream(callback=ws_private_handler)
+        log.info("Subscribed to private streams.")
+
+def _close_ws():
+    global _ws_obj
+    with _ws_lock:
+        try:
+            if _ws_obj and hasattr(_ws_obj, "exit"):
+                _ws_obj.exit()  # pybit provides .exit() to close threads
+        except Exception:
+            pass
+        _ws_obj = None
+
+def _ws_watchdog():
+    """Background thread that restarts WS if no messages arrive for N seconds."""
+    backoff = CFG["ws_backoff_start"]
+    while not _stop_ws:
+        now = time.time()
+        silent = now - _last_msg_ts if _last_msg_ts else 0
+        if silent > CFG["ws_silence_watchdog_secs"]:
+            log.error("WS silent too long; reconnecting...")
+            _close_ws()
+            try:
+                _spawn_ws()
+                backoff = CFG["ws_backoff_start"]  # reset on success
+            except Exception as e:
+                log.error(f"WS respawn failed: {e}")
+                sleep_for = min(backoff, CFG["ws_backoff_max"])
+                time.sleep(sleep_for)
+                backoff = min(CFG["ws_backoff_max"], max(backoff * 2, CFG["ws_backoff_start"]))
+                continue
+        time.sleep(1.0)
+
+# ---------- bootstrap ----------
+def load_positions_once():
+    for acct_key, extra in account_iter():
+        for coin in CFG["settle_coins"]:
+            try:
+                res = http.get_positions(category=CFG["category"], settleCoin=coin, **extra)
+                arr = res.get("result", {}).get("list", []) or []
+                for p in arr:
+                    symbol = p.get("symbol")
+                    if not symbol:
+                        continue
+                    if CFG["listen_symbols"] != "*" and symbol not in CFG["listen_symbols"]:
+                        continue
+                    if CFG["symbol_blocklist"] and symbol.upper() in {s.upper() for s in CFG["symbol_blocklist"]}:
+                        continue
+                    size = Decimal(p.get("size") or "0")
+                    if size == 0:
+                        continue
+                    side = "long" if p.get("side","").lower() == "buy" else "short"
+                    entry = Decimal(p.get("avgPrice") or "0")
+                    pos_idx = int(p.get("positionIdx") or 0)
+                    with STATE.lock:
+                        STATE.pos[(acct_key, symbol)] = {
+                            "side": side, "qty": size, "entry": entry, "pos_idx": pos_idx,
+                            "tp_placed": False, "tp_filled": 0
+                        }
+            except Exception as e:
+                log.error(f"load pos {acct_key} {coin} error: {e}")
+
+def bootstrap_existing():
+    for acct_key, extra in account_iter():
+        with STATE.lock:
+            keys = [k for k in STATE.pos.keys() if k[0] == acct_key]
+        for _, symbol in keys:
+            check = symbol_allowed_by_policy(symbol, extra)
+            if not check.allowed:
+                log.info(f"{acct_key}:{symbol} skipped at bootstrap by policy: {check.reason}")
+                with STATE.lock:
+                    STATE.pos[(acct_key, symbol)]["tp_placed"] = True
+                continue
+            tick = check.filters.tick_size
+            ensure_stop(symbol, STATE.pos[(acct_key, symbol)]["side"], Decimal(STATE.pos[(acct_key, symbol)]["entry"]), STATE.pos[(acct_key, symbol)]["pos_idx"], tick, extra)
+            if breaker_active():
+                with STATE.lock:
+                    STATE.pos[(acct_key, symbol)]["tp_placed"] = True
+                send_tg(f"⛔ {acct_key}:{symbol} breaker active — SL ensured, TPs paused.")
+                continue
+            place_5_tps_for(acct_key, extra, symbol, STATE.pos[(acct_key, symbol)]["side"], Decimal(STATE.pos[(acct_key, symbol)]["entry"]), STATE.pos[(acct_key, symbol)]["qty"], STATE.pos[(acct_key, symbol)]["pos_idx"])
+
 # ---------- main ----------
 def bootstrap():
-    lev_note = f"(policy: maxLev≥{CFG['min_max_leverage']})" if CFG["require_min_max_leverage"] else "(policy: all symbols)"
-    send_tg(f"🟢 TP/SL Manager online {lev_note}.")
-    log.info(f"TP/SL Manager started {lev_note}")
+    send_tg("🟢 TP/SL Manager online.")
+    log.info("TP/SL Manager started (policy: all symbols)")
+
     load_positions_once()
     bootstrap_existing()
+
+    # start WS + watchdog
+    _spawn_ws()
+    t = threading.Thread(target=_ws_watchdog, name="ws-watchdog", daemon=True)
+    t.start()
+
+    # idle loop
     try:
-        ws_private.order_stream(callback=ws_private_handler)
-        ws_private.position_stream(callback=ws_private_handler)
-        ws_private.execution_stream(callback=ws_private_handler)
-        log.info("Subscribed to private streams.")
-    except Exception as e:
-        log.error(f"WS subscribe error: {e}")
-    while True:
-        time.sleep(5)
+        while True:
+            time.sleep(5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        global _stop_ws
+        _stop_ws = True
+        _close_ws()
+        log.info("Shutting down.")
 
 if __name__ == "__main__":
-    try:
-        bootstrap()
-    except KeyboardInterrupt:
-        log.info("Shutting down.")
+    bootstrap()
