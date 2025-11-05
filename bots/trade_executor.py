@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 trade_executor.py — risk-based entries via relay (DRY by default), maker-first, window-gated, cooldowned.
+Now with global breaker enforcement.
 
 ENV (existing + new knobs):
   EXECUTOR_RELAY_BASE=http://127.0.0.1:5000   # or https ngrok URL
@@ -10,7 +11,7 @@ ENV (existing + new knobs):
   LOG_LEVEL=INFO|DEBUG
   SIGNAL_DIR=signals
 
-  # New safety/behavior knobs
+  # Safety/behavior knobs
   EXEC_RISK_PCT=0.15                           # % equity risk per trade (0.15 = 0.15%)
   EXEC_MAX_LEVERAGE=50                         # hard cap on notional/equity
   EXEC_MAKER_TICKS=2                           # price shading in ticks for PostOnly
@@ -20,9 +21,8 @@ ENV (existing + new knobs):
   EXEC_ALLOW_SHORTS=true                       # enable short entries
   EQUITY_COIN=USDT                             # which wallet coin to read for equity
 
-Signals file format (observed.jsonl):
-  Each line: {"symbol":"BTCUSDT","signal":"LONG|LONG_BREAKOUT|SHORT|...","params":{"stop_dist":0.006,"spread_max_bps":8,"maker_only":true}}
-  - stop_dist is optional (fraction of price). If absent, we use 0.5 × ATR(14)/price fallback via last price (relay ATR not required).
+  # NEW
+  EXEC_ENFORCE_BREAKER=true                    # refuse entries when breaker is ON
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 # Project modules
 import core.relay_client as rc
 from core.instruments import load_or_fetch, round_price, round_qty
+from core import breaker  # NEW: global breaker
 
 # Optional Telegram notifier
 try:
@@ -51,7 +52,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SIGDIR = ROOT / (os.getenv("SIGNAL_DIR") or "signals")
 QUEUE = SIGDIR / "observed.jsonl"
 
-# New knobs
+# Knobs
 def _env_bool(k: str, default: bool) -> bool:
     v = (os.getenv(k, str(int(default))) or "").strip().lower()
     return v in {"1","true","yes","on"}
@@ -68,15 +69,17 @@ def _env_float(k: str, default: float) -> float:
     except Exception:
         return default
 
-EXEC_RISK_PCT      = _env_float("EXEC_RISK_PCT", 0.15)      # percent of equity risk per trade
-EXEC_MAX_LEVERAGE  = _env_int("EXEC_MAX_LEVERAGE", 50)
-EXEC_MAKER_TICKS   = _env_int("EXEC_MAKER_TICKS", 2)
-EXEC_COOLDOWN_SEC  = _env_int("EXEC_COOLDOWN_SEC", 300)
-EXEC_ALLOW_SHORTS  = _env_bool("EXEC_ALLOW_SHORTS", True)
-EQUITY_COIN        = os.getenv("EQUITY_COIN", "USDT") or "USDT"
-TZ                 = os.getenv("TZ", "America/Phoenix") or "America/Phoenix"
-TW_START           = os.getenv("EXEC_TRADING_START", "00:00")
-TW_END             = os.getenv("EXEC_TRADING_END", "23:59")
+EXEC_RISK_PCT       = _env_float("EXEC_RISK_PCT", 0.15)      # percent of equity risk per trade
+EXEC_MAX_LEVERAGE   = _env_int("EXEC_MAX_LEVERAGE", 50)
+EXEC_MAKER_TICKS    = _env_int("EXEC_MAKER_TICKS", 2)
+EXEC_COOLDOWN_SEC   = _env_int("EXEC_COOLDOWN_SEC", 300)
+EXEC_ALLOW_SHORTS   = _env_bool("EXEC_ALLOW_SHORTS", True)
+EXEC_ENFORCE_BREAKER= _env_bool("EXEC_ENFORCE_BREAKER", True)   # NEW
+
+EQUITY_COIN         = os.getenv("EQUITY_COIN", "USDT") or "USDT"
+TZ                  = os.getenv("TZ", "America/Phoenix") or "America/Phoenix"
+TW_START            = os.getenv("EXEC_TRADING_START", "00:00")
+TW_END              = os.getenv("EXEC_TRADING_END", "23:59")
 
 # Cooldown memory (per run)
 _LAST_TRADE_TS = defaultdict(float)
@@ -113,12 +116,9 @@ def _in_trading_window() -> bool:
 def _atr14_pct_fallback(symbol: str, last: float) -> float:
     """
     Cheap ATR% fallback without pulling full kline:
-    - Query best bid/ask over a few cycles would be ideal, but relay keeps it simple.
-    - Use a static small swing if last is valid; you can wire a proper ATR endpoint later.
     """
     if last <= 0:
-        return 0.005  # 0.5% as a very conservative default
-    # pretend ATR% ~ 0.8% on liquid majors, 1.2% on alts; crude but better than zero
+        return 0.005  # 0.5% as a conservative default
     if symbol.upper().startswith(("BTC", "ETH")):
         return 0.008
     return 0.012
@@ -167,6 +167,14 @@ def place_entry(symbol, side, qty, price=None, order_tag="B44"):
     return rc.proxy("POST", "/v5/order/create", body=body)
 
 def run():
+    # NEW: breaker gate
+    if EXEC_ENFORCE_BREAKER and breaker.is_active():
+        st = breaker.status()
+        reason = (st.get("reason") or "").strip()
+        log.warning(f"breaker active; executor standing down (reason: {reason})")
+        tg_send(f"🛑 EXEC paused — breaker active • reason: {reason}", priority="warn")
+        return
+
     if not _in_trading_window():
         log.info(f"outside trading window {TW_START}-{TW_END} local; skipping this pass")
         return
@@ -196,7 +204,11 @@ def run():
     instr = load_or_fetch(sorted(list(syms)))
 
     # equity
-    equity = rc.equity_unified(coin=EQUITY_COIN) if hasattr(rc, "equity_unified") else rc.equity_unified()
+    try:
+        equity = rc.equity_unified(coin=EQUITY_COIN)
+    except TypeError:
+        # old signature
+        equity = rc.equity_unified()
     if equity <= 0:
         log.warning(f"equity=0 or fetch failed; using 10 {EQUITY_COIN} as dummy base")
         equity = 10.0
@@ -303,7 +315,7 @@ def run():
         msg = (
             f"✅ EXEC {mode} • {sym} {side.upper()} "
             f"{qty} @ {price if price else 'MKT'} • "
-            f"risk {EXEC_RISK_PCT:.2f}% of {EQUITY_COIN}≈{risk_cash:.2f} • "
+            f"risk {EXEC_RISK_PCT:.2f}% of {EQUITY_COIN}≈{(equity * (EXEC_RISK_PCT/100.0)):.2f} • "
             f"spr {spr_bps:.1f}bps • lev≤{EXEC_MAX_LEVERAGE}x"
         )
         if res and isinstance(res, dict) and res.get("ok") is True and res.get("dry"):
@@ -320,5 +332,8 @@ def run():
 
 if __name__ == "__main__":
     base = os.getenv('EXECUTOR_RELAY_BASE') or os.getenv('RELAY_BASE') or 'http://127.0.0.1:5000'
-    log.info(f"executor LIVE={LIVE} relay={base} window={TW_START}-{TW_END} risk={EXEC_RISK_PCT:.2f}% lev≤{EXEC_MAX_LEVERAGE}x")
+    log.info(
+        f"executor LIVE={LIVE} relay={base} window={TW_START}-{TW_END} "
+        f"risk={EXEC_RISK_PCT:.2f}% lev≤{EXEC_MAX_LEVERAGE}x breaker_enforced={EXEC_ENFORCE_BREAKER}"
+    )
     run()
