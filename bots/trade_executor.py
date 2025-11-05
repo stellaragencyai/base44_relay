@@ -13,8 +13,9 @@ ENV:
 
 import os, json, time, logging, pathlib, math
 from dotenv import load_dotenv
-from core import relay_client
+from core.relay_client import *
 from core.instruments import load_or_fetch, round_price, round_qty
+
 
 load_dotenv()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
