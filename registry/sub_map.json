@@ -1,13 +1,36 @@
 {
   "meta": {
-    "version": "1.0",
-    "updated": "2025-11-03"
+    "version": "1.1",
+    "updated": "2025-11-04",
+    "notes": "All *_pct are FRACTIONS (0.0015 = 0.15%). Use uid or uid_label. uid_book provides authoritative name→uid mapping."
+  },
+  "uid_book": {
+    "sniper 42": "260417078",
+    "AJ Account": "152304954",
+    "xdxdx": "302355261",
+    "Mikecoehn2023": "65986659",
+    "alexcarson2023": "65986592",
+    "DJ Account": "152499802"
+  },
+  "defaults": {
+    "account_type": "UNIFIED",
+    "enabled": true,
+    "maker_only": true,
+    "spread_max_bps": 8,
+    "order_tag": "B44",
+    "guardrails": {
+      "global_breaker_dd_pct": 0.03,
+      "news_lockout_sec": 600,
+      "funding_lockout_min": 10
+    }
   },
   "subs": {
     "MAIN": {
       "name": "Main",
       "uid": "",
+      "uid_label": "Main Account",
       "role": "discretionary",
+      "enabled": true,
       "strategy": "A0_manual",
       "risk": {
         "initial_risk_pct": 0.0015,
@@ -18,6 +41,9 @@
         "whitelist": ["PUMPFUNUSDT", "HBARUSDT", "ADAUSDT", "SOLUSDT"],
         "max_leverage": 75
       },
+      "maker_only": true,
+      "spread_max_bps": 8,
+      "order_tag": "B44",
       "guardrails": {
         "global_breaker_dd_pct": 0.03,
         "news_lockout_sec": 600,
@@ -27,7 +53,9 @@
     "SUB7": {
       "name": "Canary",
       "uid": "",
+      "uid_label": "sniper 42",
       "role": "canary",
+      "enabled": true,
       "strategy": "A7_canary",
       "risk": {
         "initial_risk_pct": 0.0005,
@@ -38,6 +66,9 @@
         "whitelist": ["PUMPFUNUSDT", "HBARUSDT", "DOGEUSDT"],
         "max_leverage": 75
       },
+      "maker_only": true,
+      "spread_max_bps": 8,
+      "order_tag": "B44",
       "guardrails": {
         "global_breaker_dd_pct": 0.03,
         "news_lockout_sec": 600,
@@ -47,7 +78,9 @@
     "SUB2": {
       "name": "Breakout",
       "uid": "",
+      "uid_label": "AJ Account",
       "role": "breakout",
+      "enabled": true,
       "strategy": "A2_breakout",
       "risk": {
         "initial_risk_pct": 0.0025,
@@ -58,6 +91,9 @@
         "whitelist": ["SOLUSDT", "APTUSDT", "LINKUSDT", "PUMPFUNUSDT"],
         "max_leverage": 50
       },
+      "maker_only": true,
+      "spread_max_bps": 8,
+      "order_tag": "B44",
       "guardrails": {
         "global_breaker_dd_pct": 0.03,
         "news_lockout_sec": 600,
@@ -67,7 +103,9 @@
     "SUB1": {
       "name": "Trend",
       "uid": "",
+      "uid_label": "DJ Account",
       "role": "trend",
+      "enabled": true,
       "strategy": "A1_trend",
       "risk": {
         "initial_risk_pct": 0.0035,
@@ -78,6 +116,9 @@
         "whitelist": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT"],
         "max_leverage": 25
       },
+      "maker_only": true,
+      "spread_max_bps": 8,
+      "order_tag": "B44",
       "guardrails": {
         "global_breaker_dd_pct": 0.03,
         "news_lockout_sec": 600,
