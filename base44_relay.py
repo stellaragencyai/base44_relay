@@ -2,11 +2,25 @@
 # -*- coding: utf-8 -*-
 """
 Base44 Relay — Hardened + Diagnostics (Flask)
-- Auth: Bearer or x-relay-token
-- Generic proxy: POST /bybit/proxy  (Bybit v5 only)
-- Native helpers:  GET /bybit/wallet/balance, /bybit/positions, /bybit/tickers, /bybit/subuids
-- Legacy shims:    /v1/wallet/balance, /v1/order/realtime, /v1/position/list → mapped to v5
-- Diagnostics:     /health, /diag/time (clock), /diag/bybit (auth sanity), /heartbeat (TG)
+
+- Auth: Bearer or x-relay-token (also ?token= for quick curls)
+- Generic proxy:        POST /bybit/proxy      (Bybit v5 only; signed)
+- Native helpers:       GET  /bybit/wallet/balance
+                        GET  /bybit/positions
+                        GET  /bybit/tickers
+                        GET  /bybit/subuids
+- Base44 helpers:       GET  /getAccountData   ← ALWAYS returns an ARRAY of accounts
+                        GET  /getEquityCurve
+- Legacy shims:         GET  /v1/wallet/balance
+                        GET  /v1/order/realtime
+                        GET  /v1/position/list
+                        GET  /v5/position/list  (compat)
+                        GET  /v5/market/tickers (compat)
+- Diagnostics:          GET  /health
+                        GET  /diag/time
+                        GET  /diag/bybit       (auth sanity)
+                        GET  /heartbeat        (TG ping)
+                        GET  /diag/telegram    (verifies token + recent chat IDs)
 
 .env keys:
   RELAY_TOKEN=...
@@ -15,21 +29,25 @@ Base44 Relay — Hardened + Diagnostics (Flask)
   BYBIT_BASE=        # optional; auto-picked from BYBIT_ENV if empty
   BYBIT_API_KEY=...
   BYBIT_API_SECRET=...
-  BYBIT_RECV_WINDOW=10000
+  BYBIT_RECV_WINDOW=20000
   RELAY_TIMEOUT=25
   TELEGRAM_BOT_TOKEN=...
   TELEGRAM_CHAT_ID=...
-  RELAY_HOST=127.0.0.1
-  RELAY_PORT=5000
+  RELAY_HOST=0.0.0.0
+  RELAY_PORT=8080
 """
+
+from __future__ import annotations
 
 import os
 import time
 import hmac
 import json
+import csv
 import hashlib
 import logging
-from typing import Optional, Tuple, Dict, Any
+from pathlib import Path
+from typing import Optional, Tuple, Dict, Any, List
 
 import requests
 from flask import Flask, request, jsonify, make_response
@@ -41,6 +59,7 @@ from dotenv import load_dotenv
 # ──────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 
+ROOT             = Path(__file__).resolve().parent
 RELAY_TOKEN      = (os.getenv("RELAY_TOKEN") or "").strip()
 ALLOWED_ORIGINS  = [o.strip() for o in (os.getenv("ALLOWED_ORIGINS") or "").split(",") if o.strip()]
 BYBIT_ENV        = (os.getenv("BYBIT_ENV") or "mainnet").strip().lower()
@@ -54,7 +73,7 @@ BYBIT_API_SECRET = (os.getenv("BYBIT_API_SECRET") or "").strip()
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID   = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
-RECV_WINDOW     = (os.getenv("BYBIT_RECV_WINDOW") or "10000").strip()  # generous headroom
+RECV_WINDOW     = (os.getenv("BYBIT_RECV_WINDOW") or "20000").strip()
 TIMEOUT_S       = float(os.getenv("RELAY_TIMEOUT") or "25")
 
 if not RELAY_TOKEN:
@@ -65,7 +84,7 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 app = Flask(__name__)
 CORS(app, origins=ALLOWED_ORIGINS or ["*"])
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("base44_relay")
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -89,6 +108,15 @@ def tg_send(text: str):
         )
     except Exception:
         pass
+
+def _tg_get_updates() -> Dict[str, Any]:
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "no_token"}
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates", timeout=10)
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 def _get_token_from_request() -> Optional[str]:
     # Accept either Bearer or x-relay-token; also ?token= for quick tests
@@ -117,8 +145,6 @@ def require_auth(func):
 # ──────────────────────────────────────────────────────────────────────────────
 # Bybit signing / request helpers (v5)
 # ──────────────────────────────────────────────────────────────────────────────
-
-
 def _canonical_query(params: Optional[dict]) -> str:
     if not params:
         return ""
@@ -141,10 +167,7 @@ def _bybit_headers(ts: str, sign: str) -> Dict[str, str]:
 
 def _sign_payload(method: str, params: Optional[dict], body: Optional[dict]) -> Tuple[str, str]:
     """Return (timestamp_ms, signature) for v5.
-    prehash = f"{ts}{api_key}{recv_window}{query_string_or_body}"
-    GET → use canonical query string
-    POST → use compact JSON string ({} if empty)
-    """
+    prehash = f"{ts}{api_key}{recv_window}{query_string_or_body}"""
     ts = str(int(time.time() * 1000))
     if method.upper() == "GET":
         payload_str = _canonical_query(params)
@@ -162,18 +185,17 @@ def _http_call(method: str, path: str, params: Optional[dict], body: Optional[di
     url = f"{BYBIT_BASE}{path}"
     try:
         if method == "GET":
-            # Send encoded query params on wire; sign over canonical unencoded
             r = requests.get(url, params=params or {}, headers=headers, timeout=TIMEOUT_S)
+        elif method == "DELETE":
+            r = requests.delete(url, json=body or {}, headers=headers, timeout=TIMEOUT_S)
         else:
             r = requests.post(url, json=body or {}, headers=headers, timeout=TIMEOUT_S)
 
-        # Parse JSON if possible
         try:
             data = r.json()
         except Exception:
             data = r.text
 
-        # Helpful mapping for 401s
         if r.status_code == 401:
             hint = {
                 "hint": "Bybit 401: check API key/secret, IP allowlist, permissions; ensure v5 signing and correct endpoint.",
@@ -196,9 +218,7 @@ def bybit_proxy_internal(payload: dict) -> Dict[str, Any]:
     params = payload.get("params") or {}
     body   = payload.get("body") or {}
 
-    # Primary call
     status_p, body_p = _http_call(method, path, params, body)
-    # Retry only on transient-ish statuses
     if status_p in (408, 425, 429, 500, 502, 503, 504, 599):
         status_f, body_f = _http_call(method, path, params, body)
     else:
@@ -226,6 +246,34 @@ def _passthrough_primary(prox: Dict[str, Any]):
     return resp
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Registry helpers for sub accounts
+# ──────────────────────────────────────────────────────────────────────────────
+def _load_sub_uids() -> List[str]:
+    p = ROOT / "registry" / "sub_uids.csv"
+    out: List[str] = []
+    if p.exists():
+        with p.open("r", newline="", encoding="utf-8") as f:
+            for row in csv.reader(f):
+                if not row:
+                    continue
+                cand = (row[0] or "").strip()
+                if cand and cand.isdigit():
+                    out.append(cand)
+    return out
+
+def _pretty_name(uid: str) -> str:
+    mp = ROOT / "registry" / "sub_map.json"
+    if mp.exists():
+        try:
+            js = json.loads(mp.read_text(encoding="utf-8"))
+            nm = (js.get(uid) or {}).get("name") or (js.get(uid) or {}).get("label")
+            if nm:
+                return nm
+        except Exception:
+            pass
+    return f"sub:{uid}"
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Routes
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -241,13 +289,11 @@ def health():
 
 @app.get("/diag/time")
 def diag_time():
-    # quick sanity for local clock skew
     return jsonify({"ok": True, "localEpochMs": int(time.time() * 1000)})
 
 @app.get("/diag/bybit")
 @require_auth
 def diag_bybit():
-    """Auth sanity: calls a harmless v5 endpoint requiring valid signature."""
     prox = bybit_proxy_internal({
         "method": "GET",
         "path": "/v5/account/wallet-balance",
@@ -255,13 +301,31 @@ def diag_bybit():
     })
     return _passthrough_primary(prox)
 
-@app.post("/heartbeat")
 @app.get("/heartbeat")
 @require_auth
 def heartbeat():
-    note = request.args.get("note") or (request.get_json(silent=True) or {}).get("note") or "heartbeat"
+    note = request.args.get("note") or "heartbeat"
     tg_send(f"💓 Base44 Relay heartbeat — {note}")
     return _json_ok(message="sent")
+
+@app.get("/diag/telegram")
+@require_auth
+def diag_telegram():
+    """Quick check: shows recent chat_ids seen by the bot so you can copy the right one."""
+    data = _tg_get_updates()
+    chats = []
+    try:
+        for upd in data.get("result", []):
+            msg = upd.get("message") or upd.get("channel_post") or {}
+            chat = msg.get("chat") or {}
+            cid = chat.get("id")
+            title = chat.get("title")
+            uname = chat.get("username")
+            if cid:
+                chats.append({"chat_id": cid, "title": title, "username": uname})
+    except Exception:
+        pass
+    return _json_ok(ok=data.get("ok", False), chats=chats)
 
 # ---- Generic proxy (v5 only) ----
 @app.post("/bybit/proxy")
@@ -282,9 +346,10 @@ def bybit_proxy():
 def wallet_balance_native():
     params = {"accountType": request.args.get("accountType", "UNIFIED")}
     coin   = request.args.get("coin")
-    subUid = request.args.get("subUid")
+    # Bybit v5 uses memberId for sub accounts on many endpoints
+    member = request.args.get("memberId") or request.args.get("subUid")
     if coin: params["coin"] = coin
-    if subUid: params["subUid"] = subUid
+    if member: params["memberId"] = member
     prox = bybit_proxy_internal({"method": "GET", "path": "/v5/account/wallet-balance", "params": params})
     return _passthrough_primary(prox)
 
@@ -293,9 +358,11 @@ def wallet_balance_native():
 def positions_native():
     params = {"category": request.args.get("category", "linear")}
     symbol = request.args.get("symbol")
-    subUid = request.args.get("subUid")
+    settle = request.args.get("settleCoin") or request.args.get("settle") or "USDT"
+    member = request.args.get("memberId") or request.args.get("subUid")
     if symbol: params["symbol"] = symbol
-    if subUid: params["subUid"] = subUid
+    if settle: params["settleCoin"] = settle
+    if member: params["memberId"] = member
     prox = bybit_proxy_internal({"method": "GET", "path": "/v5/position/list", "params": params})
     return _passthrough_primary(prox)
 
@@ -304,9 +371,7 @@ def positions_native():
 def tickers_native():
     params = {"category": request.args.get("category", "linear")}
     symbol = request.args.get("symbol")
-    subUid = request.args.get("subUid")
     if symbol: params["symbol"] = symbol
-    if subUid: params["subUid"] = subUid
     prox = bybit_proxy_internal({"method": "GET", "path": "/v5/market/tickers", "params": params})
     return _passthrough_primary(prox)
 
@@ -327,19 +392,60 @@ def bybit_subuids():
         return _json_err(502, "bybit_error", proxy=prox)
     return _json_ok(source="user/query-sub-members", sub_uids=uids)
 
-# ---- Base44 helper routes ----
-@app.route("/getAccountData", methods=["GET", "POST"])   # ← allow POST to avoid 405 from dashboard
+# ---- Base44 helpers ----
+@app.route("/getAccountData", methods=["GET", "POST"])
 @require_auth
 def get_account_data():
-    prox = bybit_proxy_internal({
-        "method": "GET",
-        "path": "/v5/account/wwallet-balance".replace("wwallet", "wallet"),  # guard against accidental dup
-        "params": {"accountType": "UNIFIED"},
-    })
-    body = prox.get("primary", {}).get("body", {}) or {}
-    return _json_ok(account=body)
+    """
+    Returns an ARRAY of accounts, always.
+    Each item: { uid, label, accountType, equity, walletBalance, unrealisedPnl }
+    Includes main, plus any registry/ sub_uids.csv if present.
+    """
+    coin = request.args.get("coin", "USDT")
+    account_type = request.args.get("accountType", "UNIFIED")
 
-@app.route("/getEquityCurve", methods=["GET", "POST"])  # ← allow POST as well
+    accounts = []
+
+    # main
+    params = {"accountType": account_type, "coin": coin}
+    d_main = bybit_proxy_internal({"method": "GET", "path": "/v5/account/wallet-balance", "params": params})
+    body_m = d_main.get("primary", {}).get("body", {}) or {}
+    lst_m  = (((body_m.get("result") or {}).get("list")) or [])
+    if lst_m:
+        r = lst_m[0]
+        accounts.append({
+            "uid": "main",
+            "label": "main",
+            "accountType": account_type,
+            "equity": float(r.get("totalEquity") or 0),
+            "walletBalance": float(r.get("walletBalance") or 0),
+            "unrealisedPnl": float(r.get("unrealisedPnl") or 0),
+        })
+
+    # subs (optional)
+    for uid in _load_sub_uids():
+        params = {"accountType": account_type, "coin": coin, "memberId": uid}
+        d_sub = bybit_proxy_internal({"method": "GET", "path": "/v5/account/wallet-balance", "params": params})
+        body_s = d_sub.get("primary", {}).get("body", {}) or {}
+        lst_s  = (((body_s.get("result") or {}).get("list")) or [])
+        if lst_s:
+            r = lst_s[0]
+            accounts.append({
+                "uid": uid,
+                "label": _pretty_name(uid),
+                "accountType": account_type,
+                "equity": float(r.get("totalEquity") or 0),
+                "walletBalance": float(r.get("walletBalance") or 0),
+                "unrealisedPnl": float(r.get("unrealisedPnl") or 0),
+            })
+
+    # normalize to array, always
+    if not isinstance(accounts, list):
+        accounts = [accounts] if accounts else []
+
+    return jsonify(accounts), 200
+
+@app.route("/getEquityCurve", methods=["GET", "POST"])
 @require_auth
 def get_equity_curve():
     prox = bybit_proxy_internal({
@@ -360,12 +466,11 @@ def get_equity_curve():
 @app.get("/v1/wallet/balance")
 @require_auth
 def legacy_wallet_balance():
-    # map to v5 to avoid 401s on old path
     params = {"accountType": request.args.get("accountType", "UNIFIED")}
     coin   = request.args.get("coin")
-    subUid = request.args.get("subUid")
+    member = request.args.get("memberId") or request.args.get("subUid")
     if coin: params["coin"] = coin
-    if subUid: params["subUid"] = subUid
+    if member: params["memberId"] = member
     prox = bybit_proxy_internal({"method": "GET", "path": "/v5/account/wallet-balance", "params": params})
     return _passthrough_primary(prox)
 
@@ -383,7 +488,11 @@ def legacy_order_realtime():
 def legacy_position_list_v1():
     params = {"category": request.args.get("category", "linear")}
     symbol = request.args.get("symbol")
+    settle = request.args.get("settleCoin") or "USDT"
+    member = request.args.get("memberId") or request.args.get("subUid")
     if symbol: params["symbol"] = symbol
+    if settle: params["settleCoin"] = settle
+    if member: params["memberId"] = member
     prox = bybit_proxy_internal({"method": "GET", "path": "/v5/position/list", "params": params})
     return _passthrough_primary(prox)
 
@@ -392,9 +501,11 @@ def legacy_position_list_v1():
 def compat_position_list_v5():
     params = {"category": request.args.get("category", "linear")}
     symbol = request.args.get("symbol")
-    subUid = request.args.get("subUid")
+    settle = request.args.get("settleCoin") or "USDT"
+    member = request.args.get("memberId") or request.args.get("subUid")
     if symbol: params["symbol"] = symbol
-    if subUid: params["subUid"] = subUid
+    if settle: params["settleCoin"] = settle
+    if member: params["memberId"] = member
     prox = bybit_proxy_internal({"method": "GET", "path": "/v5/position/list", "params": params})
     return _passthrough_primary(prox)
 
@@ -403,9 +514,7 @@ def compat_position_list_v5():
 def compat_market_tickers_v5():
     params = {"category": request.args.get("category", "linear")}
     symbol = request.args.get("symbol")
-    subUid = request.args.get("subUid")
     if symbol: params["symbol"] = symbol
-    if subUid: params["subUid"] = subUid
     prox = bybit_proxy_internal({"method": "GET", "path": "/v5/market/tickers", "params": params})
     return _passthrough_primary(prox)
 
@@ -413,11 +522,11 @@ def compat_market_tickers_v5():
 # Entrypoint
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    host = os.getenv("RELAY_HOST", "127.0.0.1")
+    host = os.getenv("RELAY_HOST", "0.0.0.0")
     try:
-        port = int(os.getenv("RELAY_PORT", "5000"))
+        port = int(os.getenv("RELAY_PORT", "8080"))
     except ValueError:
-        port = 5000
+        port = 8080
     log.info(f"Starting Base44 Relay on http://{host}:{port} → {BYBIT_BASE}")
     log.info(f"Loaded from: {os.path.abspath(__file__)}")
     app.run(host=host, port=port, debug=False)
