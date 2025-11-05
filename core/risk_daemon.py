@@ -1,4 +1,3 @@
-# core/risk_daemon.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
@@ -19,17 +18,21 @@ except Exception:
     from core.env_bootstrap import *  # loads config/.env automatically
 
 """
-Base44 Risk Daemon (v1.5)
+Base44 Risk Daemon (v1.8)
 
-- Tracks daily equity per sub-account (UNIFIED) and alerts on drawdown breach.
-- Optional auto-flatten (cancel all + reduce-only market closes).
-- Persists daily anchors on disk; publishes breaker state JSON for other bots.
-- EWMA smoothing + hysteresis; startup grace; optional CSV.
+What’s new vs your v1.5:
+- Respects a MANUAL breaker: if .state/risk_state.json has {"breach": true}, we act as breached.
+- Symbol whitelist/blacklist enforcement via config/trade_guard.json:
+    • allowed_symbols (if non-empty) is the only list we may hold
+    • blocked_symbols always forbidden
+    • optional auto-close on violation (env toggle), reduce-only market
+- Always-ensure-SL: if a position has no SL, we set a last-resort SL with a tiny tick buffer.
+- Keeps your EWMA/hysteresis, daily anchors, notifier integration, and Base44 proxy flow.
 
-.env knobs
+.env knobs (kept + added)
   RISK_POLL_SEC=30
   RISK_MAX_DD_PCT=3.0
-  RISK_AUTOFIX=false
+  RISK_AUTOFIX=false                 # on breach: cancel-all + flatten
   RISK_AUTOFIX_DRY_RUN=true
   RISK_NOTIFY_EVERY_MIN=10
   RISK_STARTUP_GRACE_SEC=15
@@ -37,11 +40,21 @@ Base44 Risk Daemon (v1.5)
   RISK_BREACH_HYSTERESIS_PCT=0.3
   RISK_LOG_CSV=
   RISK_STATE_DIR=.state
+
+  # NEW — whitelist controls
+  TRADE_GUARD_PATH=config/trade_guard.json
+  ENFORCE_WHITELIST=true
+  RISK_CLOSE_ON_VIOLATION=false      # if true, reduce-only market close on violation (honors DRY_RUN)
+
+Behavior notes
+- On ANY breach (manual or DD), we write {"breach": true, ...} back to the breaker JSON and (if AUTOFIX) cancel & flatten.
+- We ensure SL before any potential flatten/violation logic, so you’re not naked even if flatten fails.
 """
 
 import os, json, time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, ROUND_DOWN
 
 # Prefer notifier_bot’s tg_send; fall back to base44_client; console if all else fails
 def _resolve_tg_send():
@@ -51,7 +64,7 @@ def _resolve_tg_send():
             return _nb.tg_send
     except Exception:
         try:
-            import notifier_bot as _nb
+            import notifier_bot as _nb  # type: ignore
             if hasattr(_nb, "tg_send"):
                 return _nb.tg_send
         except Exception:
@@ -62,7 +75,7 @@ def _resolve_tg_send():
             return _b44.tg_send
     except Exception:
         try:
-            import base44_client as _b44
+            import base44_client as _b44  # type: ignore
             if hasattr(_b44, "tg_send"):
                 return _b44.tg_send
         except Exception:
@@ -111,10 +124,15 @@ EWMA_ALPHA             = _getf("RISK_EWMA_ALPHA", 0.25)
 HYSTERESIS_PCT         = _getf("RISK_BREACH_HYSTERESIS_PCT", 0.3)
 CSV_PATH               = os.getenv("RISK_LOG_CSV", "").strip()
 STATE_DIR              = Path(os.getenv("RISK_STATE_DIR", ".state"))
+TRADE_GUARD_PATH       = Path(os.getenv("TRADE_GUARD_PATH", "config/trade_guard.json"))
+ENFORCE_WHITELIST      = _getb("ENFORCE_WHITELIST", True)
+CLOSE_ON_VIOLATION     = _getb("RISK_CLOSE_ON_VIOLATION", False)
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 ANCHORS_PATH = STATE_DIR / "risk_anchors.json"
 BREAKER_PATH = STATE_DIR / "risk_state.json"
+
+CATEGORY = "linear"
 
 # ─────────── State ───────────
 anchors: dict[str, float] = {}
@@ -137,6 +155,14 @@ def _save_anchors(day: str, anchors_map: dict[str, float]) -> None:
         ANCHORS_PATH.write_text(json.dumps({"day": day, "anchors": anchors_map}, indent=2), encoding="utf-8")
     except Exception as e:
         print(f"[risk_daemon] warn: persist anchors: {e}")
+
+def _read_breaker() -> dict:
+    if not BREAKER_PATH.exists():
+        return {}
+    try:
+        return json.loads(BREAKER_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 def _write_breaker(is_breached: bool, details: dict | None = None) -> None:
     payload = {
@@ -162,7 +188,7 @@ def _total_equity_from_resp(resp: dict) -> float | None:
         return None
 
 def _cancel_all_orders(uid: str) -> tuple[bool, str]:
-    payload = {"category": "linear", "memberId": uid}
+    payload = {"category": CATEGORY, "memberId": uid}
     r = bybit_proxy("POST", "/v5/order/cancel-all", body=payload)
     ok = r.get("retCode") in (0, "0")
     return ok, f"cancel-all retCode={r.get('retCode')}"
@@ -181,11 +207,12 @@ def _flatten_positions(uid: str) -> str:
             symbol = p.get("symbol")
             side = p.get("side")
             size = p.get("size")
-            if not symbol or not size: continue
+            if not symbol or not size: 
+                continue
             qty = str(size)
             close_side = "Sell" if side == "Buy" else "Buy"
             body = {
-                "category": "linear",
+                "category": CATEGORY,
                 "symbol": symbol,
                 "side": close_side,
                 "orderType": "Market",
@@ -198,7 +225,7 @@ def _flatten_positions(uid: str) -> str:
             else:
                 r = bybit_proxy("POST", "/v5/order/create", body=body)
                 msgs.append(f"{symbol}:{side}->{close_side} qty {qty} retCode={r.get('retCode')}")
-                time.sleep(0.15)
+                time.sleep(0.12)
         except Exception as e:
             msgs.append(f"{p.get('symbol') or '?'}: exception {e}")
     return " | ".join(msgs) if msgs else "no actionable positions"
@@ -211,10 +238,53 @@ def _maybe_alert(uid: str, text: str, priority: str = "warn") -> None:
     tg_send(text, priority=priority)
     last_alert[uid] = now
 
+# ---- Last-resort SL ensure (via proxy) ----
+def _round_to_tick(p: Decimal, tick: Decimal) -> Decimal:
+    steps = (p / tick).quantize(Decimal("1."), rounding=ROUND_DOWN)
+    return steps * tick
+
+def _instrument_meta(symbol: str) -> tuple[Decimal, Decimal]:
+    r = bybit_proxy("GET", "/v5/market/instruments-info", params={"category": CATEGORY, "symbol": symbol})
+    lst = (r.get("result") or {}).get("list") or []
+    if not lst:
+        raise RuntimeError(f"instrument meta not found: {symbol}")
+    tick = Decimal(lst[0]["priceFilter"]["tickSize"])
+    step = Decimal(lst[0]["lotSizeFilter"]["qtyStep"])
+    return tick, step
+
+def _ensure_stop(uid: str, symbol: str, side: str, entry: float | int | str, pos_idx: int) -> None:
+    try:
+        r = bybit_proxy("GET", "/v5/position/list", params={"category": CATEGORY, "symbol": symbol, "memberId": uid})
+        lst = (r.get("result") or {}).get("list") or []
+        if lst and (Decimal(str(lst[0].get("stopLoss") or "0")) > 0):
+            return
+        tick, _ = _instrument_meta(symbol)
+        entry_d = Decimal(str(entry))
+        # 3-tick buffer
+        if side == "Buy":
+            sl = _round_to_tick(entry_d - tick * Decimal(3), tick)
+        else:
+            sl = _round_to_tick(entry_d + tick * Decimal(3), tick)
+        body = {"category": CATEGORY, "symbol": symbol, "positionIdx": str(pos_idx), "stopLoss": str(sl), "memberId": uid}
+        bybit_proxy("POST", "/v5/position/trading-stop", body=body)
+        tg_send(f"🛑 SL ensured for {symbol} at {sl}", priority="info")
+    except Exception as e:
+        print(f"[ensure_stop] {symbol} error: {e}")
+
+# ─────────── Whitelist ───────────
+def _load_trade_guard() -> tuple[set[str], set[str]]:
+    try:
+        js = json.loads(TRADE_GUARD_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return set(), set()
+    allowed = {s.upper() for s in (js.get("allowed_symbols") or [])}
+    blocked = {s.upper() for s in (js.get("blocked_symbols") or [])}
+    return allowed, blocked
+
 # ─────────── Core actions ───────────
-def _handle_breach(uid: str, label: str, dd_pct: float, eq_now: float) -> None:
-    _write_breaker(True, {"uid": uid, "label": label, "dd_pct": dd_pct, "equity": eq_now})
-    msg = f"🧯 RISK BREACH — {label}\nDD {dd_pct:.2f}% ≥ {MAX_DD_PCT:.2f}% • Eq {eq_now:.4f}\nAUTOFIX={AUTOFIX} DRY_RUN={DRY_RUN}"
+def _handle_breach(uid: str, label: str, dd_pct: float, eq_now: float, reason: str) -> None:
+    _write_breaker(True, {"uid": uid, "label": label, "dd_pct": dd_pct, "equity": eq_now, "reason": reason})
+    msg = f"🧯 RISK BREACH — {label}\nReason: {reason}\nDD {dd_pct:.2f}% ≥ {MAX_DD_PCT:.2f}% • Eq {eq_now:.4f}\nAUTOFIX={AUTOFIX} DRY_RUN={DRY_RUN}"
     print(msg)
     _maybe_alert(uid, msg, priority="error")
 
@@ -263,16 +333,22 @@ def main():
                 tg_send(f"🕛 New UTC day {day}: reset risk anchors.", priority="info")
 
             any_breach = False
+            allowed, blocked = _load_trade_guard() if ENFORCE_WHITELIST else (set(), set())
+
+            # Manual breaker check
+            cur_break = _read_breaker()
+            manual_breach = bool(cur_break.get("breach"))
 
             for uid in uids:
                 label = pretty_name(uid, name_map)
+
+                # Equity + DD
                 bal = get_balance_unified(uid)
                 eq_raw = _total_equity_from_resp(bal)
                 if eq_raw is None:
                     print(f"[{label}] equity fetch err retCode={bal.get('retCode')} msg={bal.get('retMsg')}")
                     continue
 
-                # Init anchor if missing
                 if uid not in anchors or anchors[uid] is None:
                     anchors[uid] = eq_raw
                     _save_anchors(current_day, anchors)
@@ -284,28 +360,88 @@ def main():
                 equity_ewma[uid] = e_now
 
                 anchor = anchors[uid]
-                if anchor <= 0:
-                    continue
+                dd_pct_smoothed = (max(0.0, anchor - e_now) / anchor) * 100.0 if anchor > 0 else 0.0
 
-                dd_pct_raw = (max(0.0, anchor - eq_raw) / anchor) * 100.0
-                dd_pct = (max(0.0, anchor - e_now) / anchor) * 100.0  # smoothed
-
-                print(f"[{label}] eq {eq_raw:.6f} (ewma {e_now:.6f}) • anchor {anchor:.6f} • DD {dd_pct:.2f}%")
+                print(f"[{label}] eq {eq_raw:.6f} (ewma {e_now:.6f}) • anchor {anchor:.6f} • DD {dd_pct_smoothed:.2f}%")
 
                 in_grace = (time.time() - boot_ts) < STARTUP_GRACE_SEC
-                threshold = MAX_DD_PCT
-                clear_level = max(0.0, MAX_DD_PCT - HYSTERESIS_PCT)
+                threshold  = MAX_DD_PCT
+                clear_lvl  = max(0.0, MAX_DD_PCT - HYSTERESIS_PCT)
 
-                if not in_grace and dd_pct >= threshold:
+                # Positions
+                pos = get_positions_linear(uid)
+                rows = (pos.get("result") or {}).get("list") or []
+
+                # Ensure SL on all open positions
+                for p in rows:
+                    try:
+                        symbol = p.get("symbol")
+                        side = p.get("side")
+                        entry = p.get("avgPrice")
+                        pos_idx = int(p.get("positionIdx") or 0)
+                        size = float(p.get("size") or 0)
+                        if not symbol or size <= 0: 
+                            continue
+                        _ensure_stop(uid, symbol, side, entry, pos_idx)
+                    except Exception as e:
+                        print(f"[{label}] ensure_stop error: {e}")
+
+                # Whitelist enforcement
+                if ENFORCE_WHITELIST and rows:
+                    for p in rows:
+                        symbol = (p.get("symbol") or "").upper()
+                        size   = float(p.get("size") or 0)
+                        side   = p.get("side") or "Buy"
+                        if size <= 0 or not symbol:
+                            continue
+
+                        allowed_ok = True
+                        if allowed:
+                            allowed_ok = symbol in allowed
+                        if symbol in blocked:
+                            allowed_ok = False
+
+                        if not allowed_ok:
+                            reason = f"whitelist violation ({symbol})"
+                            _maybe_alert(uid, f"⚠️ {label}: {reason}", priority="warn")
+                            if CLOSE_ON_VIOLATION:
+                                if DRY_RUN:
+                                    tg_send(f"[DRY] {label}: would close {symbol} due to {reason}", priority="warn")
+                                else:
+                                    # reduce-only market
+                                    close_side = "Sell" if side == "Buy" else "Buy"
+                                    body = {
+                                        "category": CATEGORY,
+                                        "symbol": symbol,
+                                        "side": close_side,
+                                        "orderType": "Market",
+                                        "qty": str(p.get("size")),
+                                        "reduceOnly": True,
+                                        "memberId": uid
+                                    }
+                                    r = bybit_proxy("POST", "/v5/order/create", body=body)
+                                    tg_send(f"❌ {label}: closed {symbol} for {reason} retCode={r.get('retCode')}", priority="warn")
+
+                # Breach logic: manual or DD
+                breached_now = False
+                if manual_breach:
+                    breached_now = True
                     any_breach = True
-                    _handle_breach(uid, label, dd_pct, eq_raw)
-                elif dd_pct <= clear_level:
-                    # clear region — nothing to do (kept for future "recovered" logic)
+                    _handle_breach(uid, label, dd_pct_smoothed, eq_raw, reason="manual")
+
+                elif not in_grace and dd_pct_smoothed >= threshold:
+                    breached_now = True
+                    any_breach = True
+                    _handle_breach(uid, label, dd_pct_smoothed, eq_raw, reason="drawdown")
+
+                # Hysteresis clear handled globally below
+                if not breached_now and dd_pct_smoothed <= clear_lvl:
+                    # considered in "clear region" for this uid
                     pass
 
             if any_breach:
-                # already written per-UID in _handle_breach
-                pass
+                # already written per-UID in _handle_breach; ensure file reflects breach
+                _write_breaker(True, {"note": "active breach across one or more UIDs"})
             else:
                 _maybe_clear_breaker()
 
