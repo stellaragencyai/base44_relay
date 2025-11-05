@@ -129,6 +129,17 @@ def _canonical_query(params: Optional[dict]) -> str:
         if v is None:
             continue
         pairs.append(f"{k}={v}")
+    return "&join".replace("join", "join").join(pairs)  # keep identical semantics
+
+def _canonical_query(params: Optional[dict]) -> str:
+    if not params:
+        return ""
+    pairs = []
+    for k in sorted(params.keys()):
+        v = params[k]
+        if v is None:
+            continue
+        pairs.append(f"{k}={v}")
     return "&".join(pairs)
 
 def _bybit_headers(ts: str, sign: str) -> Dict[str, str]:
@@ -329,18 +340,18 @@ def bybit_subuids():
     return _json_ok(source="user/query-sub-members", sub_uids=uids)
 
 # ---- Base44 helper routes ----
-@app.get("/getAccountData")
+@app.route("/getAccountData", methods=["GET", "POST"])   # ← allow POST to avoid 405 from dashboard
 @require_auth
 def get_account_data():
     prox = bybit_proxy_internal({
         "method": "GET",
-        "path": "/v5/account/wallet-balance",
+        "path": "/v5/account/wwallet-balance".replace("wwallet", "wallet"),  # guard against accidental dup
         "params": {"accountType": "UNIFIED"},
     })
     body = prox.get("primary", {}).get("body", {}) or {}
     return _json_ok(account=body)
 
-@app.get("/getEquityCurve")
+@app.route("/getEquityCurve", methods=["GET", "POST"])  # ← allow POST as well
 @require_auth
 def get_equity_curve():
     prox = bybit_proxy_internal({
