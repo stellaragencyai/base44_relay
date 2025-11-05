@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 — TP/SL Manager (final + breaker-aware + 75x-ready)
+Base44 — TP/SL Manager (final + breaker-aware + PnL summary)
 
 Keeps your original features:
 - Auto Stop Loss (structure-first, ATR fallback, last-resort tick buffer)
@@ -11,13 +11,15 @@ Keeps your original features:
 - Optional multi-subaccount monitoring via SUB_UIDS
 - .env loaded explicitly from project root to avoid path issues
 
-Enhancements:
-- Breaker-aware: if `.state/risk_state.json` says breach=true, we ENSURE SL but DO NOT place new TPs.
-- Optional leverage policy: act only on symbols whose maxLeverage >= MIN_MAX_LEVERAGE (default off).
-- Optional symbol blocklist.
+Enhancements in this version:
+- Passes api_key/api_secret to BOTH HTTP and WebSocket (fixes UnauthorizedException on private streams).
+- Breaker-aware: if `.state/risk_state.json` has breach=true, we ENSURE SL and DO NOT place new TPs.
+- Per-rung notional + weighted average exit + total expected PnL reported to Telegram on ladder placement.
+- Safer state dir handling, better logging, minor resilience tweaks.
 
 Requires:
   pip install pybit python-dotenv requests pyyaml
+
 .env in repo root:
   BYBIT_API_KEY=xxxx
   BYBIT_API_SECRET=xxxx
@@ -37,7 +39,7 @@ import time
 import logging
 import threading
 from pathlib import Path
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, getcontext
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 
@@ -45,13 +47,24 @@ import requests
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP, WebSocket
 
+# Increase Decimal precision for PnL sums on tiny qtys
+getcontext().prec = 28
+
 # ---------- logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("tp5")
 
 # ---------- force-load .env from project root ----------
 # bots/tp_sl_manager.py -> parents[1] is repo root
-load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(dotenv_path=REPO_ROOT / ".env")
+
+# ensure .state dir exists
+STATE_DIR = REPO_ROOT / ".state"
+try:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 
 # ---------- config ----------
 CFG = {
@@ -115,7 +128,7 @@ CFG = {
     "listen_symbols": "*",           # "*" = all symbols the account trades
     "symbol_blocklist": [],          # optional explicit excludes (["XYZUSDT", ...])
 
-    # NEW: leverage policy
+    # leverage policy
     "require_min_max_leverage": False,  # when True, only manage symbols whose maxLeverage >= min_max_leverage
     "min_max_leverage": 75,
 }
@@ -126,7 +139,7 @@ BYBIT_SECRET = os.getenv("BYBIT_API_SECRET", "")
 BYBIT_ENV = os.getenv("BYBIT_ENV", "mainnet").lower().strip()
 SUB_UIDS = [s.strip() for s in os.getenv("SUB_UIDS", "").split(",") if s.strip()]
 
-# Allow env overrides for new leverage policy
+# Allow env overrides for leverage policy
 if os.getenv("REQUIRE_MIN_MAX_LEVERAGE"):
     CFG["require_min_max_leverage"] = os.getenv("REQUIRE_MIN_MAX_LEVERAGE", "false").strip().lower() in ("1","true","yes","on")
 if os.getenv("MIN_MAX_LEVERAGE"):
@@ -138,33 +151,48 @@ if os.getenv("MIN_MAX_LEVERAGE"):
 if not (BYBIT_KEY and BYBIT_SECRET):
     raise SystemExit("Missing BYBIT_API_KEY/BYBIT_API_SECRET in .env at project root.")
 
+# Create HTTP/WS clients with credentials
 if BYBIT_ENV == "testnet":
     http = HTTP(testnet=True, api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
-    ws_private = WebSocket(testnet=True, channel_type="private")
+    ws_private = WebSocket(testnet=True, channel_type="private", api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
 else:
     http = HTTP(testnet=False, api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
-    ws_private = WebSocket(testnet=False, channel_type="private")
+    ws_private = WebSocket(testnet=False, channel_type="private", api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def send_tg(msg: str):
-    if not (TG_TOKEN and TG_CHAT):
-        return
+def _tg_send(payload: dict):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"},
+            json=payload,
             timeout=6
         )
     except Exception as e:
         log.warning(f"telegram/error: {e}")
 
+def send_tg(msg: str):
+    if not (TG_TOKEN and TG_CHAT):
+        return
+    if len(msg) <= 3900:
+        _tg_send({"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"})
+        return
+    # split long messages
+    parts = []
+    while msg:
+        parts.append(msg[:3900])
+        msg = msg[3900:]
+    for p in parts:
+        _tg_send({"chat_id": TG_CHAT, "text": p, "parse_mode": "HTML"})
+
 # --- breaker flag (shared with risk_daemon) ---
-_BREAKER_FILE = Path(__file__).resolve().parents[1] / ".state" / "risk_state.json"
+_BREAKER_FILE = STATE_DIR / "risk_state.json"
 
 def breaker_active() -> bool:
     try:
+        if not _BREAKER_FILE.exists():
+            return False
         js = json.loads(_BREAKER_FILE.read_text(encoding="utf-8"))
         return bool(js.get("breach"))
     except Exception:
@@ -373,11 +401,39 @@ def ensure_stop(symbol: str, side: str, entry: Decimal, pos_idx: int, tick: Deci
         log.warning(f"set SL failed: {e}")
     return stop
 
+# ---------- PnL math ----------
+def compute_plan_stats(entry: Decimal, side: str, tp_prices: List[Decimal], sizes: List[Decimal]) -> Tuple[Decimal, Decimal, List[Tuple[Decimal, Decimal]]]:
+    """
+    Returns: (total_pnl_usdt, weighted_avg_exit, rung_stats)
+    rung_stats: list of (notional_usdt, pnl_usdt) for each rung
+    """
+    total_qty = sum(sizes)
+    if total_qty <= 0:
+        return Decimal("0"), entry, [(Decimal("0"), Decimal("0")) for _ in sizes]
+    rung_stats = []
+    total_pnl = Decimal("0")
+    weighted_sum = Decimal("0")
+    for px, q in zip(tp_prices, sizes):
+        notional = px * q  # linear perp: notional ≈ price * qty (USDT)
+        if side == "long":
+            pnl = (px - entry) * q
+        else:
+            pnl = (entry - px) * q
+        rung_stats.append((notional, pnl))
+        total_pnl += pnl
+        weighted_sum += px * q
+    avg_exit = weighted_sum / total_qty if total_qty > 0 else entry
+    return total_pnl, avg_exit, rung_stats
+
 # ---------- placement ----------
 def place_tp(http_cli: HTTP, symbol: str, close_side: str, px: Decimal, qty: Decimal, tick: Decimal, extra: dict):
     px = round_price_to_tick(px, tick)
     maker_ticks = adaptive_offset_ticks(symbol, tick, extra)
     px = px - tick * maker_ticks if close_side == "Sell" else px + tick * maker_ticks
+    body = dict(
+        category=CFG["category"], symbol=symbol, side=close_side, orderType="Limit",
+        qty=str(qty.normalize()), price=str(px.normalize())),
+    # build body cleanly (avoid stray commas)
     body = dict(
         category=CFG["category"], symbol=symbol, side=close_side, orderType="Limit",
         qty=str(qty.normalize()), price=str(px.normalize()),
@@ -390,6 +446,7 @@ def place_tp(http_cli: HTTP, symbol: str, close_side: str, px: Decimal, qty: Dec
             r = http_cli.place_order(**body, **extra)
             if r.get("retCode") == 0:
                 return True
+            # if not ok, try nudging one tick inside band
             if attempt < retries:
                 px = px - tick if close_side == "Sell" else px + tick
                 body["price"] = str(px)
@@ -414,20 +471,26 @@ def account_iter():
         yield (f"sub:{uid}", {"subUid": uid})
 
 # ---------- leverage policy ----------
-def symbol_allowed_by_policy(symbol: str, extra: dict) -> Tuple[bool, Optional[str], Optional[SymbolFilters]]:
-    """Return (allowed, reason_if_blocked, filters)"""
+@dataclass
+class PolicyCheck:
+    allowed: bool
+    reason: Optional[str]
+    filters: Optional['SymbolFilters']
+
+def symbol_allowed_by_policy(symbol: str, extra: dict) -> PolicyCheck:
+    """Return a PolicyCheck with permission and filters."""
     if CFG["symbol_blocklist"] and symbol.upper() in {s.upper() for s in CFG["symbol_blocklist"]}:
-        return (False, "blocked by symbol_blocklist", None)
+        return PolicyCheck(False, "blocked by symbol_blocklist", None)
     try:
         filters = get_symbol_filters(symbol, extra)
     except Exception as e:
-        return (False, f"no instrument meta: {e}", None)
+        return PolicyCheck(False, f"no instrument meta: {e}", None)
 
     if CFG["require_min_max_leverage"]:
         need = int(CFG["min_max_leverage"])
         if filters.max_leverage < need:
-            return (False, f"maxLeverage {filters.max_leverage} < required {need}", filters)
-    return (True, None, filters)
+            return PolicyCheck(False, f"maxLeverage {filters.max_leverage} < required {need}", filters)
+    return PolicyCheck(True, None, filters)
 
 # ---------- regime & targets ----------
 def regime_and_targets(symbol: str, entry: Decimal, stop: Decimal, side_open: str, extra: dict) -> Tuple[str, List[float], List[Decimal], Optional[float]]:
@@ -450,25 +513,24 @@ def regime_and_targets(symbol: str, entry: Decimal, stop: Decimal, side_open: st
 
 # ---------- core placement ----------
 def place_5_tps_for(account_key: str, extra: dict, symbol: str, side: str, entry: Decimal, qty: Decimal, pos_idx: int):
-    allowed, reason, filters = symbol_allowed_by_policy(symbol, extra)
-    if not allowed:
-        log.info(f"{account_key}:{symbol} skipped by policy: {reason}")
-        send_tg(f"⏸️ {account_key}:{symbol} skipped — {reason}")
+    check = symbol_allowed_by_policy(symbol, extra)
+    if not check.allowed:
+        log.info(f"{account_key}:{symbol} skipped by policy: {check.reason}")
+        send_tg(f"⏸️ {account_key}:{symbol} skipped — {check.reason}")
         with STATE.lock:
-            # still track pos so we don't spam; mark as 'placed' to suppress loops
             STATE.pos[(account_key, symbol)]["tp_placed"] = True
         return
 
     # Breaker guard: ensure SL, do not place TPs
     if breaker_active():
-        tick = filters.tick_size
+        tick = check.filters.tick_size
         stop = ensure_stop(symbol, side, entry, pos_idx, tick, extra)
         with STATE.lock:
             STATE.pos[(account_key, symbol)]["tp_placed"] = True
         send_tg(f"⛔ {account_key}:{symbol} breaker active — SL ensured at {stop}, TPs paused.")
         return
 
-    tick, step, minq = filters.tick_size, filters.step_size, filters.min_order_qty
+    tick, step, minq = check.filters.tick_size, check.filters.step_size, check.filters.min_order_qty
 
     stop = ensure_stop(symbol, side, entry, pos_idx, tick, extra)
     regime, rgrid, tp_prices, atr_val = regime_and_targets(symbol, entry, stop, side, extra)
@@ -495,6 +557,15 @@ def place_5_tps_for(account_key: str, extra: dict, symbol: str, side: str, entry
         if place_tp(http, symbol, close_side, px, q, tick, extra):
             placed += 1
 
+    # compute plan stats for Telegram
+    total_pnl, avg_exit, rung_stats = compute_plan_stats(entry, side, tp_prices, sizes)
+    rung_lines = []
+    for i, (px, q, (notional, pnl)) in enumerate(zip(tp_prices, sizes, rung_stats), start=1):
+        if q <= 0: 
+            rung_lines.append(f"TP{i}: {px} | qty 0")
+        else:
+            rung_lines.append(f"TP{i}: {px} | qty {q.normalize()} | notion {notional.normalize()} | pnl {pnl.normalize()}")
+
     with STATE.lock:
         STATE.pos[(account_key, symbol)]["tp_placed"] = True
         STATE.pos[(account_key, symbol)]["tp_prices"] = tp_prices
@@ -509,7 +580,16 @@ def place_5_tps_for(account_key: str, extra: dict, symbol: str, side: str, entry
     alloc_str = ", ".join([f"{int(w*100)}%" for w in CFG["tp_allocations"]])
     px_str = ", ".join([str(round_price_to_tick(Decimal(p), tick)) for p in tp_prices])
     extra_note = f" | maxLev≥{CFG['min_max_leverage']}" if CFG["require_min_max_leverage"] else ""
-    send_tg(f"✅ {account_key}:{symbol} placed {placed}/5 TPs{extra_note}\nRegime:{regime}\nEntry:{entry} Stop:{stop}\nAlloc:{alloc_str}\nTPs:{px_str}")
+    msg = (
+        f"✅ {account_key}:{symbol} placed {placed}/5 TPs{extra_note}\n"
+        f"Regime: {regime}\n"
+        f"Entry: {entry}  Stop: {stop}\n"
+        f"Alloc: {alloc_str}\n"
+        f"TPs: {px_str}\n"
+        f"Avg exit (wtd): {avg_exit.normalize()} | Plan PnL (full fill): {total_pnl.normalize()}\n"
+        + "\n".join(rung_lines)
+    )
+    send_tg(msg)
 
 def set_sl(account_key: str, extra: dict, symbol: str, pos_idx: int, new_sl: Decimal):
     try:
@@ -584,21 +664,19 @@ def bootstrap_existing():
         with STATE.lock:
             keys = [k for k in STATE.pos.keys() if k[0] == acct_key]
         for _, symbol in keys:
-            allowed, reason, filters = symbol_allowed_by_policy(symbol, extra)
-            if not allowed:
-                log.info(f"{acct_key}:{symbol} skipped at bootstrap by policy: {reason}")
+            check = symbol_allowed_by_policy(symbol, extra)
+            if not check.allowed:
+                log.info(f"{acct_key}:{symbol} skipped at bootstrap by policy: {check.reason}")
                 with STATE.lock:
                     STATE.pos[(acct_key, symbol)]["tp_placed"] = True
                 continue
+            tick = check.filters.tick_size
+            ensure_stop(symbol, STATE.pos[(acct_key, symbol)]["side"], Decimal(STATE.pos[(acct_key, symbol)]["entry"]), STATE.pos[(acct_key, symbol)]["pos_idx"], tick, extra)
             if breaker_active():
-                tick = filters.tick_size
-                ensure_stop(symbol, STATE.pos[(acct_key, symbol)]["side"], Decimal(STATE.pos[(acct_key, symbol)]["entry"]), STATE.pos[(acct_key, symbol)]["pos_idx"], tick, extra)
                 with STATE.lock:
                     STATE.pos[(acct_key, symbol)]["tp_placed"] = True
                 send_tg(f"⛔ {acct_key}:{symbol} breaker active — SL ensured, TPs paused.")
                 continue
-            tick = filters.tick_size
-            ensure_stop(symbol, STATE.pos[(acct_key, symbol)]["side"], Decimal(STATE.pos[(acct_key, symbol)]["entry"]), STATE.pos[(acct_key, symbol)]["pos_idx"], tick, extra)
             place_5_tps_for(acct_key, extra, symbol, STATE.pos[(acct_key, symbol)]["side"], Decimal(STATE.pos[(acct_key, symbol)]["entry"]), STATE.pos[(acct_key, symbol)]["qty"], STATE.pos[(acct_key, symbol)]["pos_idx"])
 
 # ---------- WS handler ----------
@@ -652,21 +730,19 @@ def ws_private_handler(message):
                             "tp_prices": STATE.pos.get((acct_key, symbol), {}).get("tp_prices", []),
                         }
                     if new_pos or not STATE.pos[(acct_key, symbol)]["tp_placed"]:
-                        allowed, reason, filters = symbol_allowed_by_policy(symbol, extra)
-                        if not allowed:
-                            log.info(f"{acct_key}:{symbol} skipped by policy on new/updated pos: {reason}")
+                        check = symbol_allowed_by_policy(symbol, extra)
+                        if not check.allowed:
+                            log.info(f"{acct_key}:{symbol} skipped by policy on new/updated pos: {check.reason}")
                             with STATE.lock:
                                 STATE.pos[(acct_key, symbol)]["tp_placed"] = True
                             continue
+                        tick = check.filters.tick_size
+                        ensure_stop(symbol, side, entry, pos_idx, tick, extra)
                         if breaker_active():
-                            tick = filters.tick_size
-                            ensure_stop(symbol, side, entry, pos_idx, tick, extra)
                             with STATE.lock:
                                 STATE.pos[(acct_key, symbol)]["tp_placed"] = True
                             send_tg(f"⛔ {acct_key}:{symbol} breaker active — SL ensured, TPs paused.")
                             continue
-                        tick = filters.tick_size
-                        ensure_stop(symbol, side, entry, pos_idx, tick, extra)
                         place_5_tps_for(acct_key, extra, symbol, side, entry, size, pos_idx)
 
     except Exception as e:
