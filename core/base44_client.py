@@ -213,3 +213,6 @@ def get_closed_pnl(member_id: str, symbol: Optional[str] = None) -> dict:
     if symbol:
         params["symbol"] = symbol
     return bybit_proxy("GET", "/v5/position/closed-pnl", params=params)
+
+if __name__ == "__main__":
+    print(relay_get("/diag/time"))
