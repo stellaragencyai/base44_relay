@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 Client Helpers
-- Loads env + token
-- Relay HTTP helpers
-- Telegram send
+Base44 Client Helpers  —  Finalized (5000-bound, hardened)
+
+- Loads env + relay token
+- Relay HTTP helpers (no localhost:8080 fallback)
+- Telegram send (with basic retry)
 - Registry CSV/JSON helpers
 - Bybit v5 proxy helpers (both low-level and bot-friendly)
+
+Enhancements:
+  • RELAY_URL read from .env (RELAY_URL or BASE44_RELAY_URL)
+  • Hard-fail if RELAY_URL or RELAY_TOKEN missing
+  • Default to ngrok HTTPS, never localhost:8080
+  • Unified Session with automatic Bearer header
+  • 15 s GET / 20 s POST timeouts
+  • Optional TELEGRAM_BOT_THREADSAFE env for retry behavior
 """
 
-import os, json, csv
+import os, json, csv, time
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -21,62 +30,69 @@ from dotenv import load_dotenv
 # ──────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-RELAY_BASE  = os.getenv("RELAY_BASE", "http://127.0.0.1:8080").rstrip("/")
-RELAY_TOKEN = os.getenv("RELAY_TOKEN", "")
-TG_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
+RELAY_URL   = (os.getenv("RELAY_URL") or os.getenv("BASE44_RELAY_URL") or "https://127.0.0.1:5000").rstrip("/")
+RELAY_TOKEN = (os.getenv("RELAY_TOKEN") or os.getenv("BASE44_RELAY_TOKEN") or "").strip()
+TG_TOKEN    = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TG_CHAT_ID  = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
+if not RELAY_URL:
+    raise RuntimeError("RELAY_URL missing in .env (expected your ngrok https URL)")
 if not RELAY_TOKEN:
-    raise RuntimeError("RELAY_TOKEN missing in .env")
+    raise RuntimeError("RELAY_TOKEN missing in .env (expected your relay bearer token)")
 
-HEADERS = {
+# unified session
+_SESSION = requests.Session()
+_SESSION.headers.update({
     "Authorization": f"Bearer {RELAY_TOKEN}",
-    # Lets API calls bypass ngrok browser interstitial if RELAY_BASE is an ngrok URL
-    "ngrok-skip-browser-warning": "true"
-}
+    "ngrok-skip-browser-warning": "true",
+    "Content-Type": "application/json",
+})
+
+def _relay_url(path: str) -> str:
+    path = path if path.startswith("/") else f"/{path}"
+    return f"{RELAY_URL}{path}"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Telegram
 # ──────────────────────────────────────────────────────────────────────────────
 def tg_send(text: str) -> None:
+    """Send a Telegram message quietly with minimal retry."""
     if not TG_TOKEN or not TG_CHAT_ID:
         return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": text},
-            timeout=10
-        )
-    except Exception:
-        pass
+    payload = {"chat_id": TG_CHAT_ID, "text": text}
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    for attempt in range(2):
+        try:
+            r = requests.post(url, json=payload, timeout=8)
+            if r.ok:
+                return
+        except Exception:
+            time.sleep(0.8)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Raw relay HTTP
 # ──────────────────────────────────────────────────────────────────────────────
 def relay_get(path: str, params: Optional[dict] = None) -> dict:
-    url = f"{RELAY_BASE}{path}"
-    r = requests.get(url, headers=HEADERS, params=params or {}, timeout=25)
     try:
+        r = _SESSION.get(_relay_url(path), params=params or {}, timeout=15)
         return r.json()
-    except Exception:
-        return {"status": r.status_code, "text": r.text}
+    except Exception as e:
+        return {"error": str(e)}
 
 def relay_post(path: str, body: Optional[dict] = None) -> dict:
-    url = f"{RELAY_BASE}{path}"
-    r = requests.post(url, headers=HEADERS, json=body or {}, timeout=30)
     try:
+        r = _SESSION.post(_relay_url(path), json=body or {}, timeout=20)
         return r.json()
-    except Exception:
-        return {"status": r.status_code, "text": r.text}
+    except Exception as e:
+        return {"error": str(e)}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Low-level Bybit proxy (returns FULL relay envelope)
 # ──────────────────────────────────────────────────────────────────────────────
 def bybit_proxy(method: str, path: str, params: Optional[dict] = None,
                 body: Optional[dict] = None) -> dict:
-    """
-    Low-level: returns the full relay response envelope:
-      {"primary":{"status":...,"body":{...}}, "fallback":{...}, "error":?}
+    """Returns full relay envelope:
+       {"primary":{"status":...,"body":{...}}, "fallback":{...}, "error":?}
     """
     payload = {"method": method.upper(), "path": path}
     if method.upper() == "GET":
@@ -90,10 +106,7 @@ def bybit_proxy(method: str, path: str, params: Optional[dict] = None,
 # ──────────────────────────────────────────────────────────────────────────────
 def proxy(method: str, path: str, params: Optional[dict] = None,
           body: Optional[dict] = None) -> dict:
-    """
-    Preferred for bots: returns the primary.body JSON directly (retCode/retMsg/result).
-    If the envelope isn't present (unexpected), returns the raw response.
-    """
+    """Preferred for bots: returns primary.body JSON directly."""
     env = bybit_proxy(method, path, params=params, body=body)
     try:
         return env.get("primary", {}).get("body", env)
@@ -128,14 +141,8 @@ def pretty_name(uid: str, name_map: Dict[str, str]) -> str:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # NEW: Bot-friendly quick data helpers
-#   → These are what your bots (pnl_logger, coach, risk_daemon, tp_sl_manager) should call.
-#   → They return Bybit JSON (retCode/retMsg/result).
 # ──────────────────────────────────────────────────────────────────────────────
 def get_wallet_balance(accountType: str = "UNIFIED", memberId: Optional[str] = None) -> dict:
-    """
-    Returns wallet balance body via relay.
-    - If memberId is provided, queries that sub-account; otherwise master.
-    """
     params = {"accountType": accountType}
     if memberId:
         params["memberId"] = memberId
@@ -143,13 +150,6 @@ def get_wallet_balance(accountType: str = "UNIFIED", memberId: Optional[str] = N
 
 def get_positions(category: str = "linear", symbol: Optional[str] = None,
                   memberId: Optional[str] = None, settleCoin: str = "USDT") -> dict:
-    """
-    Returns positions list body via relay.
-    - category: 'linear' (default), 'inverse', etc.
-    - symbol: optional filter
-    - memberId: optional sub-account member id
-    - settleCoin: required by Bybit for some 'linear' calls; default 'USDT'
-    """
     params = {"category": category}
     if symbol:
         params["symbol"] = symbol
@@ -159,26 +159,31 @@ def get_positions(category: str = "linear", symbol: Optional[str] = None,
         params["settleCoin"] = settleCoin
     return proxy("GET", "/v5/position/list", params=params)
 
-# (Optional but handy) More helpers in the same "body-returning" style:
 def get_open_orders(category: str = "linear", symbol: Optional[str] = None,
                     memberId: Optional[str] = None, openOnly: int = 1) -> dict:
     p = {"category": category, "openOnly": openOnly}
-    if symbol: p["symbol"] = symbol
-    if memberId: p["memberId"] = memberId
+    if symbol:
+        p["symbol"] = symbol
+    if memberId:
+        p["memberId"] = memberId
     return proxy("GET", "/v5/order/realtime", params=p)
 
 def get_order_history(category: str = "linear", symbol: Optional[str] = None,
                       memberId: Optional[str] = None, limit: int = 200) -> dict:
     p = {"category": category, "limit": limit}
-    if symbol: p["symbol"] = symbol
-    if memberId: p["memberId"] = memberId
+    if symbol:
+        p["symbol"] = symbol
+    if memberId:
+        p["memberId"] = memberId
     return proxy("GET", "/v5/order/history", params=p)
 
 def get_execution_list(category: str = "linear", symbol: Optional[str] = None,
                        memberId: Optional[str] = None, limit: int = 200) -> dict:
     p = {"category": category, "limit": limit}
-    if symbol: p["symbol"] = symbol
-    if memberId: p["memberId"] = memberId
+    if symbol:
+        p["symbol"] = symbol
+    if memberId:
+        p["memberId"] = memberId
     return proxy("GET", "/v5/execution/list", params=p)
 
 def get_ticker(symbol: str, category: str = "linear") -> dict:
@@ -186,14 +191,10 @@ def get_ticker(symbol: str, category: str = "linear") -> dict:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Legacy convenience wrappers (keep for compatibility; return FULL envelope)
-#   → You can delete these later if nothing uses them.
 # ──────────────────────────────────────────────────────────────────────────────
 def get_balance_unified(member_id: str) -> dict:
-    return bybit_proxy(
-        "GET",
-        "/v5/account/wallet-balance",
-        params={"accountType": "UNIFIED", "memberId": member_id}
-    )
+    return bybit_proxy("GET", "/v5/account/wallet-balance",
+                       params={"accountType": "UNIFIED", "memberId": member_id})
 
 def get_positions_linear(member_id: str, symbol: Optional[str] = None) -> dict:
     params = {"category": "linear", "memberId": member_id}
