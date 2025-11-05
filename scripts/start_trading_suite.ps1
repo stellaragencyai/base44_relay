@@ -5,8 +5,8 @@ param(
 $py = Join-Path $BaseDir ".venv\Scripts\python.exe"
 if (-not (Test-Path $py)) { $py = "python" }
 
-function Launch($title, $args) {
-  Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit","-Command","$args") -WorkingDirectory $BaseDir -WindowStyle Minimized -Verb RunAs
+function Launch($title, $cmdArgs) {
+  Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit","-Command","$cmdArgs") -WorkingDirectory $BaseDir -WindowStyle Minimized -Verb RunAs
   Start-Sleep -Milliseconds 300
 }
 
