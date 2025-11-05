@@ -14,18 +14,18 @@ What this module gives you:
 - Tiny CLI: --validate, --ping, --echo, --updates for quick checks.
 
 Environment variables honored (in .env or real env):
-  TELEGRAM_BOT_TOKEN=123456:ABC…      (required for sending)
-  TELEGRAM_CHAT_ID=7776809236          (single chat)
-  TELEGRAM_CHAT_IDS=777,888,-100123…   (comma-separated list; overrides CHAT_ID if set)
-  TELEGRAM_THREAD_ID=123               (optional; topic/thread id)
-  TELEGRAM_SILENT=0|1                  (1 = disable notifications)
-  TELEGRAM_DISABLE_PREVIEW=1|0         (1 = no link previews)
+  TELEGRAM_BOT_TOKEN=123456:ABC…
+  TELEGRAM_CHAT_ID=7776809236
+  TELEGRAM_CHAT_IDS=777,888,-100123…   (overrides CHAT_ID if set)
+  TELEGRAM_THREAD_ID=123
+  TELEGRAM_SILENT=0|1
+  TELEGRAM_DISABLE_PREVIEW=1|0
   TELEGRAM_DEFAULT_PARSE_MODE=Markdown | HTML
-  TELEGRAM_NOTIFY=1|0                  (default notification behavior)
+  TELEGRAM_NOTIFY=1|0
   TELEGRAM_MAX_RETRIES=3
   TELEGRAM_BACKOFF_BASE_MS=400
   TELEGRAM_RATE_LIMIT_TPS=1.5
-  TZ=America/Phoenix                   (defaults to UTC if not set)
+  TZ=America/Phoenix
 """
 
 from __future__ import annotations
@@ -46,19 +46,16 @@ import requests
 _ENV_PATH = None
 try:
     from dotenv import load_dotenv, find_dotenv
-    # First prefer a local .env in CWD (useful when running from tools/)
     if os.path.exists(".env"):
         _ENV_PATH = os.path.abspath(".env")
         load_dotenv(_ENV_PATH, override=True)
         print(f"[notifier] Loaded .env (override=True): {_ENV_PATH}")
     else:
-        # Fallback to walking up the tree to locate project .env
         _ENV_PATH = find_dotenv(filename=".env", usecwd=True)
         if _ENV_PATH:
             load_dotenv(_ENV_PATH, override=True)
             print(f"[notifier] Loaded .env (override=True): {_ENV_PATH}")
         else:
-            # As a last resort, still call load_dotenv to pick a default .env if present
             load_dotenv(override=True)
             print("[notifier/warn] No project .env found via find_dotenv; relying on process env (override=True).")
 except Exception:
@@ -68,10 +65,20 @@ except Exception:
 # ------------------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------------------
+def _is_placeholder(s: str) -> bool:
+    try:
+        val = (s or "").strip().lower()
+    except Exception:
+        return True
+    return val in {"", "<chat_id>", "<chat_ids>", "<token>", "changeme", "todo"}
+
 _TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
 _TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
 _TELEGRAM_CHAT_IDS = [c.strip() for c in (os.getenv("TELEGRAM_CHAT_IDS", "") or "").split(",") if c.strip()]
-if not _TELEGRAM_CHAT_IDS and _TELEGRAM_CHAT_ID:
+
+# Sanitize placeholders and choose a valid destination list
+_TELEGRAM_CHAT_IDS = [c for c in _TELEGRAM_CHAT_IDS if not _is_placeholder(c)]
+if not _TELEGRAM_CHAT_IDS and not _is_placeholder(_TELEGRAM_CHAT_ID):
     _TELEGRAM_CHAT_IDS = [_TELEGRAM_CHAT_ID]
 
 _TELEGRAM_THREAD_ID = (os.getenv("TELEGRAM_THREAD_ID", "") or "").strip()
@@ -87,7 +94,7 @@ _DEFAULT_NOTIFY = (os.getenv("TELEGRAM_NOTIFY", "1") or "1") != "0"
 _MAX_RETRIES = max(0, int((os.getenv("TELEGRAM_MAX_RETRIES", "3") or "3")))
 _BACKOFF_BASE_MS = max(50, int((os.getenv("TELEGRAM_BACKOFF_BASE_MS", "400") or "400")))
 _RATE_LIMIT_TPS = max(0.1, float((os.getenv("TELEGRAM_RATE_LIMIT_TPS", "1.5") or "1.5")))
-_TZ = (os.getenv("TZ", "America/Phoenix") or "America/Phoenix")  # default to your local
+_TZ = (os.getenv("TZ", "America/Phoenix") or "America/Phoenix")
 
 # ------------------------------------------------------------------------------
 # Token validation and API base
@@ -105,7 +112,6 @@ def _valid_token(tok: str) -> bool:
     return bool(_TOKEN_RE.match(tok))
 
 def _bom_prefix_debug(tok: str) -> str:
-    """Show code points of first/last few chars to catch BOM/garbage."""
     if not tok:
         return "len=0"
     prv = [f"{ord(c):#06x}" for c in tok[:3]]
@@ -303,7 +309,7 @@ def tg_diag(verbose_updates: bool = False) -> bool:
 def set_chat_ids(ids: Iterable[str | int]) -> None:
     """Override destination chat IDs at runtime."""
     global _TELEGRAM_CHAT_IDS
-    _TELEGRAM_CHAT_IDS = [str(x).strip() for x in ids if str(x).strip()]
+    _TELEGRAM_CHAT_IDS = [str(x).strip() for x in ids if str(x).strip() and not _is_placeholder(x)]
 
 def tg_send(msg: str,
             *,
@@ -366,7 +372,7 @@ def tg_send_code(text: str,
                  priority: str = "info",
                  **kwargs) -> None:
     """Send a code block as Markdown with triple backticks."""
-    safe = text.replace("```", "`\u200d``")  # zero-width joiner to break fence
+    safe = text.replace("```", "`\u200d``")
     msg = f"```{language}\n{safe}\n```"
     kwargs.setdefault("parse_mode", "Markdown")
     tg_send(msg, priority=priority, **kwargs)
@@ -444,7 +450,6 @@ if __name__ == "__main__":
     parser.add_argument("--echo", type=str, help="Send a custom message to configured chat(s)")
     args = parser.parse_args()
 
-    # Always print where the env came from and basic status
     print(f"[notifier] .env path: {_ENV_PATH or '<none>'}")
     print(f"[notifier] token ok: {bool(_valid_token(_TELEGRAM_BOT_TOKEN))}  chats: {', '.join(_TELEGRAM_CHAT_IDS) if _TELEGRAM_CHAT_IDS else '<none>'}")
 
@@ -464,6 +469,5 @@ if __name__ == "__main__":
         tg_send(args.echo, priority="info")
 
     if not ran:
-        # Default behavior: just do a diag so you see immediate health
         tg_diag(verbose_updates=False)
         _console_print("notifier/info:", "Nothing else to do. Try --validate, --ping, or --echo.")
