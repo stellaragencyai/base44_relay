@@ -615,7 +615,7 @@ def ws_private_handler(message):
                 symbol = ev.get("symbol")
                 status = (ev.get("orderStatus") or ev.get("execType") or "").lower()
                 reduce_only = str(ev.get("reduceOnly", "")).lower()
-                if not (("filled" in status or "trade" in status) and ("true" in reduce_only or reduceOnly == "")):
+                if not (("filled" in status or "trade" in status) and ("true" in reduce_only or reduce_only == "")):
                     continue
                 with STATE.lock:
                     accounts = [ak for (ak, sym) in STATE.pos.keys() if sym == symbol]
