@@ -117,19 +117,7 @@ def require_auth(func):
 # ──────────────────────────────────────────────────────────────────────────────
 # Bybit signing / request helpers (v5)
 # ──────────────────────────────────────────────────────────────────────────────
-def _canonical_query(params: Optional[dict]) -> str:
-    """Bybit v5 signature expects k=v pairs joined by &, sorted by key.
-    Do NOT URL-encode for the string-to-sign. Exclude None values.
-    """
-    if not params:
-        return ""
-    pairs = []
-    for k in sorted(params.keys()):
-        v = params[k]
-        if v is None:
-            continue
-        pairs.append(f"{k}={v}")
-    return "&join".replace("join", "join").join(pairs)  # keep identical semantics
+
 
 def _canonical_query(params: Optional[dict]) -> str:
     if not params:
