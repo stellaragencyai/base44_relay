@@ -4,14 +4,28 @@
 """
 Notifier Bot (core) — DC-safe, token-validated, env-safe, override-friendly
 
-Adds:
-- Root .env discovery via find_dotenv
-- load_dotenv(..., override=True) so .env actually wins over stale OS/session vars
-- Token regex validation + masked preview
-- getMe probe with clear diagnostics
-- Optional getUpdates fetch to help discover chat_id
-- BOM/whitespace detector for TELEGRAM_BOT_TOKEN
-- Timezone-aware timestamps
+What this module gives you:
+- Root .env discovery with override=True so .env beats stale User/System env vars.
+- Token format validation + masked previews to avoid leaking secrets in logs.
+- getMe probe with clear diagnostics and optional getUpdates fetch.
+- Optional multi-recipient via TELEGRAM_CHAT_IDS (comma-separated).
+- Optional thread routing via TELEGRAM_THREAD_ID (for forum topics).
+- Rate limiting, retries with backoff, silent mode, preview toggles.
+- Tiny CLI: --validate, --ping, --echo, --updates for quick checks.
+
+Environment variables honored (in .env or real env):
+  TELEGRAM_BOT_TOKEN=123456:ABC…      (required for sending)
+  TELEGRAM_CHAT_ID=7776809236          (single chat)
+  TELEGRAM_CHAT_IDS=777,888,-100123…   (comma-separated list; overrides CHAT_ID if set)
+  TELEGRAM_THREAD_ID=123               (optional; topic/thread id)
+  TELEGRAM_SILENT=0|1                  (1 = disable notifications)
+  TELEGRAM_DISABLE_PREVIEW=1|0         (1 = no link previews)
+  TELEGRAM_DEFAULT_PARSE_MODE=Markdown | HTML
+  TELEGRAM_NOTIFY=1|0                  (default notification behavior)
+  TELEGRAM_MAX_RETRIES=3
+  TELEGRAM_BACKOFF_BASE_MS=400
+  TELEGRAM_RATE_LIMIT_TPS=1.5
+  TZ=America/Phoenix                   (defaults to UTC if not set)
 """
 
 from __future__ import annotations
@@ -25,19 +39,31 @@ from typing import Any, Iterable, Optional, List
 
 import requests
 
-# dotenv: load root .env reliably and OVERRIDE existing env
+# ------------------------------------------------------------------------------
+# dotenv: load project .env reliably and OVERRIDE existing env (this is key)
+# We try: CWD .env, then parent chain using find_dotenv, and we force override.
+# ------------------------------------------------------------------------------
+_ENV_PATH = None
 try:
     from dotenv import load_dotenv, find_dotenv
-    _ENV_PATH = find_dotenv(filename=".env", usecwd=True)
-    if _ENV_PATH:
+    # First prefer a local .env in CWD (useful when running from tools/)
+    if os.path.exists(".env"):
+        _ENV_PATH = os.path.abspath(".env")
         load_dotenv(_ENV_PATH, override=True)
         print(f"[notifier] Loaded .env (override=True): {_ENV_PATH}")
     else:
-        load_dotenv(override=True)
-        print("[notifier/warn] No project .env found via find_dotenv; relying on process env (override=True).")
+        # Fallback to walking up the tree to locate project .env
+        _ENV_PATH = find_dotenv(filename=".env", usecwd=True)
+        if _ENV_PATH:
+            load_dotenv(_ENV_PATH, override=True)
+            print(f"[notifier] Loaded .env (override=True): {_ENV_PATH}")
+        else:
+            # As a last resort, still call load_dotenv to pick a default .env if present
+            load_dotenv(override=True)
+            print("[notifier/warn] No project .env found via find_dotenv; relying on process env (override=True).")
 except Exception:
     _ENV_PATH = None
-    print("[notifier/warn] python-dotenv not available; relying on process env.")
+    print("[notifier/warn] python-dotenv not available; relying on process env only.")
 
 # ------------------------------------------------------------------------------
 # Config
@@ -61,12 +87,13 @@ _DEFAULT_NOTIFY = (os.getenv("TELEGRAM_NOTIFY", "1") or "1") != "0"
 _MAX_RETRIES = max(0, int((os.getenv("TELEGRAM_MAX_RETRIES", "3") or "3")))
 _BACKOFF_BASE_MS = max(50, int((os.getenv("TELEGRAM_BACKOFF_BASE_MS", "400") or "400")))
 _RATE_LIMIT_TPS = max(0.1, float((os.getenv("TELEGRAM_RATE_LIMIT_TPS", "1.5") or "1.5")))
-_TZ = (os.getenv("TZ", "UTC") or "UTC")
+_TZ = (os.getenv("TZ", "America/Phoenix") or "America/Phoenix")  # default to your local
 
 # ------------------------------------------------------------------------------
 # Token validation and API base
 # ------------------------------------------------------------------------------
 _TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{30,}$")
+
 def _mask_token(tok: str) -> str:
     if not tok:
         return "<empty>"
@@ -403,3 +430,40 @@ def tg_validate(verbose_updates: bool = False) -> bool:
 
 # Backward compatibility alias
 send = tg_send
+
+# ------------------------------------------------------------------------------
+# CLI entry point
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Base44 Notifier Bot (Telegram)")
+    parser.add_argument("--validate", action="store_true", help="Run token check + send a test message")
+    parser.add_argument("--updates", action="store_true", help="Also print getUpdates payload during --validate")
+    parser.add_argument("--ping", nargs="?", const="notifier", help="Send a heartbeat message (optional name)")
+    parser.add_argument("--echo", type=str, help="Send a custom message to configured chat(s)")
+    args = parser.parse_args()
+
+    # Always print where the env came from and basic status
+    print(f"[notifier] .env path: {_ENV_PATH or '<none>'}")
+    print(f"[notifier] token ok: {bool(_valid_token(_TELEGRAM_BOT_TOKEN))}  chats: {', '.join(_TELEGRAM_CHAT_IDS) if _TELEGRAM_CHAT_IDS else '<none>'}")
+
+    ran = False
+
+    if args.validate:
+        ran = True
+        ok = tg_validate(verbose_updates=args.updates)
+        _console_print("notifier/result:", f"validate={'ok' if ok else 'fail'}")
+
+    if args.ping is not None:
+        ran = True
+        tg_healthcheck(args.ping)
+
+    if args.echo:
+        ran = True
+        tg_send(args.echo, priority="info")
+
+    if not ran:
+        # Default behavior: just do a diag so you see immediate health
+        tg_diag(verbose_updates=False)
+        _console_print("notifier/info:", "Nothing else to do. Try --validate, --ping, or --echo.")
