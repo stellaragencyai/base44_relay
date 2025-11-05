@@ -6,7 +6,9 @@ runs strategies in observe-only and emits normalized signals.
 
 ENV:
   LOG_LEVEL=INFO|DEBUG
-  OBSERVE_ONLY=true (only print signals)
+  OBSERVE_ONLY=true            # only print/write signals; executor decides live/dry
+  OBSERVE_TEST_SIGNAL=true     # emit one harmless LONG_TEST per whitelisted symbol
+  OBSERVE_APPEND=false         # append instead of overwrite observed.jsonl
   SIGNAL_DIR=signals
 """
 
@@ -23,9 +25,13 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 REG = ROOT / "registry" / "sub_map.json"
 SIGDIR = ROOT / (os.getenv("SIGNAL_DIR") or "signals")
 SIGDIR.mkdir(exist_ok=True, parents=True)
-OBSERVE_ONLY = (os.getenv("OBSERVE_ONLY") or "true").strip().lower() == "true"
 
-def load_json(p):
+OBSERVE_ONLY  = (os.getenv("OBSERVE_ONLY") or "true").strip().lower() == "true"
+OBS_TEST      = (os.getenv("OBSERVE_TEST_SIGNAL") or "false").strip().lower() == "true"
+OBS_APPEND    = (os.getenv("OBSERVE_APPEND") or "false").strip().lower() == "true"
+FILE_MODE     = "a" if OBS_APPEND else "w"
+
+def load_json(p: pathlib.Path) -> Dict[str, Any]:
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -55,7 +61,7 @@ def validate_schema(doc: Dict[str, Any]):
         if sub.get("enabled", True) and not wl:
             raise SystemExit(f"sub '{sub_key}' enabled but whitelist empty")
 
-def resolve_uids(doc: Dict[str, Any]):
+def resolve_uids(doc: Dict[str, Any]) -> Dict[str, Any]:
     book = doc.get("uid_book", {})
     for sub_key, sub in doc["subs"].items():
         uid = (sub.get("uid") or "").strip()
@@ -64,7 +70,8 @@ def resolve_uids(doc: Dict[str, Any]):
             sub["uid"] = book[label]
     return doc
 
-def load_strategies():
+def load_strategies_registry() -> Dict[str, type]:
+    """Load strategy classes once from strategies.REGISTRY."""
     from strategies import REGISTRY
     loaded = {}
     for name, path_spec in REGISTRY.items():
@@ -74,7 +81,7 @@ def load_strategies():
         loaded[name] = cls
     return loaded
 
-def make_signal(sub_key, sym, sig_type, strength, params, meta=None):
+def make_signal(sub_key: str, sym: str, sig_type: str, strength: float, params: Dict[str, Any], meta=None) -> Dict[str, Any]:
     return {
         "ts": int(time.time()*1000),
         "sub": sub_key,
@@ -85,26 +92,46 @@ def make_signal(sub_key, sym, sig_type, strength, params, meta=None):
         "meta": meta or {}
     }
 
-def run_observe(doc: Dict[str, Any], strategies: Dict[str, Any]):
-    outf = open(SIGDIR / "observed.jsonl", "a", encoding="utf-8")
+def run_observe(doc: Dict[str, Any], strategies: Dict[str, type]):
+    # open once with the selected mode
+    outf_path = SIGDIR / "observed.jsonl"
+    outf = open(outf_path, FILE_MODE, encoding="utf-8")
     count = 0
+
     for sub_key, sub in doc["subs"].items():
-        if not sub.get("enabled", True): 
+        if not sub.get("enabled", True):
             continue
+
         strat_key = sub["strategy"]
-        if strat_key not in strategies:
+        Strategy = strategies.get(strat_key)
+        if Strategy is None and not OBS_TEST:
             log.warning(f"sub {sub_key} strategy '{strat_key}' not registered; skipping")
             continue
-        Strategy = strategies[strat_key]
-        s = Strategy()
-        # Placeholder data fetch here — you can wire in klines/ticks later
+
         params = {
             "risk_per_trade_pct": sub["risk"]["initial_risk_pct"],
             "maker_only": sub.get("maker_only", True),
             "spread_max_bps": sub.get("spread_max_bps", 8)
         }
+
+        # Placeholder: real code should fetch klines/tick/pos before calling strategies
+        klines = None
+        tick   = None
+        pos    = None
+
         for sym in sub["symbols"]["whitelist"]:
-            sigs = s.generate_signals(klines=None, tick=None, pos=None, params=params)
+            if OBS_TEST:
+                # Emit one harmless test signal per symbol. Lets you test executor/relay end-to-end.
+                payload = make_signal(sub_key, sym, "LONG_TEST", 0.5, params, {"strategy": strat_key, "test": True})
+                line = json.dumps(payload, separators=(",",":"))
+                print(line)
+                outf.write(line + "\n")
+                count += 1
+                continue
+
+            # Real strategy flow (will produce zero until you implement logic)
+            s = Strategy()
+            sigs = s.generate_signals(klines=klines, tick=tick, pos=pos, params=params)
             for sig in sigs:
                 if sig.get("symbol") and sig["symbol"] != sym:
                     continue
@@ -113,13 +140,13 @@ def run_observe(doc: Dict[str, Any], strategies: Dict[str, Any]):
                 print(line)
                 outf.write(line + "\n")
                 count += 1
+
     outf.close()
-    log.info(f"observe finished, signals={count}")
+    log.info(f"observe finished, signals={count}, file_mode={FILE_MODE}, path={outf_path}")
 
 if __name__ == "__main__":
     doc = load_json(REG)
     validate_schema(doc)
-    docm = deep_merge({"subs": {}}, doc)  # no-op but future-proof
-    docm = resolve_uids(docm)
-    strategies = load_strategies()
-    run_observe(docm, strategies)
+    doc = resolve_uids(doc)
+    strategies = load_strategies_registry()
+    run_observe(doc, strategies)
