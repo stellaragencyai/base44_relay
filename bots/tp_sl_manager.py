@@ -6,7 +6,8 @@ Base44 — TP/SL Manager (5 equal TPs + auto-resize on scale-in + laddered trail
 - 5 TP rungs, equal R spacing (default 0.5R steps up to 2.5R), equal size per rung.
 - On position size change (scale-in), immediately re-sizes all 5 rungs so sum(qty)=position size.
 - Shorts fixed: symmetric logic, close-side Buy, periodic sweep + WS.
-- Trailing SL: after TP2 → SL=TP1; TP3 → SL=TP2; TP4 → SL=TP3; TP5 → SL=TP4.
+- Trailing SL: TP2 → SL=TP1; TP3 → SL=TP2; TP4 → SL=TP3; TP5 → SL=TP4.
+- SL tighter: chooses closer of structure-stop vs ATR-stop, smaller ATR multiple, smaller tick buffer.
 - Maker-only reduce-only; WS watchdog; USDT/USDC settle scan.
 
 Requires:
@@ -47,6 +48,7 @@ CFG = {
     "tp_equal_r_start": 0.5,   # first TP at 0.5R
     "tp_equal_r_step": 0.5,    # step between rungs
     "tp_equal_alloc": 1.0,     # total allocation across rungs; split equally
+
     # maker placement
     "maker_post_only": True,
     "spread_offset_ratio": 0.35,
@@ -54,32 +56,41 @@ CFG = {
     "fallback_maker_offset_ticks": 2,
     "price_band_retry": True,
     "price_band_max_retries": 2,
-    # SL logic
-    "sl_atr_mult_fallback": 1.0,
-    "sl_atr_buffer": 0.2,
+
+    # SL logic (tightened)
+    "sl_use_closer_of_structure_or_atr": True,  # pick the closer stop to entry
+    "sl_atr_mult_fallback": 0.45,               # closer ATR baseline (was 1.0)
+    "sl_atr_buffer": 0.08,                      # smaller structure cushion (was 0.2)
     "sl_kline_tf": "5",
     "sl_kline_count": 120,
     "sl_swing_lookback": 20,
-    "sl_min_tick_buffer": 3,
-    # BE / laddered SL trigger point
-    "be_after_tp_index": 2,   # after TP2
+    "sl_min_tick_buffer": 2,                    # was 3
+
+    # BE / laddered SL trigger point (we now use rung laddering; BE no longer used)
+    "be_after_tp_index": 2,
     "be_buffer_ticks": 1,
+
     # market/category
     "category": "linear",
+
     # symbol handling
     "listen_symbols": "*",
     "symbol_blocklist": [],
+
     # leverage policy (optional)
     "require_min_max_leverage": False,
     "min_max_leverage": 75,
+
     # settle scan
     "settle_coins": ["USDT", "USDC"],
+
     # WS resilience
     "ws_ping_interval": 15,
     "ws_ping_timeout": 10,
     "ws_silence_watchdog_secs": 25,
     "ws_backoff_start": 2,
     "ws_backoff_max": 60,
+
     # periodic sweep to catch misses
     "periodic_sweep_sec": 12,
 }
@@ -200,9 +211,9 @@ def _compute_structure_stop(symbol: str, side_word: str, entry: Decimal, tick: D
         atr = (sum(trs[-14:]) / Decimal(14)) if len(trs) >= 14 else Decimal(0)
         atr_buf = atr * Decimal(str(CFG["sl_atr_buffer"]))
         if side_word == "long":
-            stop = min(lows[-CFG["sl_swing_lookback"] or 20:]) - atr_buf
+            stop = min(lows[-(CFG["sl_swing_lookback"] or 20):]) - atr_buf
         else:
-            stop = max(highs[-CFG["sl_swing_lookback"] or 20:]) + atr_buf
+            stop = max(highs[-(CFG["sl_swing_lookback"] or 20):]) + atr_buf
         return round_price_to_tick(Decimal(stop), tick)
     except Exception:
         return None
@@ -227,6 +238,15 @@ def _compute_fallback_atr_stop(symbol: str, side_word: str, entry: Decimal, tick
     except Exception:
         return None
 
+def _pick_closer_stop(entry: Decimal, a: Optional[Decimal], b: Optional[Decimal], side_word: str, tick: Decimal) -> Decimal:
+    """Choose the stop closer to entry; fallback to a small tick buffer if both missing."""
+    choices = [x for x in (a, b) if x is not None]
+    if choices:
+        return min(choices, key=lambda s: abs(entry - s))
+    # last resort: a couple ticks off entry
+    return round_price_to_tick(entry - tick*Decimal(CFG["sl_min_tick_buffer"]) if side_word=="long"
+                               else entry + tick*Decimal(CFG["sl_min_tick_buffer"]), tick)
+
 def ensure_stop(symbol: str, side_word: str, entry: Decimal, pos_idx: int, tick: Decimal, extra: dict) -> Decimal:
     try:
         res = http.get_positions(category=CFG["category"], symbol=symbol, **extra)
@@ -237,9 +257,9 @@ def ensure_stop(symbol: str, side_word: str, entry: Decimal, pos_idx: int, tick:
     except Exception as e:
         log.debug(f"check SL failed: {e}")
 
-    stop = _compute_structure_stop(symbol, side_word, entry, tick, extra) \
-        or _compute_fallback_atr_stop(symbol, side_word, entry, tick, extra) \
-        or round_price_to_tick(entry - tick*Decimal(CFG["sl_min_tick_buffer"]) if side_word=="long" else entry + tick*Decimal(CFG["sl_min_tick_buffer"]), tick)
+    s_struct = _compute_structure_stop(symbol, side_word, entry, tick, extra)
+    s_atr    = _compute_fallback_atr_stop(symbol, side_word, entry, tick, extra)
+    stop = _pick_closer_stop(entry, s_struct, s_atr, side_word, tick)
 
     try:
         http.set_trading_stop(category=CFG["category"], symbol=symbol, positionIdx=str(pos_idx), stopLoss=str(stop), **extra)
@@ -251,6 +271,9 @@ def ensure_stop(symbol: str, side_word: str, entry: Decimal, pos_idx: int, tick:
 def build_equal_r_targets(entry: Decimal, stop: Decimal, side_word: str, tick: Decimal) -> List[Decimal]:
     """Return exactly 5 target prices equally spaced in R; rounded to tick."""
     r_unit = abs(entry - stop)
+    # guard against pathological zero-R
+    if r_unit <= 0:
+        r_unit = tick * Decimal(5)
     start = Decimal(str(CFG["tp_equal_r_start"]))
     step  = Decimal(str(CFG["tp_equal_r_step"]))
     levels = [start + step * i for i in range(CFG["tp_rungs"])]
@@ -369,18 +392,17 @@ def _split_even(total: Decimal, step: Decimal, minq: Decimal, n: int) -> List[De
     # fix rounding residual
     diff = total - sum(chunks)
     # distribute residual by adding/subtracting one step
-    sgn = 1 if diff > 0 else -1
-    diff_abs = abs(diff)
-    while diff_abs >= step:
-        for i in range(n):
+    if diff != 0:
+        sgn = 1 if diff > 0 else -1
+        diff_abs = abs(diff)
+        while diff_abs >= step:
+            for i in range(n):
+                if diff_abs < step: break
+                new_q = chunks[i] + (step if sgn>0 else -step)
+                if new_q >= 0:
+                    chunks[i] = new_q
+                    diff_abs -= step
             if diff_abs < step: break
-            new_q = chunks[i] + (step if sgn>0 else -step)
-            if new_q >= 0:
-                chunks[i] = new_q
-                diff_abs -= step
-        if diff_abs < step: break
-        # safeguard
-        break
     # ensure minq where possible by stealing from others
     for i in range(n):
         if chunks[i] == 0: continue
@@ -492,7 +514,7 @@ def set_sl(account_key: str, extra: dict, symbol: str, pos_idx: int, new_sl: Dec
     except Exception as e:
         log.warning(f"set SL error {account_key}:{symbol}: {e}")
 
-# ---------- fills: BE + laddered SL ----------
+# ---------- fills: laddered SL ----------
 def handle_tp_fill(account_key: str, extra: dict, ev: dict):
     symbol = ev.get("symbol")
     with STATE.lock:
@@ -511,22 +533,13 @@ def handle_tp_fill(account_key: str, extra: dict, ev: dict):
     filled_px = ev.get("avgPrice") or ev.get("execPrice") or ev.get("price")
     send_tg(f"🎯 {account_key}:{symbol} TP filled {filled_count}/{CFG['tp_rungs']} @ {filled_px}")
 
-    # Move to BE after TP2
-    if filled_count >= CFG["be_after_tp_index"]:
-        with STATE.lock:
-            already = s.get("be_moved", False)
-            s["be_moved"] = True
-        if not already:
-            be_price = entry + tick*CFG["be_buffer_ticks"] if side_word=="long" else entry - tick*CFG["be_buffer_ticks"]
-            set_sl(account_key, extra, symbol, pos_idx, be_price)
-
-    # Ladder SL to previous TP price each subsequent fill
-    if targets:
-        if filled_count >= 3:  # from TP3 onwards
-            prev_index = min(filled_count - 2, CFG["tp_rungs"] - 2)  # TP3->index1, TP4->2, TP5->3
-            if 0 <= prev_index < len(targets):
-                ladder_price = Decimal(str(targets[prev_index]))
-                set_sl(account_key, extra, symbol, pos_idx, ladder_price)
+    # Ladder SL to previous TP price:
+    # TP2 -> SL = TP1; TP3 -> SL = TP2; TP4 -> SL = TP3; TP5 -> SL = TP4
+    if targets and filled_count >= 2:
+        prev_index = min(filled_count - 2, CFG["tp_rungs"] - 2)  # 2->0, 3->1, 4->2, 5->3
+        if 0 <= prev_index < len(targets):
+            ladder_price = Decimal(str(targets[prev_index]))
+            set_sl(account_key, extra, symbol, pos_idx, ladder_price)
 
 # ---------- bootstrap/sweep ----------
 def load_positions_once():
@@ -568,7 +581,7 @@ def periodic_sweep_loop():
                             with STATE.lock:
                                 s = STATE.pos.get((acct_key, symbol))
                                 prev_qty = s.get("qty") if s else None
-                            # sync if new or size changed
+                            # sync if new or size changed or ladder not yet placed
                             if s is None or prev_qty != size or not s.get("tp_placed"):
                                 place_or_sync_ladder(acct_key, extra, symbol, side_word, entry, size, pos_idx)
                     except Exception as e:
@@ -602,7 +615,7 @@ def ws_private_handler(message):
                 symbol = ev.get("symbol")
                 status = (ev.get("orderStatus") or ev.get("execType") or "").lower()
                 reduce_only = str(ev.get("reduceOnly", "")).lower()
-                if not (("filled" in status or "trade" in status) and ("true" in reduce_only or reduce_only == "")):
+                if not (("filled" in status or "trade" in status) and ("true" in reduce_only or reduceOnly == "")):
                     continue
                 with STATE.lock:
                     accounts = [ak for (ak, sym) in STATE.pos.keys() if sym == symbol]
@@ -682,7 +695,7 @@ def _ws_watchdog():
 
 # ---------- main ----------
 def bootstrap():
-    send_tg("🟢 TP/SL Manager online (5 equal TPs; auto-resize on scale-in).")
+    send_tg("🟢 TP/SL Manager online (5 equal TPs; auto-resize on scale-in; tight SL).")
     log.info("TP/SL Manager started (5 equal TPs)")
 
     load_positions_once()
