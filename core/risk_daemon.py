@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 Base44 — Risk Daemon (portfolio guardrails + PnL snapshots)
+Core-aligned edition: uses core.bybit_client and core.breaker; keeps your PnL + rollups intact.
 
 What it does
 - Polls unified equity for MAIN + each SUB (SUB_UIDS), optionally excluding manual subs from enforcement.
 - Tracks a per-day local baseline and computes drawdown; trips a global breaker when DD exceeds threshold.
-- Persists breaker state to .state/risk_state.json (read by TP/SL Manager, Executor, etc.).
+- Persists breaker state via core.breaker (shared TTL/extend/notify semantics).
 - Writes JSONL snapshots to logs/pnl/<YYYY-MM-DD>.jsonl (so your PnL log isn't a separate snowflake).
-- Sends hourly rollups and end-of-day summary (same knobs you already use) with alert cooldowns.
-- Optional enforcement hooks (disabled by default) to attempt a soft account-safe mode via breaker.
+- Sends hourly rollups and end-of-day summary with alert cooldowns.
+- Optional enforcement hooks (passive; never flattens positions).
 
 Env (.env)
   # polling + timezone
@@ -32,36 +33,48 @@ Env (.env)
   RISK_MAX_DD_PCT=3.0          # daily max drawdown vs local-day baseline; triggers breaker
   RISK_NOTIFY_EVERY_MIN=10     # min minutes between identical alerts
   RISK_STARTUP_GRACE_SEC=20    # grace period after boot before evaluating DD
-  RISK_AUTOFIX=false           # if true, will set breaker file and ping; no position closing is attempted
-  RISK_AUTOFIX_DRY_RUN=true    # report intended actions without doing anything (kept for future active enforcement)
+  RISK_AUTOFIX=false           # if true, will trip breaker via core.breaker (no position closing attempted)
+  RISK_AUTOFIX_DRY_RUN=true    # retained for future active enforcement (currently informational only)
 
   # Relay awareness (optional; improves diagnostics before calling upstream)
   RELAY_URL=https://<your-ngrok>
   RELAY_TOKEN=...
 
-  # Bybit creds
+  # Bybit creds (used by core.bybit_client under the hood)
   BYBIT_API_KEY=...
   BYBIT_API_SECRET=...
   BYBIT_ENV=mainnet|testnet
 
   # Logging
   LOG_LEVEL=INFO
+
+  # Breaker defaults (honored by core.breaker)
+  BREAKER_DEFAULT_TTL_SEC=3600
+  BREAKER_NOTIFY_COOLDOWN_SEC=8
 """
 
 from __future__ import annotations
-import os, json, time, logging, datetime
+import os
+import json
+import time
+import logging
+import datetime
 from decimal import Decimal, getcontext
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
 from dotenv import load_dotenv
-from pybit.unified_trading import HTTP
 
-# notifier (soft dep)
+# Notifier (soft dep)
 try:
     from core.notifier_bot import tg_send
 except Exception:
-    def tg_send(msg: str, priority: str="info", **_): print(f"[notify/{priority}] {msg}")
+    def tg_send(msg: str, priority: str = "info", **_):  # type: ignore
+        print(f"[notify/{priority}] {msg}")
+
+# Core stacks we standardize on
+from core.bybit_client import Bybit
+from core import breaker
 
 getcontext().prec = 28
 
@@ -75,7 +88,9 @@ log = logging.getLogger("risk_daemon")
 
 STATE_DIR = ROOT / ".state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
-BREAKER_FILE = STATE_DIR / "risk_state.json"           # shared with other bots
+# This daemon no longer writes risk_state.json directly; the canonical path is owned by core.breaker
+BREAKER_FILE = STATE_DIR / "risk_state.json"
+
 EFFECTIVE_DIR = ROOT / ".state" / "effective"          # where strategy_config writes
 EFFECTIVE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -83,18 +98,22 @@ PNL_DIR = Path(os.getenv("PNL_LOG_DIR", str(ROOT / "logs" / "pnl")))
 PNL_DIR.mkdir(parents=True, exist_ok=True)
 PNL_ROTATE_DAILY = (os.getenv("PNL_ROTATE_DAILY", "0") == "1")
 
-# ---- helpers ----
+# ---- env helpers ----
 def env_bool(k: str, default: bool) -> bool:
     v = (os.getenv(k, str(int(default))) or "").strip().lower()
     return v in {"1","true","yes","on"}
 
 def env_int(k: str, default: int) -> int:
-    try: return int((os.getenv(k, str(default)) or "").strip())
-    except Exception: return default
+    try:
+        return int((os.getenv(k, str(default)) or "").strip())
+    except Exception:
+        return default
 
 def env_float(k: str, default: float) -> float:
-    try: return float((os.getenv(k, str(default)) or "").strip())
-    except Exception: return default
+    try:
+        return float((os.getenv(k, str(default)) or "").strip())
+    except Exception:
+        return default
 
 def env_csv(k: str) -> list[str]:
     raw = os.getenv(k, "") or ""
@@ -103,9 +122,9 @@ def env_csv(k: str) -> list[str]:
 # ---- config knobs ----
 PNL_POLL_SEC = env_int("PNL_POLL_SEC", 30)
 
-PNL_SEND_HOURLY = env_bool("PNL_SEND_HOURLY", True)
-PNL_SEND_DAILY  = env_bool("PNL_SEND_DAILY", True)
-PNL_DAILY_SEND_HOUR = env_int("PNL_DAILY_SEND_HOUR", 23)
+PNL_SEND_HOURLY       = env_bool("PNL_SEND_HOURLY", True)
+PNL_SEND_DAILY        = env_bool("PNL_SEND_DAILY", True)
+PNL_DAILY_SEND_HOUR   = env_int("PNL_DAILY_SEND_HOUR", 23)
 
 TZ = os.getenv("TZ", "America/Phoenix") or "America/Phoenix"
 
@@ -113,17 +132,17 @@ SUB_UIDS = env_csv("SUB_UIDS")
 MANUAL_SUB_UIDS = set(env_csv("MANUAL_SUB_UIDS"))
 EXCLUDE_MAIN = env_bool("EXCLUDE_MAIN_FROM_ENFORCE", False)
 
-RISK_MAX_DD_PCT = env_float("RISK_MAX_DD_PCT", 3.0)
-RISK_NOTIFY_EVERY_MIN = env_int("RISK_NOTIFY_EVERY_MIN", 10)
+RISK_MAX_DD_PCT        = env_float("RISK_MAX_DD_PCT", 3.0)
+RISK_NOTIFY_EVERY_MIN  = env_int("RISK_NOTIFY_EVERY_MIN", 10)
 RISK_STARTUP_GRACE_SEC = env_int("RISK_STARTUP_GRACE_SEC", 20)
-RISK_AUTOFIX = env_bool("RISK_AUTOFIX", False)
-RISK_AUTOFIX_DRY = env_bool("RISK_AUTOFIX_DRY_RUN", True)
+RISK_AUTOFIX           = env_bool("RISK_AUTOFIX", False)
+RISK_AUTOFIX_DRY       = env_bool("RISK_AUTOFIX_DRY_RUN", True)
 
 # relay (for diagnostics)
 RELAY_URL = (os.getenv("RELAY_URL", "") or os.getenv("DASHBOARD_RELAY_BASE", "")).rstrip("/")
 RELAY_TOKEN = os.getenv("RELAY_TOKEN", "") or os.getenv("RELAY_SECRET", "")
 
-# Bybit client
+# ---- client (core.bybit_client) ----
 BYBIT_KEY = os.getenv("BYBIT_API_KEY","")
 BYBIT_SECRET = os.getenv("BYBIT_API_SECRET","")
 BYBIT_ENV = (os.getenv("BYBIT_ENV","mainnet") or "mainnet").lower().strip()
@@ -131,7 +150,8 @@ BYBIT_ENV = (os.getenv("BYBIT_ENV","mainnet") or "mainnet").lower().strip()
 if not (BYBIT_KEY and BYBIT_SECRET):
     raise SystemExit("Missing BYBIT_API_KEY/BYBIT_API_SECRET in .env")
 
-http = HTTP(testnet=(BYBIT_ENV=="testnet"), api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
+by = Bybit()
+by.sync_time()
 
 # ---- time helpers ----
 def now_local() -> datetime.datetime:
@@ -141,56 +161,53 @@ def now_local() -> datetime.datetime:
     except Exception:
         return datetime.datetime.now()
 
-def today_key(dt: Optional[datetime.datetime]=None) -> str:
-    d = dt or now_local()
+def today_key(dt_in: Optional[datetime.datetime]=None) -> str:
+    d = dt_in or now_local()
     return d.strftime("%Y-%m-%d")
 
-# ---- breaker state ----
-def read_breaker() -> dict:
-    try:
-        return json.loads(BREAKER_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {"breach": False, "reason": "", "ts": ""}
-
-def write_breaker(breach: bool, reason: str):
-    state = {
-        "breach": bool(breach),
-        "reason": reason,
-        "ts": now_local().isoformat()
-    }
-    try:
-        BREAKER_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-    return state
-
-# ---- equity sampling ----
+# ---- equity sampling via core.bybit_client ----
 def _equity_unified(extra: dict) -> Decimal:
     """
     Returns total equity (USD notionally) for an account (main or sub).
+    extra accepts {"memberId": "..."} or {"subUid": "..."} depending on your Bybit wrapper.
+    Bybit v5 balance returns a list of coins; we sum usdValue and fallback on stables.
     """
     try:
-        res = http.get_wallet_balance(accountType="UNIFIED", **extra)
-        coins = (res.get("result") or {}).get("list", []) or []
-        if not coins:
+        ok, data, err = by.get_wallet_balance(accountType="UNIFIED", **extra)
+        if not ok:
+            log.warning(f"equity fetch error ({extra}): {err}")
             return Decimal("0")
+        wallets = (data.get("result") or {}).get("list") or []
+        if not wallets:
+            return Decimal("0")
+        # Some wrappers return list-of-wallets; choose the first unified wallet
+        coins = wallets[0].get("coin", []) or []
         eq = Decimal("0")
-        for c in coins[0].get("coin", []):
-            # Bybit returns usdValue; fallback to walletBalance for stables
+        for c in coins:
+            coin = str(c.get("coin") or "").upper()
             usd = Decimal(str(c.get("usdValue") or "0"))
-            if usd == 0 and c.get("coin") in {"USDT","USDC"}:
+            if usd == 0 and coin in {"USDT","USDC"}:
                 usd = Decimal(str(c.get("walletBalance") or "0"))
             eq += usd
         return eq
     except Exception as e:
-        log.warning(f"equity fetch error ({extra}): {e}")
+        log.warning(f"equity fetch exception ({extra}): {e}")
         return Decimal("0")
 
 def snapshot_equities() -> Dict[str, str]:
     data: Dict[str, str] = {}
     data["main"] = str(_equity_unified({}))
     for uid in SUB_UIDS:
-        data[f"sub:{uid}"] = str(_equity_unified({"subUid": uid}))
+        # Prefer memberId if your client supports it; fall back to subUid if that's exposed
+        extra = {}
+        # Attempt memberId; if your client maps it differently, swap key here.
+        extra_key = "memberId" if "memberId" in by.PRIVATE_EXTRA_KEYS else ("subUid" if "subUid" in by.PRIVATE_EXTRA_KEYS else None)  # type: ignore[attr-defined]
+        if extra_key:
+            extra[extra_key] = uid
+        else:
+            # Older client variant: try both; only one will be honored
+            extra = {"memberId": uid, "subUid": uid}
+        data[f"sub:{uid}"] = str(_equity_unified(extra))
     total = sum(Decimal(v) for v in data.values())
     data["total"] = str(total)
     return data
@@ -232,19 +249,18 @@ def compute_dd_pct(cur_total: Decimal, base_total: Decimal) -> float:
     dd = (base_total - cur_total) / base_total * 100.0
     return float(max(0.0, dd))
 
+# ---- breaker control (shared API) ----
 def breaker_enforce(reason: str):
     """
-    Current enforcement is passive: write breaker file + notify.
-    You can wire active enforcement later (cancel all reduce-only, flatten, etc.).
+    Passive enforcement: trip breaker using core.breaker (honors BREAKER_DEFAULT_TTL_SEC).
     """
-    state = write_breaker(True, reason)
+    # If you want a specific TTL from this daemon instead of env default, pass ttl_sec=XXXX here.
+    breaker.set_on(reason=reason, ttl_sec=None, source="risk_daemon")
     tg_send(f"⛔ Risk breaker SET • {reason}", priority="error")
-    log.warning(f"breaker set: {state}")
 
 def breaker_clear():
-    prev = read_breaker()
-    if prev.get("breach"):
-        write_breaker(False, "manual/auto clear")
+    if breaker.is_active():
+        breaker.set_off(reason="risk_daemon_clear", source="risk_daemon")
         tg_send("✅ Risk breaker cleared.", priority="success")
 
 # ---- relay sanity (optional) ----
@@ -323,8 +339,7 @@ def main():
                     last_alert_ts = time.time()
                     reason = f"DD {dd_pct:.2f}% ≥ {RISK_MAX_DD_PCT:.2f}% (vs {base_total:.2f})"
                     if RISK_AUTOFIX:
-                        # passive enforcement: set breaker
-                        if read_breaker().get("breach") is not True:
+                        if not breaker.is_active():
                             breaker_enforce(reason)
                         else:
                             tg_send(f"⛔ Risk breaker still active • {reason}", priority="error")
