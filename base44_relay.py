@@ -524,9 +524,9 @@ def compat_market_tickers_v5():
 if __name__ == "__main__":
     host = os.getenv("RELAY_HOST", "0.0.0.0")
     try:
-        port = int(os.getenv("RELAY_PORT", "8080"))
+        port = int(os.getenv("RELAY_PORT", "5000"))
     except ValueError:
-        port = 8080
+        port = 5000
     log.info(f"Starting Base44 Relay on http://{host}:{port} → {BYBIT_BASE}")
     log.info(f"Loaded from: {os.path.abspath(__file__)}")
     app.run(host=host, port=port, debug=False)
