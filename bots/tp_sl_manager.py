@@ -487,8 +487,8 @@ def _split_even(total: Decimal, step: Decimal, minq: Decimal, n: int) -> List[De
 
 def build_equal_r_targets(entry: Decimal, stop: Decimal, side_word: str, tick: Decimal) -> List[Decimal]:
     n = CFG.get("tp_rungs", 5)
-    r_start = Decimal(str(CFG.get("tp_equal_r_start", 0.5")))
-    r_step  = Decimal(str(CFG.get("tp_equal_r_step", 0.5")))
+    r_start = Decimal(str(CFG.get("tp_equal_r_start", 0.5)))
+    r_step  = Decimal(str(CFG.get("tp_equal_r_step", 0.5)))
 
     r_value = abs(entry - stop)
     targets: List[Decimal] = []
