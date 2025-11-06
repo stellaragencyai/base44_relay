@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "main": {
+    "uid": "MAIN",
+    "name": "Main Account",
+    "mode": "manual_allowed",               // "auto" | "semi_auto" | "manual" | "manual_allowed"
+    "entry_owner": "executor",              // who is allowed to open: "executor" | "human" | "both"
+    "exit_owner": "b44",                    // who maintains exits: "b44" keeps TPs/SLs via reconciler
+    "risk_multiplier": 1.00,                // scales RISK_PCT from .env
+    "symbols": []                           // empty = all symbols allowed
+  },
+  "sub_accounts": [
+    {
+      "uid": "260417078",
+      "name": "sniper 42",
+      "mode": "manual",                     // fully manual, bots do not open or close
+      "entry_owner": "human",
+      "exit_owner": "b44",                  // reconciler may still protect with SLs if you want
+      "risk_multiplier": 0.0,
+      "symbols": []
+    },
+    {
+      "uid": "302355261",
+      "name": "xdxdx",
+      "mode": "manual",                     // second manual sub per your rule
+      "entry_owner": "human",
+      "exit_owner": "b44",
+      "risk_multiplier": 0.0,
+      "symbols": []
+    },
+    {
+      "uid": "152304954",
+      "name": "AJ Account",
+      "mode": "auto",
+      "entry_owner": "executor",
+      "exit_owner": "b44",
+      "risk_multiplier": 0.8,
+      "symbols": ["BTCUSDT","ETHUSDT","HBARUSDT"]
+    },
+    {
+      "uid": "65986659",
+      "name": "Mikecoehn2023",
+      "mode": "auto",
+      "entry_owner": "executor",
+      "exit_owner": "b44",
+      "risk_multiplier": 1.0,
+      "symbols": []
+    },
+    {
+      "uid": "65986592",
+      "name": "alexcarson2023",
+      "mode": "auto",
+      "entry_owner": "executor",
+      "exit_owner": "b44",
+      "risk_multiplier": 1.2,
+      "symbols": []
+    },
+    {
+      "uid": "152499802",
+      "name": "DJ Account",
+      "mode": "auto",
+      "entry_owner": "executor",
+      "exit_owner": "b44",
+      "risk_multiplier": 0.6,
+      "symbols": []
+    }
+  ],
+  "defaults": {
+    "mode": "auto",
+    "entry_owner": "executor",
+    "exit_owner": "b44",
+    "risk_multiplier": 1.0,
+    "symbols": []
+  },
+  "rules": {
+    "allow_manual_main_entries": true,      // you can occasionally place on Main
+    "bots_must_respect_manual": true,       // bots will not open on manual accounts
+    "reconciler_can_protect_manual": true   // reconciler may ensure SL/TP on manual accounts
+  }
+}
