@@ -1,169 +1,267 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-bots/pnl_daily.py — Daily equity PnL snapshot + report (main + sub-accounts)
+Base44 — PnL Daily/Rollup (Telegram pretty print)
 
-Usage (from project root, venv active):
-  # take today's baseline snapshot (run once after midnight local)
-  python -m bots.pnl_daily --snapshot
+- Pulls equity per account (main + SUB_UIDS)
+- Computes deltas vs last snapshot of the same UTC day
+- Counts open positions per account
+- Prints tidy Telegram message with emojis and alignment
+- Supports --snapshot to write a baseline file, otherwise prints live rollup
 
-  # produce end-of-day report and send to Telegram
-  python -m bots.pnl_daily --report
-
-What it does:
-- Pulls UNIFIED equity for PNL_EQUITY_COIN across main + SUB_UIDS via relay /v5/account/wallet-balance
-- Writes snapshot to logs/pnl/YYYY-MM-DD/baseline.json
-- On report, compares current equity to baseline and prints + Telegram-sends a rollup
+ENV (optional):
+  PNL_TITLE=Portfolio PnL
+  PNL_EQUITY_COIN=USDT
+  PNL_SHOW_UNREAL=true
+  PNL_SHOW_REAL=true
+  PNL_EMOJI_MAIN=🧠
+  PNL_EMOJI_DEFAULT=🟦
+  PNL_EMOJI_MAP=uid:emoji,uid:emoji,...
 """
 
 from __future__ import annotations
 import os, json, time, math, pathlib, argparse, datetime
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Any, List, Tuple
 
 from dotenv import load_dotenv
 
-# Relay client (must expose proxy(method, path, params/body))
+# Relay + notifier
 import core.relay_client as rc
-
-# Notifier (optional but we have it)
 try:
     from core.notifier_bot import tg_send
 except Exception:
-    def tg_send(msg: str, priority: str="info", **_): print(f"[notify/{priority}] {msg}")
+    def tg_send(msg: str, priority: str="info", **_):  # fallback
+        print(f"[notify/{priority}] {msg}")
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-load_dotenv(ROOT / ".env", override=True)
+LOGDIR = ROOT / "logs" / "pnl"
+LOGDIR.mkdir(parents=True, exist_ok=True)
 
-LOG_DIR = ROOT / "logs" / "pnl"
-TODAY_DIR = LOG_DIR / datetime.date.today().isoformat()
-TODAY_DIR.mkdir(parents=True, exist_ok=True)
+load_dotenv(dotenv_path=ROOT / ".env")
 
-COIN = os.getenv("PNL_EQUITY_COIN", "USDT") or "USDT"
-SUBS = [s.strip() for s in (os.getenv("PNL_SUB_UIDS","") or "").split(",") if s.strip()]
-ACCOUNT_TYPE = "UNIFIED"  # bybit unified trading
+def env_bool(k: str, default: bool) -> bool:
+    v = (os.getenv(k, str(int(default))) or "").strip().lower()
+    return v in {"1","true","yes","on"}
 
-def _wallet_equity(sub_uid: Optional[str]=None) -> float:
-    """
-    Fetch equity for COIN from wallet-balance endpoint via relay.
-    Supports subUid param for sub-accounts.
-    """
-    params = {"accountType": ACCOUNT_TYPE, "coin": COIN}
-    if sub_uid:
-        params["subUid"] = str(sub_uid)
+TITLE          = os.getenv("PNL_TITLE", "Portfolio PnL")
+COIN           = os.getenv("PNL_EQUITY_COIN", "USDT")
+SHOW_UNREAL    = env_bool("PNL_SHOW_UNREAL", True)
+SHOW_REAL      = env_bool("PNL_SHOW_REAL", True)
+EMOJI_MAIN     = os.getenv("PNL_EMOJI_MAIN", "🧠")
+EMOJI_DEFAULT  = os.getenv("PNL_EMOJI_DEFAULT", "🟦")
 
-    resp = rc.proxy("GET", "/v5/account/wallet-balance", params=params)
-    # accept dict or JSON string
-    if isinstance(resp, str):
-        try:
-            resp = json.loads(resp)
-        except Exception:
-            return 0.0
+# Parse mapping like "260417078:🎯,302355261:🧪"
+def parse_emoji_map(s: str) -> Dict[str, str]:
+    out = {}
+    if not s:
+        return out
+    for part in s.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        uid, emo = part.split(":", 1)
+        out[uid.strip()] = emo.strip() or EMOJI_DEFAULT
+    return out
 
-    # Some relays wrap; normalize
-    result = (resp.get("result") or {})
-    lst = result.get("list") or []
-    if not lst:
-        return 0.0
-    entry = lst[0]
-    # bybit returns coin list as array of dicts under 'coin'
-    coin_rows = entry.get("coin") or []
-    if not coin_rows:
-        return 0.0
-    row = None
-    for c in coin_rows:
-        if str(c.get("coin")).upper() == COIN.upper():
-            row = c; break
-    if not row:
-        return 0.0
+EMOJI_MAP = parse_emoji_map(os.getenv("PNL_EMOJI_MAP", ""))
+
+SUB_UIDS = [x.strip() for x in (os.getenv("SUB_UIDS","")).split(",") if x.strip()]
+
+def now_utc() -> datetime.datetime:
+    return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+
+def day_key_utc(dt: datetime.datetime=None) -> str:
+    dt = dt or now_utc()
+    return dt.strftime("%Y-%m-%d")
+
+def money(x: float) -> str:
+    # friendlier fixed width for tiny accounts too
+    if abs(x) >= 1000:
+        return f"{x:,.2f}"
+    return f"{x:.2f}"
+
+def pct_safe(a: float, b: float) -> float:
     try:
-        return float(row.get("equity") or 0.0)
+        if b == 0:
+            return 0.0
+        return (a - b) / b * 100.0
     except Exception:
         return 0.0
 
-def _snapshot_path() -> pathlib.Path:
-    return TODAY_DIR / "baseline.json"
+def arrow(delta: float) -> str:
+    if delta > 0.0005:
+        return "▲"
+    if delta < -0.0005:
+        return "▼"
+    return "●"
 
-def _load_snapshot() -> Dict[str, float]:
-    p = _snapshot_path()
-    if not p.exists(): return {}
+def _wallet_equity(extra: Dict[str, Any]|None, coin: str) -> Tuple[float, float, float]:
+    """
+    Returns (total_equity, unrealized_pnl, realized_pnl) for unified account.
+    Falls back gracefully if fields are missing.
+    """
+    params = {"accountType": "UNIFIED"}
+    try:
+        resp = rc.proxy("GET", "/v5/account/wallet-balance", params=params, timeout=20) if extra else rc.proxy("GET", "/v5/account/wallet-balance", params=params, timeout=20)
+        body = (resp.get("primary",{}) or {}).get("body",{}) if isinstance(resp, dict) else {}
+        lst  = ((body.get("result",{}) or {}).get("list",[]) or [])
+        total_equity = 0.0
+        unreal = 0.0
+        realized = 0.0
+        for acct in lst:
+            for c in (acct.get("coin",[]) or []):
+                if (c.get("coin") or "").upper() == (coin or "USDT").upper():
+                    try: total_equity += float(c.get("equity",0))
+                    except: pass
+                    try: unreal += float(c.get("unrealisedPnl",0))
+                    except: pass
+                    try: realized += float(c.get("cumRealisedPnl",0))
+                    except: pass
+        # If no coin breakdown, try top level totalEquity
+        if total_equity <= 0:
+            for acct in lst:
+                try: total_equity += float(acct.get("totalEquity",0))
+                except: pass
+        return float(total_equity or 0.0), float(unreal or 0.0), float(realized or 0.0)
+    except Exception:
+        return 0.0, 0.0, 0.0
+
+def _positions_count(extra: Dict[str,Any]|None) -> int:
+    try:
+        env = {"category":"linear"}
+        if extra and "subUid" in extra:
+            resp = rc.proxy("GET", "/v5/position/list", params=env | {"subUid": extra["subUid"]})
+        else:
+            resp = rc.proxy("GET", "/v5/position/list", params=env)
+        body = (resp.get("primary",{}) or {}).get("body",{})
+        rows = ((body.get("result",{}) or {}).get("list",[]) or [])
+        # count only non-zero positions
+        n = 0
+        for p in rows:
+            try:
+                if float(p.get("size") or 0) > 0:
+                    n += 1
+            except Exception:
+                pass
+        return n
+    except Exception:
+        return 0
+
+def collect_accounts() -> List[Tuple[str, Dict[str,Any]]]:
+    out = [("main", {})]
+    for uid in SUB_UIDS:
+        out.append((f"sub:{uid}", {"subUid": uid}))
+    return out
+
+def snapshot_path(day: str) -> pathlib.Path:
+    return LOGDIR / f"daily_{day}.json"
+
+def load_snapshot(day: str) -> Dict[str, Any]:
+    p = snapshot_path(day)
+    if not p.exists():
+        return {}
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
-def _save_snapshot(data: Dict[str, float]) -> None:
-    p = _snapshot_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+def save_snapshot(day: str, data: Dict[str, Any]) -> None:
+    snapshot_path(day).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
-def collect_equities() -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    out["main"] = _wallet_equity(None)
-    for uid in SUBS:
-        out[f"sub:{uid}"] = _wallet_equity(uid)
-    return out
+def emoji_for(account_key: str) -> str:
+    if account_key == "main":
+        return EMOJI_MAIN
+    if account_key.startswith("sub:"):
+        uid = account_key.split(":",1)[1]
+        return EMOJI_MAP.get(uid, EMOJI_DEFAULT)
+    return EMOJI_DEFAULT
 
-def fmt(num: float) -> str:
-    # USDT-ish formatting
-    return f"{num:,.2f}"
+def label_for(account_key: str) -> str:
+    if account_key == "main":
+        return "main"
+    if account_key.startswith("sub:"):
+        return account_key  # or resolve nickname from registry if you want
+    return account_key
 
-def sign(num: float) -> str:
-    return "🟢" if num > 0 else ("🔴" if num < 0 else "⚪")
+def rollup() -> None:
+    day = day_key_utc()
+    prev = load_snapshot(day)  # same-day baseline
+    rows = []
+    portfolio_total = 0.0
+    prev_total = float(prev.get("_portfolio_total", 0.0))
 
-def mk_report(baseline: Dict[str, float], current: Dict[str, float]) -> Tuple[str, float, float]:
-    lines: List[str] = []
-    tot_base = 0.0; tot_cur = 0.0
+    for acct_key, extra in collect_accounts():
+        eq, unrl, rlzd = _wallet_equity(extra, COIN)
+        pcnt = _positions_count(extra)
+        portfolio_total += eq
+        prev_eq = float(prev.get(acct_key, {}).get("equity", 0.0))
+        rows.append({
+            "key": acct_key,
+            "equity": eq,
+            "prev_eq": prev_eq,
+            "unreal": unrl,
+            "real": rlzd,
+            "pos": pcnt
+        })
 
-    # stable ordering: main first, then subs numerically
-    keys = ["main"] + sorted([k for k in current.keys() if k.startswith("sub:")],
-                             key=lambda x: int(x.split(":")[1]))
+    # Build message
+    ts = now_utc().strftime("%Y-%m-%d %H:%M UTC")
+    delta_port = pct_safe(portfolio_total, prev_total)
+    hdr = f"📊 <b>{TITLE}</b> @ {ts}\nPortfolio: <b>{money(portfolio_total)}</b> {COIN}  Δ {delta_port:+.2f}% {arrow(delta_port)}"
 
-    for k in keys:
-        b = float(baseline.get(k, 0.0))
-        c = float(current.get(k, 0.0))
-        d = c - b
-        pct = (d / b * 100.0) if b > 0 else 0.0
-        tot_base += b; tot_cur += c
-        lines.append(f"{sign(d)} {k:<10} Δ {fmt(d)}  ({pct:+.2f}%)   cur {fmt(c)}  base {fmt(b)}")
+    # Format rows monospaced
+    # columns: emoji label equity delta pos [unreal/real]
+    lines = []
+    for r in rows:
+        em = emoji_for(r["key"])
+        lab = label_for(r["key"])
+        dlt = pct_safe(r["equity"], r["prev_eq"])
+        pos = r["pos"]
+        extras = []
+        if SHOW_UNREAL:
+            extras.append(f"U:{money(r['unreal'])}")
+        if SHOW_REAL:
+            extras.append(f"R:{money(r['real'])}")
+        extra_str = ("  " + " ".join(extras)) if extras else ""
+        # pad label to same width for alignment
+        labp = f"{lab:>14}"
+        ln = f"{em} <code>{labp}</code>  <code>{money(r['equity']):>8}</code>  Δ <code>{dlt:+6.2f}%</code> {arrow(dlt)}  <code>pos:{pos:>2}</code>{extra_str}"
+        lines.append(ln)
 
-    tot_d = tot_cur - tot_base
-    tot_pct = (tot_d / tot_base * 100.0) if tot_base > 0 else 0.0
+    # Simple highlights
+    try:
+        best = max(rows, key=lambda x: pct_safe(x["equity"], x["prev_eq"]))
+        worst = min(rows, key=lambda x: pct_safe(x["equity"], x["prev_eq"]))
+        bdl = pct_safe(best["equity"], best["prev_eq"])
+        wdl = pct_safe(worst["equity"], worst["prev_eq"])
+        hl = f"\n⭐ <i>Best:</i> {label_for(best['key'])} {bdl:+.2f}%   ❗ <i>Worst:</i> {label_for(worst['key'])} {wdl:+.2f}%"
+    except Exception:
+        hl = ""
 
-    header = f"📊 Daily PnL — {datetime.date.today().isoformat()} • coin={COIN}"
-    footer = f"—\n{sign(tot_d)} TOTAL Δ {fmt(tot_d)}  ({tot_pct:+.2f}%)   cur {fmt(tot_cur)}  base {fmt(tot_base)}"
-
-    return "\n".join([header, *lines, footer]), tot_d, tot_pct
+    msg = hdr + "\n" + "\n".join(lines) + hl
+    tg_send(msg, priority="success")
 
 def do_snapshot() -> None:
-    equities = collect_equities()
-    _save_snapshot(equities)
-    tg_send(f"🟢 PnL baseline recorded for {datetime.date.today().isoformat()} • {COIN}\n" +
-            "\n".join([f"{k:<10} {fmt(v)}" for k,v in equities.items()] ),
-            priority="success")
-
-def do_report() -> None:
-    base = _load_snapshot()
-    if not base:
-        tg_send("⚠️ No baseline found for today; run --snapshot first.", priority="warn")
-        return
-    cur = collect_equities()
-    report, tot_d, tot_pct = mk_report(base, cur)
-    tg_send(report, priority="info")
-    # persist a copy of the report
-    (TODAY_DIR / "report.txt").write_text(report, encoding="utf-8")
+    day = day_key_utc()
+    snap = {"_ts": int(time.time()*1000)}
+    total = 0.0
+    for acct_key, extra in collect_accounts():
+        eq, unrl, rlzd = _wallet_equity(extra, COIN)
+        total += eq
+        snap[acct_key] = {"equity": eq, "unreal": unrl, "real": rlzd}
+    snap["_portfolio_total"] = total
+    save_snapshot(day, snap)
+    tg_send(f"🗂 Snapshot saved for {day}: total={money(total)} {COIN}", priority="info")
 
 def main():
-    ap = argparse.ArgumentParser(description="Daily PnL rollup (snapshot/report)")
-    ap.add_argument("--snapshot", action="store_true", help="Take baseline snapshot for today")
-    ap.add_argument("--report", action="store_true", help="Send end-of-day PnL report")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--snapshot", action="store_true", help="write today's baseline")
     args = ap.parse_args()
 
     if args.snapshot:
         do_snapshot()
-    elif args.report:
-        do_report()
     else:
-        print("Nothing to do. Try --snapshot or --report.")
+        rollup()
 
 if __name__ == "__main__":
     main()
