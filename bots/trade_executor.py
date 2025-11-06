@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-trade_executor.py — risk-based entries via relay (DRY by default), maker-first, window-gated, cooldowned.
-Now with global breaker enforcement.
+trade_executor.py — risk-based entries via relay (DRY by default), maker-first, window-gated, cooldowned,
+with symbol whitelist/blacklist guards.
 
 ENV (existing + new knobs):
   EXECUTOR_RELAY_BASE=http://127.0.0.1:5000   # or https ngrok URL
@@ -20,9 +20,11 @@ ENV (existing + new knobs):
   EXEC_TRADING_END=23:59                       # local window end
   EXEC_ALLOW_SHORTS=true                       # enable short entries
   EQUITY_COIN=USDT                             # which wallet coin to read for equity
+  TZ=America/Phoenix
 
   # NEW
-  EXEC_ENFORCE_BREAKER=true                    # refuse entries when breaker is ON
+  EXEC_SYMBOL_WHITELIST=GIGGLEUSDT,HBARUSDT    # only these if set
+  EXEC_SYMBOL_BLACKLIST=PUMPFUNUSDT            # always excluded if listed
 """
 
 from __future__ import annotations
@@ -33,7 +35,6 @@ from dotenv import load_dotenv
 # Project modules
 import core.relay_client as rc
 from core.instruments import load_or_fetch, round_price, round_qty
-from core import breaker  # NEW: global breaker
 
 # Optional Telegram notifier
 try:
@@ -52,7 +53,6 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 SIGDIR = ROOT / (os.getenv("SIGNAL_DIR") or "signals")
 QUEUE = SIGDIR / "observed.jsonl"
 
-# Knobs
 def _env_bool(k: str, default: bool) -> bool:
     v = (os.getenv(k, str(int(default))) or "").strip().lower()
     return v in {"1","true","yes","on"}
@@ -69,19 +69,25 @@ def _env_float(k: str, default: float) -> float:
     except Exception:
         return default
 
-EXEC_RISK_PCT       = _env_float("EXEC_RISK_PCT", 0.15)      # percent of equity risk per trade
-EXEC_MAX_LEVERAGE   = _env_int("EXEC_MAX_LEVERAGE", 50)
-EXEC_MAKER_TICKS    = _env_int("EXEC_MAKER_TICKS", 2)
-EXEC_COOLDOWN_SEC   = _env_int("EXEC_COOLDOWN_SEC", 300)
-EXEC_ALLOW_SHORTS   = _env_bool("EXEC_ALLOW_SHORTS", True)
-EXEC_ENFORCE_BREAKER= _env_bool("EXEC_ENFORCE_BREAKER", True)   # NEW
+def _env_set(k: str) -> set[str]:
+    v = (os.getenv(k, "") or "").strip()
+    if not v:
+        return set()
+    return {x.strip().upper() for x in v.split(",") if x.strip()}
 
-EQUITY_COIN         = os.getenv("EQUITY_COIN", "USDT") or "USDT"
-TZ                  = os.getenv("TZ", "America/Phoenix") or "America/Phoenix"
-TW_START            = os.getenv("EXEC_TRADING_START", "00:00")
-TW_END              = os.getenv("EXEC_TRADING_END", "23:59")
+EXEC_RISK_PCT      = _env_float("EXEC_RISK_PCT", 0.15)      # percent of equity risk per trade
+EXEC_MAX_LEVERAGE  = _env_int("EXEC_MAX_LEVERAGE", 50)
+EXEC_MAKER_TICKS   = _env_int("EXEC_MAKER_TICKS", 2)
+EXEC_COOLDOWN_SEC  = _env_int("EXEC_COOLDOWN_SEC", 300)
+EXEC_ALLOW_SHORTS  = _env_bool("EXEC_ALLOW_SHORTS", True)
+EQUITY_COIN        = os.getenv("EQUITY_COIN", "USDT") or "USDT"
+TZ                 = os.getenv("TZ", "America/Phoenix") or "America/Phoenix"
+TW_START           = os.getenv("EXEC_TRADING_START", "00:00")
+TW_END             = os.getenv("EXEC_TRADING_END", "23:59")
 
-# Cooldown memory (per run)
+WL                 = _env_set("EXEC_SYMBOL_WHITELIST")
+BL                 = _env_set("EXEC_SYMBOL_BLACKLIST")
+
 _LAST_TRADE_TS = defaultdict(float)
 
 def bps(a, b):
@@ -110,35 +116,27 @@ def _in_trading_window() -> bool:
     end   = now.replace(hour=e_hour, minute=e_min, second=59, microsecond=0)
     if end >= start:
         return start <= now <= end
-    # overnight window (e.g., 22:00–06:00)
     return now >= start or now <= end
 
 def _atr14_pct_fallback(symbol: str, last: float) -> float:
-    """
-    Cheap ATR% fallback without pulling full kline:
-    """
     if last <= 0:
-        return 0.005  # 0.5% as a conservative default
+        return 0.005
     if symbol.upper().startswith(("BTC", "ETH")):
         return 0.008
     return 0.012
 
 def _compute_stop_dist(symbol: str, last: float, params: dict) -> float:
-    # 1) explicit per-signal override
     try:
         sd = float(params.get("stop_dist"))
         if sd > 0:
             return sd
     except Exception:
         pass
-    # 2) fallback to rough ATR% proxy
     return _atr14_pct_fallback(symbol, last)
 
 def _shade_limit_price(side: str, ref_px: float, tick: float) -> float:
-    # Buy below, Sell above by N ticks to enforce PostOnly
     delta = EXEC_MAKER_TICKS * tick
     px = ref_px - delta if side.upper() == "BUY" else ref_px + delta
-    # round to tick
     return round_price(px, tick)
 
 def _leverage_ok(qty: float, price: float, equity: float, max_lev: int) -> bool:
@@ -162,19 +160,9 @@ def place_entry(symbol, side, qty, price=None, order_tag="B44"):
         log.info(f"[DRY] /bybit/proxy {json.dumps({'method':'POST','path':'/v5/order/create','body':body}, separators=(',',':'))}")
         tg_send(f"🧪 EXEC DRY • {symbol} {side} {qty} @ {body.get('price','MKT')}", priority="info")
         return {"ok": True, "dry": True}
-
-    # Signed request via relay
     return rc.proxy("POST", "/v5/order/create", body=body)
 
 def run():
-    # NEW: breaker gate
-    if EXEC_ENFORCE_BREAKER and breaker.is_active():
-        st = breaker.status()
-        reason = (st.get("reason") or "").strip()
-        log.warning(f"breaker active; executor standing down (reason: {reason})")
-        tg_send(f"🛑 EXEC paused — breaker active • reason: {reason}", priority="warn")
-        return
-
     if not _in_trading_window():
         log.info(f"outside trading window {TW_START}-{TW_END} local; skipping this pass")
         return
@@ -183,7 +171,6 @@ def run():
         log.info(f"signal queue not found: {QUEUE}")
         return
 
-    # read signals
     syms, sigs = set(), []
     for line in QUEUE.read_text(encoding="utf-8").splitlines():
         if not line.strip():
@@ -200,15 +187,28 @@ def run():
         log.info("no signals to process")
         return
 
-    # load instruments for legality/rounding
-    instr = load_or_fetch(sorted(list(syms)))
+    # whitelist/blacklist guard
+    if WL:
+        allowed = {x for x in syms if x.upper() in WL}
+        blocked = {x for x in syms if x.upper() not in WL}
+        if blocked:
+            for b in sorted(blocked):
+                log.info(f"{b}: blocked by whitelist")
+        syms = allowed
+        sigs = [s for s in sigs if s.get("symbol","").upper() in WL]
 
-    # equity
-    try:
-        equity = rc.equity_unified(coin=EQUITY_COIN)
-    except TypeError:
-        # old signature
-        equity = rc.equity_unified()
+    if BL:
+        sigs = [s for s in sigs if s.get("symbol","").upper() not in BL]
+        for b in sorted({x for x in syms if x.upper() in BL}):
+            log.info(f"{b}: blocked by blacklist")
+        syms = {s for s in syms if s.upper() not in BL}
+
+    if not sigs:
+        log.info("no signals left after WL/BL filters")
+        return
+
+    instr = load_or_fetch(sorted(list(syms)))
+    equity = rc.equity_unified(coin=EQUITY_COIN) if hasattr(rc, "equity_unified") else rc.equity_unified()
     if equity <= 0:
         log.warning(f"equity=0 or fetch failed; using 10 {EQUITY_COIN} as dummy base")
         equity = 10.0
@@ -233,7 +233,6 @@ def run():
 
         want_buy = typ in ("LONG_TEST","LONG_BREAKOUT","LONG")
         want_sell = typ.startswith("SHORT")
-
         if not (want_buy or want_sell):
             continue
 
@@ -243,7 +242,6 @@ def run():
             continue
         tick = meta["tickSize"]; step = meta["lotStep"]; minq = meta["minQty"]
 
-        # live top of book
         tk = rc.ticker(sym)
         if not tk:
             log.warning(f"{sym}: no ticker")
@@ -261,27 +259,21 @@ def run():
             log.info(f"{sym}: spread {spr_bps:.1f}bps > {spread_max_bps}bps; skip")
             continue
 
-        # cooldown
         now = time.time()
         if now - _LAST_TRADE_TS[sym] < EXEC_COOLDOWN_SEC:
             log.info(f"{sym}: cooldown active; skipping")
             continue
 
-        # stop distance (fraction of price)
         stop_dist_frac = _compute_stop_dist(sym, last, params)
-        stop_dist = max(stop_dist_frac, 1e-6) * last  # convert to price distance
+        stop_dist = max(stop_dist_frac, 1e-6) * last
 
-        # risk sizing: risk_cash = equity * (EXEC_RISK_PCT/100)
         risk_cash = equity * (EXEC_RISK_PCT / 100.0)
         if risk_cash <= 0:
             log.info(f"{sym}: risk_cash <= 0; skip")
             continue
 
-        # qty so that loss at stop equals risk_cash
-        # notional @ entry px = qty * last; loss ~ qty * stop_dist
         raw_qty = risk_cash / max(stop_dist, 1e-9)
 
-        # leverage cap: notional/equity <= EXEC_MAX_LEVERAGE
         notional = raw_qty * last
         max_notional = equity * EXEC_MAX_LEVERAGE
         if notional > max_notional:
@@ -292,7 +284,6 @@ def run():
             log.info(f"{sym}: qty {raw_qty:.8f} -> {qty} after rounding; skip")
             continue
 
-        # Decide side + maker shading
         if want_buy:
             side = "Buy"
             ref_px = bid if maker_only else last
@@ -302,7 +293,6 @@ def run():
 
         price = _shade_limit_price(side, ref_px, tick) if maker_only else None
 
-        # final leverage check post rounding
         if not _leverage_ok(qty, (price or last), equity, EXEC_MAX_LEVERAGE):
             log.info(f"{sym}: leverage cap would be exceeded; skip")
             continue
@@ -310,12 +300,11 @@ def run():
         res = place_entry(sym, side, qty, price=price if maker_only else None, order_tag=tag)
         _LAST_TRADE_TS[sym] = now
 
-        # Telegram summary
         mode = "LIVE" if LIVE else "DRY"
         msg = (
             f"✅ EXEC {mode} • {sym} {side.upper()} "
             f"{qty} @ {price if price else 'MKT'} • "
-            f"risk {EXEC_RISK_PCT:.2f}% of {EQUITY_COIN}≈{(equity * (EXEC_RISK_PCT/100.0)):.2f} • "
+            f"risk {EXEC_RISK_PCT:.2f}% of {EQUITY_COIN}≈{risk_cash:.2f} • "
             f"spr {spr_bps:.1f}bps • lev≤{EXEC_MAX_LEVERAGE}x"
         )
         if res and isinstance(res, dict) and res.get("ok") is True and res.get("dry"):
@@ -332,8 +321,5 @@ def run():
 
 if __name__ == "__main__":
     base = os.getenv('EXECUTOR_RELAY_BASE') or os.getenv('RELAY_BASE') or 'http://127.0.0.1:5000'
-    log.info(
-        f"executor LIVE={LIVE} relay={base} window={TW_START}-{TW_END} "
-        f"risk={EXEC_RISK_PCT:.2f}% lev≤{EXEC_MAX_LEVERAGE}x breaker_enforced={EXEC_ENFORCE_BREAKER}"
-    )
+    log.info(f"executor LIVE={LIVE} relay={base} window={TW_START}-{TW_END} risk={EXEC_RISK_PCT:.2f}% lev≤{EXEC_MAX_LEVERAGE}x WL={','.join(sorted(WL)) or '-'} BL={','.join(sorted(BL)) or '-'}")
     run()
