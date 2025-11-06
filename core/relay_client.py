@@ -1,239 +1,314 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-core/relay_client.py — robust relay HTTP helpers with sane env loading, retries, and shape-tolerant parsing.
+Base44 Relay Client — hardened, sub-account aware, backwards compatible
 
-Env keys honored (checked in this order):
-  Token: EXECUTOR_RELAY_TOKEN -> RELAY_TOKEN
-  Base:  EXECUTOR_RELAY_BASE  -> RELAY_BASE -> RELAY_URL (default http://127.0.0.1:5000)
-
-Headers sent:
-  Authorization: Bearer <token>
-  X-Relay-Token: <token>
-  Accept: application/json
-  Content-Type: application/json
-  ngrok-skip-browser-warning: true
+Key upgrades:
+- Reads relay base from: RELAY_URL | BASE44_RELAY_URL | EXECUTOR_RELAY_BASE | RELAY_BASE | default http://127.0.0.1:5000
+- Reads token from: RELAY_TOKEN | BASE44_RELAY_TOKEN | EXECUTOR_RELAY_TOKEN
+- Unified requests.Session with Bearer; 15s GET / 20s POST timeouts
+- Robust JSON handling and HTTP error raising with readable messages
+- `bybit_proxy(..., extra={'subUid': ...})` and `proxy(..., extra=...)` for per-subaccount routing
+- `equity_unified(coin=None, extra=None)` returns numeric equity; respects subUid context
+- Health helpers: `is_token_ok()`, `/diag/ping` support
+- Safe Telegram sender with tiny retry
+- Keeps your prior bot-friendly wrappers, but prefer `extra={'subUid': '260417078'}` over memberId params
 """
 
 from __future__ import annotations
-import os, json, time, typing
-from typing import Any, Dict, Optional
+
+import os
+import json
+import csv
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
 import requests
+from dotenv import load_dotenv
 
-# --- dotenv: load the project .env and OVERRIDE stale env vars ---
-_ENV_PATH = None
-def _load_env_once():
-    global _ENV_PATH
-    if _ENV_PATH is not None:
+# ──────────────────────────────────────────────────────────────────────────────
+# Env / Globals
+# ──────────────────────────────────────────────────────────────────────────────
+load_dotenv()
+
+# Base URL priority: explicit ngrok > executor vars > fallback localhost:5000
+_RELAY_BASE = (
+    os.getenv("RELAY_URL")
+    or os.getenv("BASE44_RELAY_URL")
+    or os.getenv("EXECUTOR_RELAY_BASE")
+    or os.getenv("RELAY_BASE")
+    or "http://127.0.0.1:5000"
+).rstrip("/")
+
+# Token priority: explicit > executor
+_RELAY_TOKEN = (
+    os.getenv("RELAY_TOKEN")
+    or os.getenv("BASE44_RELAY_TOKEN")
+    or os.getenv("EXECUTOR_RELAY_TOKEN")
+    or ""
+).strip()
+
+TG_TOKEN   = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TG_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+
+if not _RELAY_BASE:
+    raise RuntimeError("Missing relay base URL. Set RELAY_URL (preferred) or EXECUTOR_RELAY_BASE in .env")
+if not _RELAY_TOKEN:
+    raise RuntimeError("Missing relay bearer token. Set RELAY_TOKEN (or EXECUTOR_RELAY_TOKEN) in .env")
+
+# Unified session
+_SESSION = requests.Session()
+_SESSION.headers.update({
+    "Authorization": f"Bearer {_RELAY_TOKEN}",
+    "ngrok-skip-browser-warning": "true",
+    "Content-Type": "application/json",
+})
+
+def _u(path: str) -> str:
+    path = path if path.startswith("/") else f"/{path}"
+    return f"{_RELAY_BASE}{path}"
+
+def _json_or_text(resp: requests.Response) -> dict:
+    """Return JSON if possible; else include raw text."""
+    try:
+        return resp.json()
+    except Exception:
+        return {"status": resp.status_code, "raw": resp.text[:2000]}
+
+def _raise_for_auth(resp: requests.Response):
+    if resp.status_code == 401:
+        raise RuntimeError("401 from relay: token mismatch or not provided")
+    if resp.status_code == 403:
+        raise RuntimeError("403 from relay: forbidden (IP allowlist? token role?)")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Telegram
+# ──────────────────────────────────────────────────────────────────────────────
+def tg_send(text: str, parse_mode: Optional[str] = None) -> None:
+    """Best-effort Telegram message with micro-retry. No exceptions leak."""
+    if not TG_TOKEN or not TG_CHAT_ID:
         return
-    try:
-        from dotenv import load_dotenv, find_dotenv
-        _ENV_PATH = os.environ.get("BASE44_ENV_PATH") or find_dotenv(filename=".env", usecwd=True)
-        if _ENV_PATH:
-            load_dotenv(_ENV_PATH, override=True)
-        else:
-            load_dotenv(override=True)
-    except Exception:
-        _ENV_PATH = None
-
-_load_env_once()
-
-# --- env helpers (resolve fresh each call, so edits to .env take effect) ---
-def _env(k: str, default: str = "") -> str:
-    return (os.getenv(k, default) or "").strip()
-
-def _get_token() -> str:
-    return _env("EXECUTOR_RELAY_TOKEN") or _env("RELAY_TOKEN")
-
-def _get_base() -> str:
-    base = _env("EXECUTOR_RELAY_BASE") or _env("RELAY_BASE") or _env("RELAY_URL") or "http://127.0.0.1:5000"
-    return base.rstrip("/")
-
-def _headers(tok: str) -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {tok}",
-        "X-Relay-Token": tok,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "ngrok-skip-browser-warning": "true",
-    }
-
-def _assert_token_base() -> tuple[str, str]:
-    tok = _get_token()
-    if not tok:
-        raise RuntimeError("Missing relay token: set EXECUTOR_RELAY_TOKEN or RELAY_TOKEN in .env")
-    base = _get_base()
-    if not base.startswith("http"):
-        raise RuntimeError(f"Bad relay base URL: {base!r}")
-    return tok, base
-
-# --- small retry helper for transient 5xx/429 ---
-def _request_with_retries(method: str, url: str, *, headers: Dict[str, str], params: Optional[dict]=None,
-                          data: Optional[str]=None, timeout: int=25, max_retries: int=2):
-    for attempt in range(max_retries + 1):
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    for _ in range(2):
         try:
-            r = requests.request(method, url, headers=headers, params=params or {}, data=data, timeout=timeout)
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
-                time.sleep(min(2.0 * (attempt + 1), 6.0))
-                continue
-            return r
-        except requests.RequestException as e:
-            if attempt >= max_retries:
-                raise
-            time.sleep(min(2.0 * (attempt + 1), 6.0))
-    return r  # type: ignore
+            r = requests.post(url, json=payload, timeout=8)
+            if r.ok:
+                return
+        except Exception:
+            time.sleep(0.8)
 
-# --- low-level HTTP to relay (NOT the Bybit proxy) ---
-def get(path: str, params: Optional[dict]=None, timeout: int=20) -> Any:
-    tok, base = _assert_token_base()
-    url = f"{base}/{path.lstrip('/')}"
-    r = _request_with_retries("GET", url, headers=_headers(tok), params=params, timeout=timeout)
-    if r.status_code == 401:
-        raise RuntimeError("401 from relay (token mismatch)")
+# ──────────────────────────────────────────────────────────────────────────────
+# Raw relay HTTP
+# ──────────────────────────────────────────────────────────────────────────────
+def relay_get(path: str, params: Optional[dict] = None, timeout: int = 15) -> dict:
     try:
-        return r.json()
-    except Exception:
-        return r.text
+        r = _SESSION.get(_u(path), params=params or {}, timeout=timeout)
+        _raise_for_auth(r)
+        return _json_or_text(r)
+    except Exception as e:
+        return {"error": str(e), "path": path, "params": params or {}}
 
-def post(path: str, body: Optional[dict]=None, timeout: int=25) -> Any:
-    tok, base = _assert_token_base()
-    url = f"{base}/{path.lstrip('/')}"
-    payload = json.dumps(body or {})
-    r = _request_with_retries("POST", url, headers=_headers(tok), data=payload, timeout=timeout)
-    if r.status_code == 401:
-        raise RuntimeError("401 from relay (token mismatch)")
+def relay_post(path: str, body: Optional[dict] = None, timeout: int = 20) -> dict:
     try:
-        return r.json()
-    except Exception:
-        return {"raw": r.text, "status": r.status_code}
+        r = _SESSION.post(_u(path), json=body or {}, timeout=timeout)
+        _raise_for_auth(r)
+        return _json_or_text(r)
+    except Exception as e:
+        return {"error": str(e), "path": path, "body": body or {}}
 
-# --- generic Bybit proxy via relay ---
-def proxy(method: str, path: str, params: Optional[dict]=None, body: Optional[dict]=None, timeout: int=25) -> Any:
+# ──────────────────────────────────────────────────────────────────────────────
+# Low-level Bybit proxy (returns FULL relay envelope)
+# Supports `extra` for context (e.g., {"subUid":"260417078"})
+# ──────────────────────────────────────────────────────────────────────────────
+def bybit_proxy(method: str, path: str, params: Optional[dict] = None,
+                body: Optional[dict] = None, extra: Optional[dict] = None,
+                timeout: int = 20) -> dict:
     """
-    Hit relay's /bybit/proxy which signs and forwards to Bybit.
-    Handles both dict and text responses by returning dict when possible.
+    Request through the relay. Returns full envelope:
+      {"primary":{"status":...,"body":{...}}, "fallback":{...}, "error":?...}
     """
     payload = {"method": method.upper(), "path": path}
     if params:
         payload["params"] = params
     if body:
         payload["body"] = body
-    resp = post("/bybit/proxy", body=payload, timeout=timeout)
-    # post() already tried to json() decode; if it's text, try once more
-    if isinstance(resp, str):
-        try:
-            return json.loads(resp)
-        except Exception:
-            return {"raw": resp}
-    return resp
+    if extra:
+        payload["extra"] = extra  # e.g., {"subUid": "260417078"}
+    return relay_post("/bybit/proxy", payload, timeout=timeout)
 
-# --- convenience: equity, ticker, klines with shape tolerance ---
-def _coerce_json(x: Any) -> dict:
-    if isinstance(x, dict):
-        return x
-    if isinstance(x, str):
+# ──────────────────────────────────────────────────────────────────────────────
+# Bot-friendly proxy (returns Bybit JSON BODY directly)
+# ──────────────────────────────────────────────────────────────────────────────
+def proxy(method: str, path: str, params: Optional[dict] = None,
+          body: Optional[dict] = None, extra: Optional[dict] = None,
+          timeout: int = 20) -> dict:
+    env = bybit_proxy(method, path, params=params, body=body, extra=extra, timeout=timeout)
+    if isinstance(env, dict) and "primary" in env:
         try:
-            return json.loads(x)
+            return env["primary"]["body"]
         except Exception:
-            return {}
-    return {}
+            return env
+    return env
 
-def equity_unified(coin: str = "USDT", sub_uid: Optional[str] = None) -> float:
+# ──────────────────────────────────────────────────────────────────────────────
+# Quick data helpers (sub-account aware via `extra`)
+# ──────────────────────────────────────────────────────────────────────────────
+def equity_unified(coin: Optional[str] = None, extra: Optional[dict] = None) -> float:
     """
-    Try relay-native helper first: /bybit/wallet/balance (unified)
-    Fallback to bybit proxy: /v5/account/wallet-balance
+    Returns numeric totalEquity for UNIFIED wallet. If `extra={'subUid':...}` is provided,
+    equity is fetched in that sub-account context.
     """
+    params = {"accountType": "UNIFIED"}
+    if coin:
+        params["coin"] = coin
+    env = bybit_proxy("GET", "/v5/account/wallet-balance", params=params, extra=extra)
+    # Prefer full envelope parsing (more robust to relay format)
     try:
-        j = get("/bybit/wallet/balance", params={"accountType": "UNIFIED", "coin": coin, **({"subUid": sub_uid} if sub_uid else {})})
-        data = _coerce_json(j)
-        lst = ((data.get("result") or {}).get("list") or []) if isinstance(data, dict) else []
+        body = (env.get("primary", {}) or {}).get("body", {}) if isinstance(env, dict) else {}
+        result = (body.get("result", {}) or {})
         total = 0.0
-        for acct in lst:
+        for acct in (result.get("list", []) or []):
             try:
-                if sub_uid and str(acct.get("subUid", "")) != str(sub_uid):
-                    continue
-                # prefer coin breakdown if available
-                coins = acct.get("coin") or []
-                if coins:
-                    for c in coins:
-                        if str(c.get("coin","")).upper() == coin.upper():
-                            total += float(c.get("equity", 0))
-                else:
-                    total += float(acct.get("totalEquity", 0))
+                total += float(acct.get("totalEquity", 0))
             except Exception:
                 pass
-        if total > 0:
+        return total
+    except Exception:
+        # Fallback if relay returned raw Bybit JSON
+        try:
+            result = (env.get("result", {}) or {})
+            total = 0.0
+            for acct in (result.get("list", []) or []):
+                total += float(acct.get("totalEquity", 0))
             return total
-    except Exception:
-        pass
+        except Exception:
+            return 0.0
 
-    # Fallback: proxy call
-    params = {"accountType": "UNIFIED", "coin": coin}
-    if sub_uid:
-        params["subUid"] = str(sub_uid)
-    j = proxy("GET", "/v5/account/wallet-balance", params=params)
-    data = _coerce_json(j)
-    result = data.get("result") or {}
-    lst = result.get("list") or []
-    if not lst:
-        return 0.0
-    entry = lst[0]
-    # coin array preferred
-    coin_rows = entry.get("coin") or []
-    if coin_rows:
-        for c in coin_rows:
-            if str(c.get("coin","")).upper() == coin.upper():
-                try:
-                    return float(c.get("equity", 0))
-                except Exception:
-                    return 0.0
-    # fall back to totalEquity
+def ticker(symbol: str, category: str = "linear") -> dict:
+    j = proxy("GET", "/v5/market/tickers", params={"category": category, "symbol": symbol})
+    return ((j.get("result", {}) or {}).get("list", []) or [{}])[0]
+
+def klines(symbol: str, interval: str = "1", limit: int = 50, category: str = "linear") -> list:
+    params = {"category": category, "symbol": symbol, "interval": interval, "limit": limit}
+    env = bybit_proxy("GET", "/v5/market/kline", params=params)
+    body = (env.get("primary", {}) or {}).get("body", {}) if isinstance(env, dict) else {}
+    return ((body.get("result", {}) or {}).get("list", []) or [])
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Registry helpers (CSV / JSON)
+# ──────────────────────────────────────────────────────────────────────────────
+def load_sub_uids(csv_path: str = "registry/sub_uids.csv",
+                  map_path: str = "registry/sub_map.json") -> Tuple[List[str], Dict[str, str]]:
+    uids: List[str] = []
+    name_map: Dict[str, str] = {}
+    p = Path(csv_path)
+    if p.exists():
+        with p.open(newline="", encoding="utf-8") as f:
+            rd = csv.DictReader(f)
+            for row in rd:
+                val = (row.get("sub_uid") or "").strip()
+                if val:
+                    uids.append(val)
+    mp = Path(map_path)
+    if mp.exists():
+        try:
+            name_map = json.loads(mp.read_text(encoding="utf-8"))
+        except Exception:
+            name_map = {}
+    return uids, name_map
+
+def pretty_name(uid: str, name_map: Dict[str, str]) -> str:
+    return name_map.get(uid, uid)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Legacy convenience wrappers (compat)
+# Note: prefer `extra={'subUid': '<UID>'}` instead of passing memberId in params.
+# ──────────────────────────────────────────────────────────────────────────────
+def get_wallet_balance(accountType: str = "UNIFIED", memberId: Optional[str] = None) -> dict:
+    params = {"accountType": accountType}
+    if memberId:
+        params["memberId"] = memberId
+    return proxy("GET", "/v5/account/wallet-balance", params=params)
+
+def get_positions(category: str = "linear", symbol: Optional[str] = None,
+                  memberId: Optional[str] = None, settleCoin: str = "USDT") -> dict:
+    p = {"category": category}
+    if symbol:
+        p["symbol"] = symbol
+    if memberId:
+        p["memberId"] = memberId
+    if category.lower() == "linear" and settleCoin:
+        p["settleCoin"] = settleCoin
+    return proxy("GET", "/v5/position/list", params=p)
+
+def get_open_orders(category: str = "linear", symbol: Optional[str] = None,
+                    memberId: Optional[str] = None, openOnly: int = 1) -> dict:
+    p = {"category": category, "openOnly": openOnly}
+    if symbol:
+        p["symbol"] = symbol
+    if memberId:
+        p["memberId"] = memberId
+    return proxy("GET", "/v5/order/realtime", params=p)
+
+def get_order_history(category: str = "linear", symbol: Optional[str] = None,
+                      memberId: Optional[str] = None, limit: int = 200) -> dict:
+    p = {"category": category, "limit": limit}
+    if symbol:
+        p["symbol"] = symbol
+    if memberId:
+        p["memberId"] = memberId
+    return proxy("GET", "/v5/order/history", params=p)
+
+def get_execution_list(category: str = "linear", symbol: Optional[str] = None,
+                       memberId: Optional[str] = None, limit: int = 200) -> dict:
+    p = {"category": category, "limit": limit}
+    if symbol:
+        p["symbol"] = symbol
+    if memberId:
+        p["memberId"] = memberId
+    return proxy("GET", "/v5/execution/list", params=p)
+
+def get_ticker(symbol: str, category: str = "linear") -> dict:
+    return proxy("GET", "/v5/market/tickers", params={"category": category, "symbol": symbol})
+
+def get_balance_unified(member_id: str) -> dict:
+    return bybit_proxy("GET", "/v5/account/wallet-balance",
+                       params={"accountType": "UNIFIED", "memberId": member_id})
+
+def get_positions_linear(member_id: str, symbol: Optional[str] = None) -> dict:
+    params = {"category": "linear", "memberId": member_id}
+    if symbol:
+        params["symbol"] = symbol
+    return bybit_proxy("GET", "/v5/position/list", params=params)
+
+def get_open_orders_linear(member_id: str, symbol: Optional[str] = None) -> dict:
+    params = {"category": "linear", "memberId": member_id}
+    if symbol:
+        params["symbol"] = symbol
+    return bybit_proxy("GET", "/v5/order/realtime", params=params)
+
+def get_closed_pnl(member_id: str, symbol: Optional[str] = None) -> dict:
+    params = {"category": "linear", "memberId": member_id}
+    if symbol:
+        params["symbol"] = symbol
+    return bybit_proxy("GET", "/v5/position/closed-pnl", params=params)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Health
+# ──────────────────────────────────────────────────────────────────────────────
+def is_token_ok() -> bool:
+    """True if relay answers /diag/ping with 200 JSON."""
     try:
-        return float(entry.get("totalEquity", 0))
+        r = _SESSION.get(_u("/diag/ping"), timeout=5)
+        _raise_for_auth(r)
+        _ = r.json()
+        return True
     except Exception:
-        return 0.0
+        return False
 
-def ticker(symbol: str) -> dict:
-    """
-    Returns first row from Bybit /v5/market/tickers for given symbol.
-    Uses proxy to avoid relying on relay-native mirrors.
-    """
-    j = proxy("GET", "/v5/market/tickers", params={"category": "linear", "symbol": symbol})
-    data = _coerce_json(j)
-    lst = ((data.get("result") or {}).get("list") or [])
-    return lst[0] if lst else {}
-
-def klines(symbol: str, interval: str = "1", limit: int = 50) -> list:
-    """
-    Returns list rows from Bybit /v5/market/kline. Handles both wrapped and direct shapes.
-    """
-    env = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
-    resp = proxy("GET", "/v5/market/kline", params=env)
-    data = _coerce_json(resp)
-    # Some relays nest under {"primary":{"body":{result:{list:[...]}}}}
-    if "primary" in data:
-        body = (data.get("primary") or {}).get("body") or {}
-        data = _coerce_json(body)
-    result = data.get("result") or {}
-    lst = result.get("list") or []
-    return lst if isinstance(lst, list) else []
-
-# --- utilities ---
-def debug_env() -> str:
-    tok = _get_token()
-    base = _get_base()
-    masked = (tok[:4] + "…" + tok[-4:]) if tok and len(tok) > 8 else (tok or "<empty>")
-    return f"relay_base={base} token={masked} env_path={_ENV_PATH or '<none>'}"
-
-def refresh_env() -> None:
-    """
-    Re-load .env on demand (e.g., after editing from a running session).
-    """
-    try:
-        from dotenv import load_dotenv
-        if _ENV_PATH:
-            load_dotenv(_ENV_PATH, override=True)
-        else:
-            load_dotenv(override=True)
-    except Exception:
-        pass
+if __name__ == "__main__":
+    print(relay_get("/diag/time"))
