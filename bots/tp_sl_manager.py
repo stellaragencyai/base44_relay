@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 — TP/SL Manager (5 equal TPs + auto-resize on scale-in + laddered trailing SL)
-HARDENED EDITION: startup grace, DRY_RUN, adopt-only, reduce-only, Base44 tagging, optional WS, notifier integration
+Base44 — TP/SL Manager (5 equal TPs + auto-resize + laddered trailing SL)
+HARDENED EDITION (final): startup grace, DRY_RUN, adopt-only, reduce-only, Base44 tagging,
+optional WS, notifier integration, sub-account routing fixed, correct maker shading.
 
 What this does:
 - 5 TP rungs, equal-R spacing (0.5R steps to 2.5R), equal size per rung.
@@ -19,11 +20,6 @@ Safety rail additions (env-driven):
   TP_MANAGED_TAG=B44            # orderLinkId prefix we own and match against for cancellations
   TP_WS_DISABLE=false           # disable WS entirely; rely on HTTP sweep
   TP_PERIODIC_SWEEP_SEC=12      # sweep frequency (seconds)
-
-Policy + telemetry:
-  - Respects per-account policy (who may manage exits).
-  - Can still "protect manual" accounts (SL/TP maintenance) if policy enables it.
-  - Decision logging for every action to logs/decisions (JSONL/Parquet).
 
 Requires:
   pip install pybit requests python-dotenv pyyaml
@@ -185,6 +181,10 @@ def account_key_to_uid(account_key: str) -> str:
         return account_key.split(":", 1)[1]
     return account_key
 
+# pybit expects memberId for subaccount scoping (not subUid)
+def extra_for_uid(uid: Optional[str]) -> dict:
+    return {} if not uid else {"memberId": uid}
+
 # ---------- precision / symbol meta ----------
 @dataclass
 class SymbolFilters:
@@ -194,7 +194,8 @@ class SymbolFilters:
     max_leverage: int
 
 def get_symbol_filters(symbol: str, extra: dict) -> SymbolFilters:
-    res = http.get_instruments_info(category=CFG["category"], symbol=symbol, **extra)
+    # ignore memberId on public market endpoints
+    res = http.get_instruments_info(category=CFG["category"], symbol=symbol)
     lst = res.get("result", {}).get("list", [])
     if not lst:
         raise RuntimeError(f"symbol info not found for {symbol}")
@@ -218,9 +219,9 @@ def round_price_to_tick(p: Decimal, tick: Decimal) -> Decimal:
     return steps * tick
 
 # ---------- market data ----------
-def get_orderbook_top(symbol: str, extra: dict) -> Optional[Tuple[Decimal, Decimal]]:
+def get_orderbook_top(symbol: str) -> Optional[Tuple[Decimal, Decimal]]:
     try:
-        ob = http.get_orderbook(category=CFG["category"], symbol=symbol, limit=1, **extra)
+        ob = http.get_orderbook(category=CFG["category"], symbol=symbol, limit=1)
         r = ob.get("result", {})
         bids = r.get("b", []) or r.get("bids") or []
         asks = r.get("a", []) or r.get("asks") or []
@@ -231,8 +232,8 @@ def get_orderbook_top(symbol: str, extra: dict) -> Optional[Tuple[Decimal, Decim
         log.warning(f"orderbook error {symbol}: {e}")
         return None
 
-def adaptive_offset_ticks(symbol: str, tick: Decimal, extra: dict) -> int:
-    ob = get_orderbook_top(symbol, extra)
+def adaptive_offset_ticks(symbol: str, tick: Decimal) -> int:
+    ob = get_orderbook_top(symbol)
     if not ob:
         return CFG["fallback_maker_offset_ticks"]
     bid, ask = ob
@@ -356,9 +357,9 @@ def place_limit_reduce(account_uid: str, symbol: str, side: str, price: Decimal,
         tg_send(f"🧪 DRY_RUN: place {side} {symbol} qty={qty} @ {price}", priority="info")
         log_event("tp_manager", "tp_create_dry", symbol, account_uid, {"side": side, "qty": str(qty), "px": str(price)})
         return None
-    # maker shading
-    maker_ticks = adaptive_offset_ticks(symbol, tick, extra)
-    px = price - tick * maker_ticks if side == "Sell" else price + tick * maker_ticks
+    # maker shading: move AWAY from mid so PostOnly rests
+    maker_ticks = adaptive_offset_ticks(symbol, tick)
+    px = price + tick * maker_ticks if side == "Sell" else price - tick * maker_ticks
 
     # min qty check early
     try:
@@ -387,7 +388,7 @@ def place_limit_reduce(account_uid: str, symbol: str, side: str, price: Decimal,
                 return oid
             # price band/invalid price → walk one tick and retry
             if attempt < retries:
-                px = px - tick if side == "Sell" else px + tick
+                px = px + tick if side == "Sell" else px - tick
                 body["price"] = str(px)
                 time.sleep(0.2)
         except Exception as e:
@@ -453,7 +454,7 @@ def fetch_open_tp_orders(symbol: str, close_side: str, extra: dict) -> List[dict
         out = []
         for it in rows:
             try:
-                if str(it.get("reduceOnly", "")).lower() != "true":
+                if str(it.get("reduceOnly", "")).lower() not in ("true", "1"):
                     continue
                 if (it.get("side") or "") != close_side:
                     continue
@@ -475,9 +476,9 @@ class PositionState:
 STATE = PositionState()
 
 def account_iter():
-    yield ("main", {})
+    yield ("main", extra_for_uid(None))
     for uid in SUB_UIDS:
-        yield (f"sub:{uid}", {"subUid": uid})
+        yield (f"sub:{uid}", extra_for_uid(uid))
 
 # ---------- policy ----------
 @dataclass
@@ -714,11 +715,11 @@ def handle_tp_fill(account_key: str, extra: dict, ev: dict):
 
 # ---------- bootstrap/sweep ----------
 def load_positions_once():
-    for acct_key, extra in account_iter():
+    for acct_key, _extra in account_iter():
         uid = account_key_to_uid(acct_key)
         for coin in CFG["settle_coins"]:
             try:
-                res = http.get_positions(category=CFG["category"], settleCoin=coin, **extra)
+                res = http.get_positions(category=CFG["category"], settleCoin=coin, **_extra)
                 arr = res.get("result", {}).get("list", []) or []
                 for p in arr:
                     symbol = p.get("symbol") or ""
@@ -733,7 +734,7 @@ def load_positions_once():
                     entry = Decimal(p.get("avgPrice") or "0")
                     pos_idx = int(p.get("positionIdx") or 0)
                     log_event("tp_manager", "bootstrap_pos", symbol, uid, {"qty": str(size), "entry": str(entry)})
-                    place_or_sync_ladder(acct_key, extra, symbol, side_word, entry, size, pos_idx)
+                    place_or_sync_ladder(acct_key, _extra, symbol, side_word, entry, size, pos_idx)
             except Exception as e:
                 log.error(f"load pos {acct_key} {coin} error: {e}")
                 log_event("tp_manager", "bootstrap_error", "", uid, {"error": str(e)}, level="error")
@@ -741,11 +742,11 @@ def load_positions_once():
 def periodic_sweep_loop():
     while True:
         try:
-            for acct_key, extra in account_iter():
+            for acct_key, _extra in account_iter():
                 uid = account_key_to_uid(acct_key)
                 for coin in CFG["settle_coins"]:
                     try:
-                        res = http.get_positions(category=CFG["category"], settleCoin=coin, **extra)
+                        res = http.get_positions(category=CFG["category"], settleCoin=coin, **_extra)
                         rows = (res.get("result") or {}).get("list") or []
                         for p in rows:
                             symbol = p.get("symbol") or ""
@@ -767,7 +768,7 @@ def periodic_sweep_loop():
                                 s = STATE.pos.get((acct_key, symbol))
                                 prev_qty = s.get("qty") if s else None
                             if s is None or prev_qty != size or not s.get("tp_placed"):
-                                place_or_sync_ladder(acct_key, extra, symbol, side_word, entry, size, pos_idx)
+                                place_or_sync_ladder(acct_key, _extra, symbol, side_word, entry, size, pos_idx)
                     except Exception as e:
                         log.warning(f"sweep {acct_key} {coin} err: {e}")
                         log_event("tp_manager", "sweep_error", "", uid, {"error": str(e)}, level="error")
@@ -806,8 +807,8 @@ def ws_private_handler(message):
                 with STATE.lock:
                     accounts = [ak for (ak, sym) in STATE.pos.keys() if sym == symbol]
                 for acct_key in accounts:
-                    extra = {} if acct_key == "main" else {"subUid": acct_key.split(":")[1]}
-                    handle_tp_fill(acct_key, extra, ev)
+                    _extra = extra_for_uid(account_key_to_uid(acct_key) if acct_key.startswith("sub:") else None)
+                    handle_tp_fill(acct_key, _extra, ev)
 
         if "position" in topic:
             for p in data:
@@ -819,7 +820,7 @@ def ws_private_handler(message):
                 entry = Decimal(p.get("avgPrice") or "0")
                 pos_idx = int(p.get("positionIdx") or 0)
 
-                for acct_key, extra in account_iter():
+                for acct_key, _extra in account_iter():
                     if size == 0:
                         with STATE.lock:
                             if (acct_key, symbol) in STATE.pos:
@@ -827,7 +828,7 @@ def ws_private_handler(message):
                                 log_event("tp_manager", "pos_closed", symbol, account_key_to_uid(acct_key))
                             STATE.pos.pop((acct_key, symbol), None)
                         continue
-                    place_or_sync_ladder(acct_key, extra, symbol, side_word, entry, size, pos_idx)
+                    place_or_sync_ladder(acct_key, _extra, symbol, side_word, entry, size, pos_idx)
     except Exception as e:
         log.error(f"ws handler error: {e}")
 
