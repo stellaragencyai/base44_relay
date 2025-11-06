@@ -2,21 +2,23 @@
 # -*- coding: utf-8 -*-
 """
 Base44 — TP/SL Manager (5 equal TPs + auto-resize on scale-in + laddered trailing SL)
-HARDENED EDITION: startup grace, DRY_RUN, adopt-only, reduce-only, Base44 tagging, notifier integration
+HARDENED EDITION: startup grace, DRY_RUN, adopt-only, reduce-only, Base44 tagging, optional WS, notifier integration
 
 What this does:
 - 5 TP rungs, equal-R spacing (0.5R steps to 2.5R), equal size per rung.
 - On size change (scale-in), re-sizes all 5 rungs so sum(qty)=position size.
 - Trailing SL ladder: TP2→SL=TP1; TP3→SL=TP2; TP4→SL=TP3; TP5→SL=TP4.
 - SL tightened: chooses closer of structure-stop vs ATR-stop.
-- Maker-only, reduce-only; periodic sweep + WS.
+- Maker-only, reduce-only; periodic HTTP sweep; optional private WS with watchdog & auto-fallback.
 
 Safety rail additions (env-driven):
-  TP_ADOPT_EXISTING=true       # adopt existing ladder; do not cancel foreign orders
-  TP_CANCEL_NON_B44=false      # never cancel orders we didn't tag (unless you set true)
-  TP_DRY_RUN=true              # report intended actions but place nothing
-  TP_STARTUP_GRACE_SEC=20      # during grace: no cancels; only tagged reduce-only placements allowed
-  TP_MANAGED_TAG=B44           # orderLinkId prefix we own and match against for cancellations
+  TP_ADOPT_EXISTING=true        # adopt existing ladder; do not cancel foreign orders
+  TP_CANCEL_NON_B44=false       # never cancel orders we didn't tag (unless you set true)
+  TP_DRY_RUN=true               # report intended actions but place nothing
+  TP_STARTUP_GRACE_SEC=20       # during grace: no cancels; only tagged reduce-only placements allowed
+  TP_MANAGED_TAG=B44            # orderLinkId prefix we own and match against for cancellations
+  TP_WS_DISABLE=false           # disable WS entirely; rely on HTTP sweep
+  TP_PERIODIC_SWEEP_SEC=12      # sweep frequency (seconds)
 
 Requires:
   pip install pybit requests python-dotenv pyyaml
@@ -40,7 +42,6 @@ from pybit.unified_trading import HTTP, WebSocket
 try:
     from core.notifier_bot import tg_send
 except Exception:
-    # emergency fallback to console if notifier not available
     def tg_send(msg: str, priority: str = "info", **kwargs):
         logging.getLogger("tp5eq").info(f"[notify/{priority}] {msg}")
 
@@ -68,10 +69,12 @@ def env_int(name: str, default: int) -> int:
         return default
 
 TP_ADOPT_EXISTING = env_bool("TP_ADOPT_EXISTING", True)
-TP_CANCEL_NON_B44  = env_bool("TP_CANCEL_NON_B44", False)
-TP_DRY_RUN         = env_bool("TP_DRY_RUN", True)
-TP_GRACE_SEC       = env_int("TP_STARTUP_GRACE_SEC", 20)
-TP_TAG             = (os.getenv("TP_MANAGED_TAG", "B44") or "B44").strip()
+TP_CANCEL_NON_B44 = env_bool("TP_CANCEL_NON_B44", False)
+TP_DRY_RUN        = env_bool("TP_DRY_RUN", True)
+TP_GRACE_SEC      = env_int("TP_STARTUP_GRACE_SEC", 20)
+TP_TAG            = (os.getenv("TP_MANAGED_TAG", "B44") or "B44").strip()
+TP_WS_DISABLE     = env_bool("TP_WS_DISABLE", False)
+TP_SWEEP_SEC_ENV  = env_int("TP_PERIODIC_SWEEP_SEC", 12)
 
 # ---------- config ----------
 CFG = {
@@ -90,9 +93,9 @@ CFG = {
     "price_band_max_retries": 2,
 
     # SL logic (tightened)
-    "sl_use_closer_of_structure_or_atr": True,  # pick the closer stop to entry
-    "sl_atr_mult_fallback": 0.45,               # closer ATR baseline
-    "sl_atr_buffer": 0.08,                      # smaller structure cushion
+    "sl_use_closer_of_structure_or_atr": True,
+    "sl_atr_mult_fallback": 0.45,
+    "sl_atr_buffer": 0.08,
     "sl_kline_tf": "5",
     "sl_kline_count": 120,
     "sl_swing_lookback": 20,
@@ -121,7 +124,14 @@ CFG = {
 
     # periodic sweep to catch misses
     "periodic_sweep_sec": 12,
+
+    # WS optional toggle (overridden by env) — added
+    "ws_optional": False,
 }
+
+# Apply env overrides
+CFG["ws_optional"] = TP_WS_DISABLE
+CFG["periodic_sweep_sec"] = TP_SWEEP_SEC_ENV
 
 # ---------- env / clients ----------
 BYBIT_KEY = os.getenv("BYBIT_API_KEY", "")
@@ -137,7 +147,8 @@ http = HTTP(testnet=(BYBIT_ENV == "testnet"), api_key=BYBIT_KEY, api_secret=BYBI
 _BREAKER_FILE = STATE_DIR / "risk_state.json"
 def breaker_active() -> bool:
     try:
-        if not _BREAKER_FILE.exists(): return False
+        if not _BREAKER_FILE.exists():
+            return False
         js = json.loads(_BREAKER_FILE.read_text(encoding="utf-8"))
         return bool(js.get("breach"))
     except Exception:
@@ -154,7 +165,8 @@ class SymbolFilters:
 def get_symbol_filters(symbol: str, extra: dict) -> SymbolFilters:
     res = http.get_instruments_info(category=CFG["category"], symbol=symbol, **extra)
     lst = res.get("result", {}).get("list", [])
-    if not lst: raise RuntimeError(f"symbol info not found for {symbol}")
+    if not lst:
+        raise RuntimeError(f"symbol info not found for {symbol}")
     item = lst[0]
     tick = Decimal(item["priceFilter"]["tickSize"])
     step = Decimal(item["lotSizeFilter"]["qtyStep"])
@@ -181,7 +193,8 @@ def get_orderbook_top(symbol: str, extra: dict) -> Optional[Tuple[Decimal, Decim
         r = ob.get("result", {})
         bids = r.get("b", []) or r.get("bids") or []
         asks = r.get("a", []) or r.get("asks") or []
-        if not bids or not asks: return None
+        if not bids or not asks:
+            return None
         return Decimal(str(bids[0][0])), Decimal(str(asks[0][0]))
     except Exception as e:
         log.warning(f"orderbook error {symbol}: {e}")
@@ -189,17 +202,18 @@ def get_orderbook_top(symbol: str, extra: dict) -> Optional[Tuple[Decimal, Decim
 
 def adaptive_offset_ticks(symbol: str, tick: Decimal, extra: dict) -> int:
     ob = get_orderbook_top(symbol, extra)
-    if not ob: return CFG["fallback_maker_offset_ticks"]
+    if not ob:
+        return CFG["fallback_maker_offset_ticks"]
     bid, ask = ob
     spread = max(Decimal("0"), ask - bid)
-    if spread <= 0: return 1
+    if spread <= 0:
+        return 1
     spread_ticks = int((spread / tick).to_integral_value(rounding=ROUND_DOWN))
     base = max(1, round(spread_ticks * CFG["spread_offset_ratio"]))
     return int(min(max(base, 1), CFG["max_maker_offset_ticks"]))
 
 # ---------- helpers ----------
 def side_to_close(position_side_word: str) -> str:
-    # close longs with Sell, shorts with Buy
     return "Sell" if position_side_word.lower().startswith("l") else "Buy"
 
 # ---------- SL calculations ----------
@@ -207,14 +221,15 @@ def _compute_structure_stop(symbol: str, side_word: str, entry: Decimal, tick: D
     try:
         res = http.get_kline(category=CFG["category"], symbol=symbol, interval=CFG["sl_kline_tf"], limit=CFG["sl_kline_count"], **extra)
         arr = (res.get("result") or {}).get("list") or []
-        if not arr: return None
+        if not arr:
+            return None
         lows, highs, trs = [], [], []
         prev_close = None
         for it in arr:
-            o,h,l,c = map(Decimal, [it[1], it[2], it[3], it[4]])
+            o, h, l, c = map(Decimal, [it[1], it[2], it[3], it[4]])
             lows.append(l); highs.append(h)
             if prev_close is not None:
-                trs.append(max(h-l, abs(h-prev_close), abs(l-prev_close)))
+                trs.append(max(h - l, abs(h - prev_close), abs(l - prev_close)))
             prev_close = c
         atr = (sum(trs[-14:]) / Decimal(14)) if len(trs) >= 14 else Decimal(0)
         atr_buf = atr * Decimal(str(CFG["sl_atr_buffer"]))
@@ -230,15 +245,17 @@ def _compute_fallback_atr_stop(symbol: str, side_word: str, entry: Decimal, tick
     try:
         res = http.get_kline(category=CFG["category"], symbol=symbol, interval=CFG["sl_kline_tf"], limit=CFG["sl_kline_count"], **extra)
         arr = (res.get("result") or {}).get("list") or []
-        if not arr: return None
+        if not arr:
+            return None
         prev_close = None
         trs = []
         for it in arr:
-            o,h,l,c = map(Decimal, [it[1], it[2], it[3], it[4]])
+            o, h, l, c = map(Decimal, [it[1], it[2], it[3], it[4]])
             if prev_close is not None:
-                trs.append(max(h-l, abs(h-prev_close), abs(l-prev_close)))
+                trs.append(max(h - l, abs(h - prev_close), abs(l - prev_close)))
             prev_close = c
-        if len(trs) < 14: return None
+        if len(trs) < 14:
+            return None
         atr = sum(trs[-14:]) / Decimal(14)
         move = atr * Decimal(str(CFG["sl_atr_mult_fallback"]))
         stop = entry - move if side_word == "long" else entry + move
@@ -250,9 +267,8 @@ def _pick_closer_stop(entry: Decimal, a: Optional[Decimal], b: Optional[Decimal]
     choices = [x for x in (a, b) if x is not None]
     if choices:
         return min(choices, key=lambda s: abs(entry - s))
-    # last resort: a couple ticks off entry
-    return round_price_to_tick(entry - tick*Decimal(CFG["sl_min_tick_buffer"]) if side_word=="long"
-                               else entry + tick*Decimal(CFG["sl_min_tick_buffer"]), tick)
+    return round_price_to_tick(entry - tick * Decimal(CFG["sl_min_tick_buffer"]) if side_word == "long"
+                               else entry + tick * Decimal(CFG["sl_min_tick_buffer"]), tick)
 
 def ensure_stop(symbol: str, side_word: str, entry: Decimal, pos_idx: int, tick: Decimal, extra: dict) -> Decimal:
     try:
@@ -260,7 +276,8 @@ def ensure_stop(symbol: str, side_word: str, entry: Decimal, pos_idx: int, tick:
         lst = res.get("result", {}).get("list", [])
         if lst and lst[0].get("stopLoss"):
             cur = Decimal(str(lst[0]["stopLoss"]))
-            if cur > 0: return cur
+            if cur > 0:
+                return cur
     except Exception as e:
         log.debug(f"check SL failed: {e}")
 
@@ -300,13 +317,21 @@ def make_link(link_hint: Optional[str] = None) -> str:
 
 # ---------- orders ----------
 def place_limit_reduce(symbol: str, side: str, price: Decimal, qty: Decimal, tick: Decimal, extra: dict) -> Optional[str]:
-    # Safety: DRY_RUN or grace without our tag → block placement
     if TP_DRY_RUN:
         tg_send(f"🧪 DRY_RUN: place {side} {symbol} qty={qty} @ {price}", priority="info")
         return None
-    # For Sell (closing longs), shade below; for Buy (closing shorts), shade above
     maker_ticks = adaptive_offset_ticks(symbol, tick, extra)
-    px = price - tick*maker_ticks if side=="Sell" else price + tick*maker_ticks
+    px = price - tick * maker_ticks if side == "Sell" else price + tick * maker_ticks
+
+    # skip illegal tiny qtys early
+    try:
+        filters = get_symbol_filters(symbol, extra)
+        if qty < filters.min_order_qty:
+            tg_send(f"⚠️ {symbol}: skip rung qty<{filters.min_order_qty} (rounded too small)", priority="warn")
+            return None
+    except Exception:
+        pass
+
     body = dict(
         category=CFG["category"], symbol=symbol, side=side, orderType="Limit",
         qty=str(qty.normalize()), price=str(px.normalize()),
@@ -321,13 +346,15 @@ def place_limit_reduce(symbol: str, side: str, price: Decimal, qty: Decimal, tic
             if r.get("retCode") in (0, "0"):
                 oid = (r.get("result") or {}).get("orderId")
                 return oid
+            # price band/invalid price → walk one tick and retry
             if attempt < retries:
-                px = px - tick if side=="Sell" else px + tick
+                px = px - tick if side == "Sell" else px + tick
                 body["price"] = str(px)
                 time.sleep(0.2)
         except Exception as e:
             log.warning(f"place_order ex: {e}")
-            if attempt < retries: time.sleep(0.3)
+            if attempt < retries:
+                time.sleep(0.3)
     return None
 
 def amend_order_qty(order_id: str, qty: Decimal, extra: dict) -> bool:
@@ -353,7 +380,6 @@ def amend_order_price(order_id: str, price: Decimal, extra: dict) -> bool:
         return False
 
 def cancel_order(order_id: str, link_id: Optional[str], extra: dict) -> None:
-    # Block cancels in grace, and of non-Base44 orders unless explicitly allowed
     if in_grace():
         tg_send(f"🔒 Cancel blocked (grace): orderId={order_id}", priority="warn")
         return
@@ -375,9 +401,12 @@ def fetch_open_tp_orders(symbol: str, close_side: str, extra: dict) -> List[dict
         out = []
         for it in rows:
             try:
-                if str(it.get("reduceOnly", "")).lower() != "true": continue
-                if (it.get("side") or "") != close_side: continue
-                if (it.get("orderType") or "") != "Limit": continue
+                if str(it.get("reduceOnly", "")).lower() != "true":
+                    continue
+                if (it.get("side") or "") != close_side:
+                    continue
+                if (it.get("orderType") or "") != "Limit":
+                    continue
                 out.append(it)
             except Exception:
                 continue
@@ -389,7 +418,6 @@ def fetch_open_tp_orders(symbol: str, close_side: str, extra: dict) -> List[dict
 # ---------- state ----------
 class PositionState:
     def __init__(self):
-        # state[(account_key, symbol)] = {..., "rungs": [ {"px": Decimal, "orderId": str, "qty": Decimal}, ... ]}
         self.pos: Dict[Tuple[str, str], Dict] = {}
         self.lock = threading.Lock()
 
@@ -422,66 +450,54 @@ def symbol_allowed_by_policy(symbol: str, extra: dict) -> PolicyCheck:
 
 # ---------- core ladder logic ----------
 def _split_even(total: Decimal, step: Decimal, minq: Decimal, n: int) -> List[Decimal]:
-    """Even split total into n chunks rounded to step; ensure each >= minq when possible."""
-    if n <= 0: return []
+    if n <= 0:
+        return []
     ideal = total / Decimal(n)
     chunks = [round_to_step(ideal, step) for _ in range(n)]
-    # fix rounding residual
     diff = total - sum(chunks)
     if diff != 0:
         sgn = 1 if diff > 0 else -1
         diff_abs = abs(diff)
         while diff_abs >= step:
             for i in range(n):
-                if diff_abs < step: break
-                new_q = chunks[i] + (step if sgn>0 else -step)
+                if diff_abs < step:
+                    break
+                new_q = chunks[i] + (step if sgn > 0 else -step)
                 if new_q >= 0:
                     chunks[i] = new_q
                     diff_abs -= step
-            if diff_abs < step: break
-    # ensure minq where possible by stealing from others
+            if diff_abs < step:
+                break
     for i in range(n):
-        if chunks[i] == 0: continue
+        if chunks[i] == 0:
+            continue
         if chunks[i] < minq:
             need = minq - chunks[i]
             for j in range(n):
-                if j==i: continue
-                give = min(need, max(Decimal(0), chunks[j]-minq))
+                if j == i:
+                    continue
+                give = min(need, max(Decimal(0), chunks[j] - minq))
                 if give > 0:
                     chunks[j] -= give
                     chunks[i] += give
                     need -= give
-                if need <= 0: break
+                if need <= 0:
+                    break
     return chunks
 
 def build_equal_r_targets(entry: Decimal, stop: Decimal, side_word: str, tick: Decimal) -> List[Decimal]:
-    """Build equal-R target prices for the configured number of TP rungs.
-
-    Uses CFG["tp_equal_r_start"] and CFG["tp_equal_r_step"] as R multiples (e.g. 0.5, 1.0, ...).
-    If the R (abs(entry - stop)) is zero or extremely small, falls back to tick-based offsets.
-    """
     n = CFG.get("tp_rungs", 5)
-    r_start = Decimal(str(CFG.get("tp_equal_r_start", 0.5)))
-    r_step = Decimal(str(CFG.get("tp_equal_r_step", 0.5)))
+    r_start = Decimal(str(CFG.get("tp_equal_r_start", 0.5")))
+    r_step  = Decimal(str(CFG.get("tp_equal_r_step", 0.5")))
 
-    # R value = distance between entry and stop (absolute)
     r_value = abs(entry - stop)
     targets: List[Decimal] = []
 
     for i in range(n):
-        dist_R = r_start + Decimal(i) * r_step  # in R multiples
-        if r_value > Decimal("0"):
-            offset = dist_R * r_value
-        else:
-            # fallback to tick-based offset when no meaningful R available
-            # use at least one tick scaled by dist_R
-            offset = dist_R * tick
-        if side_word == "long":
-            raw_px = entry + offset
-        else:
-            raw_px = entry - offset
+        dist_R = r_start + Decimal(i) * r_step
+        offset = (dist_R * r_value) if r_value > Decimal("0") else (dist_R * tick)
+        raw_px = entry + offset if side_word == "long" else entry - offset
         targets.append(round_price_to_tick(raw_px, tick))
-
     return targets
 
 def place_or_sync_ladder(account_key: str, extra: dict, symbol: str, side_word: str, entry: Decimal, qty: Decimal, pos_idx: int):
@@ -505,24 +521,21 @@ def place_or_sync_ladder(account_key: str, extra: dict, symbol: str, side_word: 
     targets = build_equal_r_targets(entry, stop, side_word, tick)
     close_side = side_to_close(side_word)
 
-    # target qty per rung
     target_chunks = _split_even(qty, step, minq, CFG["tp_rungs"])
 
-    # fetch existing RO TPs
     existing = fetch_open_tp_orders(symbol, close_side, extra)
 
-    # adopt-only phase during startup grace or when adopting foreign ladders
     adopt_only = in_grace() or TP_ADOPT_EXISTING
 
-    # map existing by nearest target price (within 2 ticks)
-    two_ticks = tick * 2
-    matched = [None] * CFG["tp_rungs"]  # holds dicts
+    two_ticks = max(tick, tick * 2)  # defensive
+    matched = [None] * CFG["tp_rungs"]
     used = set()
     for order in existing:
         try:
             px = Decimal(str(order.get("price")))
             for i, tpx in enumerate(targets):
-                if i in used: continue
+                if i in used:
+                    continue
                 if abs(px - tpx) <= two_ticks:
                     matched[i] = order
                     used.add(i)
@@ -537,31 +550,26 @@ def place_or_sync_ladder(account_key: str, extra: dict, symbol: str, side_word: 
         ex_id = ex.get("orderId") if ex else None
         ex_link = ex.get("orderLinkId") if ex else None
 
-        # If chunk is zero: only cancel if it's ours and we're past grace or allowed to cancel non-B44
         if tq <= 0:
             if ex_id:
                 if managed_link(ex_link):
                     cancel_order(ex_id, ex_link, extra)
                 else:
-                    # foreign order: adopt-only means leave it alone
                     tg_send(f"🤝 Adopt keep (qty=0 target): {account_key}:{symbol} rung {i+1} foreign order", priority="info")
             rung_info.append({"px": tpx, "qty": Decimal("0"), "orderId": ex_id})
             continue
 
-        # Need an order here
         if not ex_id:
-            # adopt-only: do not create if we are in grace and can't tag? We'll always tag our placement.
             oid = place_limit_reduce(symbol, close_side, tpx, tq, tick, extra)
             rung_info.append({"px": tpx, "qty": tq, "orderId": oid})
-            if oid: placed += 1
+            if oid:
+                placed += 1
             continue
 
-        # We have an order; if it's foreign and adopt-only, don't amend, just record
         if ex_id and (not managed_link(ex_link)) and adopt_only:
             rung_info.append({"px": Decimal(str(ex.get("price"))), "qty": Decimal(str(ex.get("qty"))), "orderId": ex_id})
             continue
 
-        # Otherwise, we can amend to target
         cur_px = Decimal(str(ex.get("price")))
         cur_qty = Decimal(str(ex.get("qty")))
         if abs(cur_px - tpx) > tick:
@@ -605,19 +613,18 @@ def handle_tp_fill(account_key: str, extra: dict, ev: dict):
     symbol = ev.get("symbol")
     with STATE.lock:
         s = STATE.pos.get((account_key, symbol))
-    if not s or not s.get("tp_placed"): return
+    if not s or not s.get("tp_placed"):
+        return
 
     with STATE.lock:
         s["tp_filled"] = s.get("tp_filled", 0) + 1
         filled_count = s["tp_filled"]
         targets = s.get("targets", [])
-        side_word = s["side"]
         pos_idx = s["pos_idx"]
 
     filled_px = ev.get("avgPrice") or ev.get("execPrice") or ev.get("price")
     tg_send(f"🎯 {account_key}:{symbol} TP filled {filled_count}/{CFG['tp_rungs']} @ {filled_px}", priority="info")
 
-    # Ladder SL to previous TP price:
     if targets and filled_count >= 2:
         prev_index = min(filled_count - 2, CFG["tp_rungs"] - 2)  # 2->0, 3->1, 4->2, 5->3
         if 0 <= prev_index < len(targets):
@@ -633,12 +640,16 @@ def load_positions_once():
                 arr = res.get("result", {}).get("list", []) or []
                 for p in arr:
                     symbol = p.get("symbol") or ""
-                    if not symbol: continue
-                    if CFG["listen_symbols"] != "*" and symbol not in CFG["listen_symbols"]: continue
-                    if CFG["symbol_blocklist"] and symbol.upper() in {s.upper() for s in CFG["symbol_blocklist"]}: continue
+                    if not symbol:
+                        continue
+                    if CFG["listen_symbols"] != "*" and symbol not in CFG["listen_symbols"]:
+                        continue
+                    if CFG["symbol_blocklist"] and symbol.upper() in {s.upper() for s in CFG["symbol_blocklist"]}:
+                        continue
                     size = Decimal(p.get("size") or "0")
-                    if size == 0: continue
-                    side_word = "long" if (p.get("side","").lower().startswith("b")) else "short"
+                    if size == 0:
+                        continue
+                    side_word = "long" if (p.get("side", "").lower().startswith("b")) else "short"
                     entry = Decimal(p.get("avgPrice") or "0")
                     pos_idx = int(p.get("positionIdx") or 0)
                     place_or_sync_ladder(acct_key, extra, symbol, side_word, entry, size, pos_idx)
@@ -656,21 +667,21 @@ def periodic_sweep_loop():
                         for p in rows:
                             symbol = p.get("symbol") or ""
                             size = Decimal(p.get("size") or "0")
-                            if not symbol: continue
+                            if not symbol:
+                                continue
                             if size <= 0:
                                 with STATE.lock:
                                     if (acct_key, symbol) in STATE.pos:
                                         tg_send(f"🏁 {acct_key}:{symbol} position closed.", priority="info")
                                     STATE.pos.pop((acct_key, symbol), None)
                                 continue
-                            side_word = "long" if (p.get("side","").lower().startswith("b")) else "short"
+                            side_word = "long" if (p.get("side", "").lower().startswith("b")) else "short"
                             entry = Decimal(p.get("avgPrice") or "0")
                             pos_idx = int(p.get("positionIdx") or 0)
 
                             with STATE.lock:
                                 s = STATE.pos.get((acct_key, symbol))
                                 prev_qty = s.get("qty") if s else None
-                            # sync if new or size changed or ladder not yet placed
                             if s is None or prev_qty != size or not s.get("tp_placed"):
                                 place_or_sync_ladder(acct_key, extra, symbol, side_word, entry, size, pos_idx)
                     except Exception as e:
@@ -693,12 +704,13 @@ def _update_heartbeat():
 def ws_private_handler(message):
     _update_heartbeat()
     try:
-        if not isinstance(message, dict): return
+        if not isinstance(message, dict):
+            return
         topic = message.get("topic", "")
         data = message.get("data", [])
-        if not data: return
+        if not data:
+            return
 
-        # Execution/order fills
         if "execution" in topic or "order" in topic:
             for ev in data:
                 symbol = ev.get("symbol")
@@ -712,13 +724,13 @@ def ws_private_handler(message):
                     extra = {} if acct_key == "main" else {"subUid": acct_key.split(":")[1]}
                     handle_tp_fill(acct_key, extra, ev)
 
-        # Position updates
         if "position" in topic:
             for p in data:
                 symbol = p.get("symbol") or ""
                 size = Decimal(p.get("size") or "0")
-                if not symbol: continue
-                side_word = "long" if (p.get("side","").lower().startswith("b")) else "short"
+                if not symbol:
+                    continue
+                side_word = "long" if (p.get("side", "").lower().startswith("b")) else "short"
                 entry = Decimal(p.get("avgPrice") or "0")
                 pos_idx = int(p.get("positionIdx") or 0)
 
@@ -729,29 +741,31 @@ def ws_private_handler(message):
                                 tg_send(f"🏁 {acct_key}:{symbol} position closed.", priority="info")
                             STATE.pos.pop((acct_key, symbol), None)
                         continue
-
-                    # always sync ladder on any update (covers scale-in)
                     place_or_sync_ladder(acct_key, extra, symbol, side_word, entry, size, pos_idx)
-
     except Exception as e:
         log.error(f"ws handler error: {e}")
 
 def _spawn_ws():
     global _ws_obj
-    with _ws_lock:
-        _ws_obj = WebSocket(
-            testnet=(BYBIT_ENV == "testnet"),
-            channel_type="private",
-            api_key=BYBIT_KEY,
-            api_secret=BYBIT_SECRET,
-            ping_interval=CFG["ws_ping_interval"],
-            ping_timeout=CFG["ws_ping_timeout"]
-        )
-        _update_heartbeat()
-        _ws_obj.order_stream(callback=ws_private_handler)
-        _ws_obj.position_stream(callback=ws_private_handler)
-        _ws_obj.execution_stream(callback=ws_private_handler)
-        log.info("Subscribed to private streams.")
+    try:
+        with _ws_lock:
+            _ws_obj = WebSocket(
+                testnet=(BYBIT_ENV == "testnet"),
+                channel_type="private",
+                api_key=BYBIT_KEY,
+                api_secret=BYBIT_SECRET,
+                ping_interval=CFG["ws_ping_interval"],
+                ping_timeout=CFG["ws_ping_timeout"]
+            )
+            _update_heartbeat()
+            _ws_obj.order_stream(callback=ws_private_handler)
+            _ws_obj.position_stream(callback=ws_private_handler)
+            _ws_obj.execution_stream(callback=ws_private_handler)
+            log.info("Subscribed to private streams.")
+    except Exception as e:
+        log.error(f"WS spawn failed: {e}; disabling WS and relying on HTTP sweep.")
+        CFG["ws_optional"] = True
+        tg_send("⚠️ TP/SL Manager: WS spawn failed; falling back to HTTP-only mode.", priority="warn")
 
 def _close_ws():
     global _ws_obj
@@ -784,13 +798,17 @@ def _ws_watchdog():
 
 # ---------- main ----------
 def bootstrap():
-    tg_send(f"🟢 TP/SL Manager online • dry_run={TP_DRY_RUN} grace={TP_GRACE_SEC}s adopt={TP_ADOPT_EXISTING} tag={TP_TAG}", priority="success")
+    tg_send(f"🟢 TP/SL Manager online • dry_run={TP_DRY_RUN} grace={TP_GRACE_SEC}s adopt={TP_ADOPT_EXISTING} tag={TP_TAG} ws_optional={CFG['ws_optional']} sweep={CFG['periodic_sweep_sec']}s", priority="success")
     log.info("TP/SL Manager started (5 equal TPs, hardened guards)")
 
     load_positions_once()
 
-    _spawn_ws()
-    threading.Thread(target=_ws_watchdog, name="ws-watchdog", daemon=True).start()
+    if not CFG["ws_optional"]:
+        _spawn_ws()
+        threading.Thread(target=_ws_watchdog, name="ws-watchdog", daemon=True).start()
+    else:
+        log.warning("WS disabled by config/env; using HTTP sweep only.")
+
     threading.Thread(target=periodic_sweep_loop, name="sweep", daemon=True).start()
 
     try:
