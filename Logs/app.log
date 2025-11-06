@@ -1,0 +1,2 @@
+2025-11-06 20:09:20 | ERROR | tools.notifier_telegram | [tg] send_text failed: HTTP 401 Unauthorized
+2025-11-06 20:09:20 | INFO | bots.signal_engine | startup SYMS=BTCUSDT,ETHUSDT TFs=[5, 15] Bias=60m queue=C:\Users\nolan\Desktop\Base 44\Signals\observed.jsonl

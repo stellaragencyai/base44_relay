@@ -2,290 +2,286 @@
 # -*- coding: utf-8 -*-
 """
 Base44 — Signal Engine (observe-first, automation-ready + heartbeat)
-Finalized: breaker-aware, once-per-bar dedupe, robust cooldowns, safer JSONL, mild telemetry polish.
+Refactored to core stack:
+- Uses core.config.settings for envs/paths
+- Uses core.logger for logging
+- Uses tools.notifier_telegram.tg for notifications
+- Talks to Bybit v5 directly (no pybit/dotenv)
 
-What it does (recap):
+What it does:
 - Scans SIG_SYMBOLS on SIG_TIMEFRAMES with a higher-timeframe bias (SIG_BIAS_TF).
-- Regime gates: min ADX on bias TF, min ATR%/Price on intraday TF, volume z-score.
+- Gates by ADX on bias TF, ATR%/Price and volume z-score on intraday TFs.
 - Emits human-readable alerts to Telegram (optional).
-- Writes machine-readable signals to signals/observed.jsonl for the executor.
-- Includes confidence score and optional stop distance hint for the executor.
-- Rate-limits per (symbol, timeframe, direction) and dedupes per bar.
+- Appends machine-readable signals to signals/observed.jsonl for an executor.
+- Rate-limits per (symbol, timeframe, direction) and dedupes once per bar.
 - Sends startup ping and periodic heartbeats.
-- Obeys global breaker: will still heartbeat, but will NOT emit signals while breaker is ON.
-
-.env keys (ensure they exist):
-  # Core
-  SIG_ENABLED=true
-  SIG_DRY_RUN=true
-  SIG_HEARTBEAT_MIN=10
-  TZ=America/Phoenix
-
-  # Universe & cadence
-  SIG_SYMBOLS=BTCUSDT,ETHUSDT
-  SIG_TIMEFRAMES=5,15
-  SIG_BIAS_TF=60
-  SIG_POLL_SEC=30
-
-  # Feature params
-  SIG_ADX_LEN=14
-  SIG_ATR_LEN=14
-  SIG_VOL_Z_WIN=60
-  SIG_MIN_ADX=18
-  SIG_MIN_ATR_PCT=0.25
-  SIG_NOTIFY_COOLDOWN_SEC=300
-  SIG_SEND_CHART_LINKS=false
-
-  # Emit options (for executor)
-  SIG_TAG=B44
-  SIG_MAKER_ONLY=true
-  SIG_SPREAD_MAX_BPS=8
-  SIG_STOP_DIST_MODE=auto     # auto | atr_mult | pct
-  SIG_STOP_ATR_MULT=3.0
-  SIG_STOP_PCT=1.2
-
-  # Output
-  SIGNAL_OUT_DIR=signals
-  SIGNAL_QUEUE_FILE=observed.jsonl
-
-  # Bybit
-  BYBIT_API_KEY=
-  BYBIT_API_SECRET=
-  BYBIT_ENV=mainnet
-
-  # Decision logging (optional helper)
-  DECISION_LOG_DIR=./logs/decisions
-  DECISION_LOG_FORMATS=jsonl,parquet
-  DECISION_LOG_FLUSH_SEC=2
-  DECISION_LOG_ROTATE_DAYS=7
+- Obeys global breaker: still heartbeats, but does NOT emit signals when breaker is ON.
 """
 
 from __future__ import annotations
-import os, time, statistics, logging, datetime, threading, json, tempfile
+import json
+import time
+import statistics
+import datetime as dt
+import threading
+import urllib.parse
+import urllib.request
+import urllib.error
 from collections import deque, defaultdict
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
-from dotenv import load_dotenv
-from pybit.unified_trading import HTTP
+from core.config import settings
+from core.logger import get_logger
+from tools.notifier_telegram import tg
 
-# Telegram notifier (soft dep)
-try:
-    from core.notifier_bot import tg_send
-except Exception:
-    def tg_send(msg: str, priority: str="info", **_): print(f"[notify/{priority}] {msg}")
+log = get_logger("bots.signal_engine")
 
-# Decision logger (soft dep)
-try:
-    from core.decision_log import log_event
-except Exception:
-    def log_event(component, event, symbol, account_uid, payload=None, trade_id=None, level="info"):
-        print(f"[DECLOG/{component}/{event}] {symbol} @{account_uid} {payload or {}}")
+# =========================
+# Config from core.settings
+# =========================
 
-# Breaker (soft dep). If import fails, we fallback to file check used by tp/sl bot.
-_BREAKER_IS_ACTIVE = None
-try:
-    from core.breaker import is_active as _breaker_is_active
-    _BREAKER_IS_ACTIVE = _breaker_is_active
-except Exception:
-    _BREAKER_IS_ACTIVE = None
+ENABLED: bool = settings.SIG_ENABLED
+DRY_RUN: bool = settings.SIG_DRY_RUN
+SYMS: List[str] = [s.strip().upper() for s in settings.SIG_SYMBOLS.split(",") if s.strip()]
+INTRA_TFS: List[int] = [int(x) for x in settings.SIG_TIMEFRAMES.split(",") if x.strip()]
+BIAS_TF: int = int(settings.SIG_BIAS_TF)
+HEARTBEAT_MIN: int = int(settings.SIG_HEARTBEAT_MIN)
 
-log = logging.getLogger("signal")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+# Feature params (fall back to sane defaults if not in .env)
+def _getfloat(name: str, default: float) -> float:
+    try:
+        v = getattr(settings, name)
+    except AttributeError:
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
 
-# ---------- env/root ----------
-ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT / ".env", override=True)
+def _getint(name: str, default: int) -> int:
+    try:
+        v = getattr(settings, name)
+    except AttributeError:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
 
-def env_bool(k: str, default: bool) -> bool:
-    v = (os.getenv(k, str(int(default))) or "").strip().lower()
-    return v in {"1","true","yes","on"}
+SIG_POLL_SEC     = _getint("SIG_POLL_SEC", 30)
+SIG_ADX_LEN      = _getint("SIG_ADX_LEN", 14)
+SIG_ATR_LEN      = _getint("SIG_ATR_LEN", 14)
+SIG_VOL_Z_WIN    = _getint("SIG_VOL_Z_WIN", 60)
+SIG_MIN_ADX      = _getfloat("SIG_MIN_ADX", 18.0)
+SIG_MIN_ATR_PCT  = _getfloat("SIG_MIN_ATR_PCT", 0.25)
+SIG_CD_SEC       = _getint("SIG_NOTIFY_COOLDOWN_SEC", 300)
 
-def env_int(k: str, default: int) -> int:
-    try: return int((os.getenv(k, str(default)) or "").strip())
-    except Exception: return default
+# Emit options for the executor
+SIG_TAG          = getattr(settings, "SIG_TAG", "B44")
+SIG_MAKER_ONLY   = bool(getattr(settings, "SIG_MAKER_ONLY", True))
+SIG_SPREAD_MAX_BPS = float(getattr(settings, "SIG_SPREAD_MAX_BPS", 8.0))
 
-def env_float(k: str, default: float) -> float:
-    try: return float((os.getenv(k, str(default)) or "").strip())
-    except Exception: return default
+STOP_MODE        = str(getattr(settings, "SIG_STOP_DIST_MODE", "auto")).strip().lower()  # auto|atr_mult|pct
+STOP_ATR_MULT    = _getfloat("SIG_STOP_ATR_MULT", 3.0)
+STOP_PCT         = _getfloat("SIG_STOP_PCT", 1.2)
 
-def env_csv(k: str, default: str="") -> List[str]:
-    raw = os.getenv(k, default) or default
-    return [s.strip().upper() for s in raw.split(",") if s.strip()]
+# Output paths
+SIGNALS_DIR: Path = settings.DIR_SIGNALS
+SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
+QUEUE_PATH: Path = SIGNALS_DIR / "observed.jsonl"
 
-# ---------- config ----------
-ENABLED = env_bool("SIG_ENABLED", True)
-SYMS = env_csv("SIG_SYMBOLS", "BTCUSDT,ETHUSDT")
-INTRA_TFS = [int(x) for x in (os.getenv("SIG_TIMEFRAMES","5,15").split(",")) if x.strip()]
-BIAS_TF = env_int("SIG_BIAS_TF", 60)
-POLL_SEC = env_int("SIG_POLL_SEC", 30)
+# Timezone
+TZ_STR: str = settings.TZ or "Europe/London"
 
-ADX_LEN = env_int("SIG_ADX_LEN", 14)
-ATR_LEN = env_int("SIG_ATR_LEN", 14)
-VOL_Z_WIN = env_int("SIG_VOL_Z_WIN", 60)
+# Network/base
+BYBIT_BASE_URL = settings.BYBIT_BASE_URL.rstrip("/")
 
-MIN_ADX = env_float("SIG_MIN_ADX", 18.0)
-MIN_ATR_PCT = env_float("SIG_MIN_ATR_PCT", 0.25)
-COOLDOWN = env_int("SIG_NOTIFY_COOLDOWN_SEC", 300)
-SEND_CHART_LINKS = env_bool("SIG_SEND_CHART_LINKS", False)
-DRY_RUN = env_bool("SIG_DRY_RUN", True)
-HEARTBEAT_MIN = env_int("SIG_HEARTBEAT_MIN", 10)
+# =========================
+# Breaker support
+# =========================
 
-SIG_TAG = (os.getenv("SIG_TAG","B44") or "B44").strip()
-SIG_MAKER_ONLY = env_bool("SIG_MAKER_ONLY", True)
-SIG_SPREAD_MAX_BPS = env_float("SIG_SPREAD_MAX_BPS", 8.0)
-
-STOP_MODE = (os.getenv("SIG_STOP_DIST_MODE","auto") or "auto").strip().lower()   # auto|atr_mult|pct
-STOP_ATR_MULT = env_float("SIG_STOP_ATR_MULT", 3.0)
-STOP_PCT = env_float("SIG_STOP_PCT", 1.2)
-
-SIGNAL_OUT_DIR = Path(os.getenv("SIGNAL_OUT_DIR", "signals"))
-SIGNAL_QUEUE_FILE = os.getenv("SIGNAL_QUEUE_FILE", "observed.jsonl")
-SIGNAL_OUT_DIR.mkdir(parents=True, exist_ok=True)
-QUEUE_PATH = SIGNAL_OUT_DIR / SIGNAL_QUEUE_FILE
-
-TZ = os.getenv("TZ", "America/Phoenix") or "America/Phoenix"
-
-BYBIT_KEY = os.getenv("BYBIT_API_KEY","")
-BYBIT_SECRET = os.getenv("BYBIT_API_SECRET","")
-BYBIT_ENV = (os.getenv("BYBIT_ENV","mainnet") or "mainnet").lower().strip()
-if not (BYBIT_KEY and BYBIT_SECRET):
-    raise SystemExit("Missing BYBIT_API_KEY/BYBIT_API_SECRET in .env")
-http = HTTP(testnet=(BYBIT_ENV=="testnet"), api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
-
-# simple append lock for JSONL queue
-_queue_lock = threading.Lock()
-
-# ---------- breaker helpers ----------
-_STATE_DIR = ROOT / ".state"
+_STATE_DIR = settings.ROOT / ".state"
 _STATE_DIR.mkdir(parents=True, exist_ok=True)
 _BREAKER_FILE = _STATE_DIR / "risk_state.json"
 
 def breaker_active() -> bool:
-    # Prefer imported breaker; otherwise fall back to file look
-    if callable(_BREAKER_IS_ACTIVE):
-        try:
-            return bool(_BREAKER_IS_ACTIVE())
-        except Exception:
-            pass
     try:
         if not _BREAKER_FILE.exists():
             return False
         js = json.loads(_BREAKER_FILE.read_text(encoding="utf-8"))
-        return bool(js.get("breach"))
+        return bool(js.get("breach") or js.get("breaker") or js.get("active"))
     except Exception:
         return False
 
-# ---------- helpers ----------
+# =========================
+# HTTP: Bybit public kline
+# =========================
+
+def _http_get(url: str, timeout: int = 15) -> Tuple[bool, Dict, str]:
+    req = urllib.request.Request(url=url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+        return False, {}, f"HTTP {e.code} {body[:300]}"
+    except Exception as e:
+        return False, {}, f"network error: {e}"
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return False, {}, f"bad json: {raw[:300]}"
+    if data.get("retCode") == 0:
+        return True, data, ""
+    return False, data, f"retCode={data.get('retCode')} retMsg={data.get('retMsg')}"
+
 def _tf_to_interval(tf_min: int) -> str:
     return "D" if tf_min >= 1440 else str(tf_min)
 
-def _kline(symbol: str, tf_min: int, limit: int=300):
+def get_kline(symbol: str, tf_min: int, limit: int = 400) -> List[Tuple[float, float, float, float, float, float]]:
     """
-    Return list of (ts, open, high, low, close, volume) oldest->newest.
-    Bybit v5 returns newest-first; we reverse it.
+    Returns list of (ts, open, high, low, close, volume) oldest->newest.
     """
-    try:
-        res = http.get_kline(category="linear", symbol=symbol, interval=_tf_to_interval(tf_min), limit=limit)
-        arr = (res.get("result") or {}).get("list") or []
-        out = [(float(x[0])/1000.0, float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])) for x in arr]
-        out.reverse()
-        return out
-    except Exception as e:
-        log.warning(f"kline error {symbol} {tf_min}m: {e}")
+    qs = urllib.parse.urlencode({
+        "category": "linear",
+        "symbol": symbol,
+        "interval": _tf_to_interval(tf_min),
+        "limit": str(limit),
+    })
+    url = f"{BYBIT_BASE_URL}/v5/market/kline?{qs}"
+    ok, data, err = _http_get(url, timeout=settings.HTTP_TIMEOUT_S)
+    if not ok:
+        log.warning("kline error %s %sm: %s", symbol, tf_min, err)
         return []
+    arr = ((data.get("result") or {}).get("list") or [])
+    out = [(float(x[0]) / 1000.0, float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])) for x in arr]
+    out.reverse()  # newest-first -> oldest-first
+    return out
+
+# =========================
+# Technicals
+# =========================
 
 def ema(values: List[float], length: int) -> List[float]:
     if not values or length <= 1: return values[:]
-    k = 2/(length+1)
-    out, val = [], None
+    k = 2 / (length + 1)
+    out: List[float] = []
+    val: Optional[float] = None
     for v in values:
-        val = v if val is None else (v*k + val*(1-k))
+        val = v if val is None else (v * k + val * (1 - k))
         out.append(val)
     return out
 
-def _true_ranges(h, l, c):
-    out, prev = [], None
+def _true_ranges(h: List[float], l: List[float], c: List[float]) -> List[float]:
+    out: List[float] = []
+    prev: Optional[float] = None
     for i in range(len(c)):
         if prev is None:
-            out.append(h[i]-l[i])
+            out.append(h[i] - l[i])
         else:
-            out.append(max(h[i]-l[i], abs(h[i]-prev), abs(l[i]-prev)))
+            out.append(max(h[i] - l[i], abs(h[i] - prev), abs(l[i] - prev)))
         prev = c[i]
     return out
 
 def sma(values: List[float], n: int) -> List[float]:
-    out, run = [], deque([], maxlen=n)
+    out: List[float] = []
+    run: deque = deque([], maxlen=n)
     for v in values:
-        run.append(v); out.append(sum(run)/len(run))
+        run.append(v)
+        out.append(sum(run) / len(run))
     return out
 
-def atr(h, l, c, n): return sma(_true_ranges(h,l,c), n)
+def atr(h: List[float], l: List[float], c: List[float], n: int) -> List[float]:
+    return sma(_true_ranges(h, l, c), n)
 
-def adx(h, l, c, n):
+def adx(h: List[float], l: List[float], c: List[float], n: int) -> List[float]:
     plus_dm, minus_dm = [0.0], [0.0]
     for i in range(1, len(c)):
-        up = h[i]-h[i-1]; dn = l[i-1]-l[i]
-        plus_dm.append(max(up,0.0) if up > dn else 0.0)
-        minus_dm.append(max(dn,0.0) if dn > up else 0.0)
-    tr_n = sma(_true_ranges(h,l,c), n)
-    pdi, mdi = [0.0]*len(c), [0.0]*len(c)
+        up = h[i] - h[i - 1]
+        dn = l[i - 1] - l[i]
+        plus_dm.append(up if (up > dn and up > 0) else 0.0)
+        minus_dm.append(dn if (dn > up and dn > 0) else 0.0)
+    tr_n = sma(_true_ranges(h, l, c), n)
+    pdi, mdi = [0.0] * len(c), [0.0] * len(c)
     for i in range(len(c)):
         if tr_n[i] > 0:
-            pdi[i] = 100.0*(plus_dm[i]/tr_n[i])
-            mdi[i] = 100.0*(minus_dm[i]/tr_n[i])
-    dx = [0.0]*len(c)
+            pdi[i] = 100.0 * (plus_dm[i] / tr_n[i])
+            mdi[i] = 100.0 * (minus_dm[i] / tr_n[i])
+    dx = [0.0] * len(c)
     for i in range(len(c)):
-        s = pdi[i]+mdi[i]
-        dx[i] = 100.0*abs(pdi[i]-mdi[i])/s if s>0 else 0.0
+        s = pdi[i] + mdi[i]
+        dx[i] = 100.0 * abs(pdi[i] - mdi[i]) / s if s > 0 else 0.0
     return sma(dx, n)
 
 def vol_zscore(vol: List[float], win: int) -> List[float]:
-    out, run = [], deque([], maxlen=win)
+    out: List[float] = []
+    run: deque = deque([], maxlen=win)
     for v in vol:
         run.append(v)
-        if len(run) < 5: out.append(0.0); continue
-        mu = statistics.mean(run); sd = statistics.pstdev(run) or 1e-9
-        out.append((v-mu)/sd)
+        if len(run) < 5:
+            out.append(0.0)
+            continue
+        mu = statistics.mean(run)
+        sd = statistics.pstdev(run) or 1e-9
+        out.append((v - mu) / sd)
     return out
 
 def atr_pct(atr_vals: List[float], closes: List[float]) -> List[float]:
-    return [0.0 if closes[i]==0 else 100.0*atr_vals[i]/closes[i] for i in range(len(closes))]
+    return [0.0 if closes[i] == 0 else 100.0 * atr_vals[i] / closes[i] for i in range(len(closes))]
 
-# ---------- features ----------
-def bias_context(symbol: str, tf: int):
-    k = _kline(symbol, tf, 200)
-    if len(k) < max(60, ADX_LEN+5): return {}
-    ts,o,h,l,c,v = list(zip(*k))
-    c,h,l = list(c), list(h), list(l)
-    a = adx(h,l,c, ADX_LEN)
+# =========================
+# Feature calcs
+# =========================
+
+def bias_context(symbol: str, tf: int) -> Dict:
+    k = get_kline(symbol, tf, 200)
+    if len(k) < max(60, SIG_ADX_LEN + 5): return {}
+    ts, o, h, l, c, v = list(zip(*k))
+    c, h, l = list(c), list(h), list(l)
+    a = adx(h, l, c, SIG_ADX_LEN)
     e50 = ema(c, 50)
-    return {"adx": a[-1], "ema50": e50[-1], "close": c[-1],
-            "trend_up": c[-1] > e50[-1], "trend_dn": c[-1] < e50[-1],
-            "bar_ts": ts[-1]}
+    return {
+        "adx": a[-1],
+        "ema50": e50[-1],
+        "close": c[-1],
+        "trend_up": c[-1] > e50[-1],
+        "trend_dn": c[-1] < e50[-1],
+        "bar_ts": ts[-1],
+    }
 
-def intra_features(symbol: str, tf: int):
-    k = _kline(symbol, tf, 400)
-    if len(k) < max(ATR_LEN, ADX_LEN, VOL_Z_WIN)+10: return {}
-    ts,o,h,l,c,v = list(zip(*k))
-    h,l,c,v = list(h), list(l), list(c), list(v)
-    a = adx(h,l,c, ADX_LEN)
-    av = atr(h,l,c, ATR_LEN)
+def intra_features(symbol: str, tf: int) -> Dict:
+    k = get_kline(symbol, tf, 400)
+    if len(k) < max(SIG_ATR_LEN, SIG_ADX_LEN, SIG_VOL_Z_WIN) + 10: return {}
+    ts, o, h, l, c, v = list(zip(*k))
+    h, l, c, v = list(h), list(l), list(c), list(v)
+    a = adx(h, l, c, SIG_ADX_LEN)
+    av = atr(h, l, c, SIG_ATR_LEN)
     ap = atr_pct(av, c)
-    vz = vol_zscore(v, VOL_Z_WIN)
-    e20, e50, e200 = ema(c,20), ema(c,50), ema(c,200)
+    vz = vol_zscore(v, SIG_VOL_Z_WIN)
+    e20, e50, e200 = ema(c, 20), ema(c, 50), ema(c, 200)
     recent = c[-3:]
-    return {"adx": a[-1], "atrp": ap[-1], "vz": vz[-1], "close": c[-1],
-            "ema20": e20[-1], "ema50": e50[-1], "ema200": e200[-1],
-            "pullback_ok": (e20[-1] > e50[-1] > e200[-1]) and (c[-1] >= e50[-1]),
-            "breakout_ok": (c[-1] > max(recent)) and (vz[-1] > 0.8),
-            "trend_dn_ok": (e20[-1] < e50[-1] < e200[-1]) and (c[-1] <= e50[-1]),
-            "breakdown_ok": (c[-1] < min(recent)) and (vz[-1] > 0.8),
-            "atr": av[-1],
-            "bar_ts": ts[-1]}
+    return {
+        "adx": a[-1],
+        "atrp": ap[-1],
+        "vz": vz[-1],
+        "close": c[-1],
+        "ema20": e20[-1],
+        "ema50": e50[-1],
+        "ema200": e200[-1],
+        "pullback_ok": (e20[-1] > e50[-1] > e200[-1]) and (c[-1] >= e50[-1]),
+        "breakout_ok": (c[-1] > max(recent)) and (vz[-1] > 0.8),
+        "trend_dn_ok": (e20[-1] < e50[-1] < e200[-1]) and (c[-1] <= e50[-1]),
+        "breakdown_ok": (c[-1] < min(recent)) and (vz[-1] > 0.8),
+        "atr": av[-1],
+        "bar_ts": ts[-1],
+    }
 
-# ---------- decision ----------
-def decide(symbol: str, tf: int, bias: dict, f: dict):
+# =========================
+# Decisioning
+# =========================
+
+def decide(symbol: str, tf: int, bias: Dict, f: Dict) -> Tuple[bool, str, str, float]:
     """
     Returns (ok, direction, why, confidence[0..1]).
     """
@@ -293,58 +289,65 @@ def decide(symbol: str, tf: int, bias: dict, f: dict):
     if not f:    return (False, "", "insufficient intraday", 0.0)
 
     score = 0.0
-    if bias["adx"] >= MIN_ADX: score += 0.25
-    else: return (False, "", f"bias ADX {bias['adx']:.1f} < {MIN_ADX}", 0.0)
+    if bias["adx"] >= SIG_MIN_ADX:
+        score += 0.25
+    else:
+        return (False, "", f"bias ADX {bias['adx']:.1f} < {SIG_MIN_ADX}", 0.0)
 
-    if f["atrp"]  >= MIN_ATR_PCT: score += 0.25
-    else: return (False, "", f"ATR% {f['atrp']:.2f} < {MIN_ATR_PCT}", 0.0)
+    if f["atrp"] >= SIG_MIN_ATR_PCT:
+        score += 0.25
+    else:
+        return (False, "", f"ATR% {f['atrp']:.2f} < {SIG_MIN_ATR_PCT}", 0.0)
 
-    long_ok  = bias["trend_up"] and (f["pullback_ok"] or f["breakout_ok"])
+    long_ok = bias["trend_up"] and (f["pullback_ok"] or f["breakout_ok"])
     short_ok = bias["trend_dn"] and (f["trend_dn_ok"] or f["breakdown_ok"])
 
     reasons = []
-    if long_ok:  reasons.append("bias-up + pullback/breakout"); score += 0.25
-    if short_ok: reasons.append("bias-down + continuation/breakdown"); score += 0.25
-    if not (long_ok or short_ok): return (False, "", "no edge", 0.0)
+    if long_ok:
+        reasons.append("bias-up + pullback/breakout")
+        score += 0.25
+    if short_ok:
+        reasons.append("bias-down + continuation/breakdown")
+        score += 0.25
+    if not (long_ok or short_ok):
+        return (False, "", "no edge", 0.0)
 
     direction = "long" if long_ok and (not short_ok or bias["trend_up"]) else "short"
     vz = f.get("vz", 0.0)
-    score += max(0.0, min(0.25, (vz - 0.5) / 4.0))   # mild boost from volume energy
+    score += max(0.0, min(0.25, (vz - 0.5) / 4.0))  # small boost from volume energy
 
     conf = max(0.0, min(1.0, score))
     return (True, direction, "; ".join(reasons), conf)
 
-# ---------- helpers for executor params ----------
-def compute_stop_dist(last: float, f: dict) -> float:
+# =========================
+# Emit & queue
+# =========================
+
+def compute_stop_dist(last: float, f: Dict) -> float:
     if STOP_MODE == "atr_mult" and f.get("atr"):
         return float(f["atr"] * STOP_ATR_MULT)
     if STOP_MODE == "pct":
         return float(last * (STOP_PCT / 100.0))
-    return 0.0  # auto → let executor use its internal fallback
+    return 0.0  # auto → let executor decide
 
-# ---------- alerts & queue ----------
-_last_alert = defaultdict(float)          # for time-based cooldown
-_last_bar_emit = {}                       # key=(sym,tf,dir) -> last_bar_ts emitted
+_queue_lock = threading.Lock()
+_last_alert = defaultdict(float)      # cooldown per (sym, tf, dir)
+_last_bar_emit: Dict[Tuple[str, int, str], float] = {}
 _last_hb = 0.0
 
-def _now_local():
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.datetime.now(ZoneInfo(TZ))
-    except Exception:
-        return datetime.datetime.now()
-
-def _safe_append_jsonl(path: Path, line: str):
-    """
-    Safer than plain append on some filesystems: write to tmp then append atomically-ish.
-    Still O_APPEND is fine, but this reduces partial line risk if your editor tail -f's the file.
-    """
-    # Plain append with a lock is adequate on Windows/NTFS and POSIX; keep it simple.
+def _safe_append_jsonl(path: Path, line: str) -> None:
     with _queue_lock:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
 
-def human_alert(symbol: str, tf: int, direction: str, why: str, bias: dict, f: dict, conf: float, mode_str: str):
+def _now_local() -> dt.datetime:
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo(TZ_STR))
+    except Exception:
+        return dt.datetime.now()
+
+def human_alert(symbol: str, tf: int, direction: str, why: str, bias: Dict, f: Dict, conf: float, mode_str: str) -> None:
     trend = "UP" if bias.get("trend_up") else ("DOWN" if bias.get("trend_dn") else "FLAT")
     lines = [
         f"🟢 Signal • {symbol} • {tf}m • {direction.upper()} • conf {conf:.2f}",
@@ -352,14 +355,11 @@ def human_alert(symbol: str, tf: int, direction: str, why: str, bias: dict, f: d
         f"Bias {BIAS_TF}m: ADX {bias['adx']:.1f} • trend {trend}",
         f"Intra: ADX {f['adx']:.1f} • ATR% {f['atrp']:.2f} • VolZ {f['vz']:.2f}",
         f"Close {f['close']:.6g} • EMA20/50/200 {f['ema20']:.6g}/{f['ema50']:.6g}/{f['ema200']:.6g}",
-        mode_str
+        mode_str,
     ]
-    if SEND_CHART_LINKS:
-        # deliberately left blank; we can bolt TV links later without touching logic
-        pass
-    tg_send("\n".join(lines), priority="info")
+    tg.safe_text("\n".join(lines), parse_mode=None, quiet=True)
 
-def maybe_emit(symbol: str, tf: int, direction: str, why: str, bias: dict, f: dict, conf: float):
+def maybe_emit(symbol: str, tf: int, direction: str, why: str, bias: Dict, f: Dict, conf: float) -> None:
     now = time.time()
     key = (symbol, tf, direction)
 
@@ -370,13 +370,12 @@ def maybe_emit(symbol: str, tf: int, direction: str, why: str, bias: dict, f: di
         return
 
     # cooldown
-    if now - _last_alert[key] < COOLDOWN:
+    if now - _last_alert[key] < SIG_CD_SEC:
         return
 
     # breaker gate: observe but don't emit when ON
     if breaker_active():
-        log_event("signal", "breaker_block_emit", symbol.upper(), "MAIN",
-                  {"tf": tf, "dir": direction, "conf": round(conf,4), "why": why})
+        log.info("breaker ON: suppressing emit %s %sm %s conf=%.2f", symbol, tf, direction, conf)
         return
 
     _last_alert[key] = now
@@ -388,7 +387,7 @@ def maybe_emit(symbol: str, tf: int, direction: str, why: str, bias: dict, f: di
     params = {
         "maker_only": bool(SIG_MAKER_ONLY),
         "spread_max_bps": float(SIG_SPREAD_MAX_BPS),
-        "tag": SIG_TAG
+        "tag": SIG_TAG,
     }
     if stop_dist > 0:
         params["stop_dist"] = float(stop_dist)
@@ -414,19 +413,19 @@ def maybe_emit(symbol: str, tf: int, direction: str, why: str, bias: dict, f: di
             "ema50": round(float(f["ema50"]), 10),
             "ema200": round(float(f["ema200"]), 10),
             "close": round(float(f["close"]), 10),
-        }
+        },
     }
 
     line = json.dumps(payload, separators=(",", ":"))
     _safe_append_jsonl(QUEUE_PATH, line)
 
-    log_event("signal", "emit", symbol.upper(), "MAIN",
-              {"tf": tf, "dir": direction, "conf": round(conf,4), "stop_mode": STOP_MODE})
-
     mode_str = "Mode: OBSERVE (executor consumes queue)"
     human_alert(symbol, tf, direction, why, bias, f, conf, mode_str)
 
-# ---------- main scan ----------
+# =========================
+# Main loop
+# =========================
+
 def loop_once() -> bool:
     any_signal = False
     for sym in SYMS:
@@ -439,21 +438,20 @@ def loop_once() -> bool:
                     any_signal = True
                     maybe_emit(sym, tf, direction, why, bias, f, conf)
         except Exception as e:
-            log.warning(f"loop {sym} error: {e}")
-            log_event("signal", "loop_error", sym, "MAIN", {"error": str(e)})
+            log.warning("loop %s error: %s", sym, e)
     return any_signal
 
-def main():
+def main() -> None:
     if not ENABLED:
-        tg_send("Signal Engine disabled (SIG_ENABLED=false).", priority="warn")
+        tg.safe_text("Signal Engine disabled (SIG_ENABLED=false).", quiet=True)
+        log.info("Signal Engine disabled via SIG_ENABLED.")
         return
 
-    tg_send(
+    tg.safe_text(
         f"🟢 Signal Engine online • SYMS={','.join(SYMS)} • TFs={INTRA_TFS} • Bias={BIAS_TF}m • Queue={QUEUE_PATH.name}",
-        priority="success"
+        quiet=True,
     )
-    log_event("signal", "startup", "", "MAIN",
-              {"syms": SYMS, "tfs": INTRA_TFS, "bias_tf": BIAS_TF, "queue": str(QUEUE_PATH)})
+    log.info("startup SYMS=%s TFs=%s Bias=%sm queue=%s", ",".join(SYMS), INTRA_TFS, BIAS_TF, QUEUE_PATH)
 
     global _last_hb
     _last_hb = 0.0
@@ -462,20 +460,18 @@ def main():
         try:
             any_signal = loop_once()
         except Exception as e:
-            log.warning(f"scan error: {e}")
-            log_event("signal", "scan_error", "", "MAIN", {"error": str(e)})
+            log.error("scan error: %s", e)
             any_signal = False
 
         # heartbeat (always, even if breaker blocks emits)
         now = time.time()
         if HEARTBEAT_MIN > 0 and (now - _last_hb) >= HEARTBEAT_MIN * 60:
             _last_hb = now
-            tg_send(
+            tg.safe_text(
                 f"🟢 Signal Engine heartbeat • SYMS={','.join(SYMS)} • TFs={INTRA_TFS} • Bias={BIAS_TF}m • queue={QUEUE_PATH.name} • signals={'yes' if any_signal else 'no'} • breaker={'ON' if breaker_active() else 'OFF'}",
-                priority="success"
+                quiet=True,
             )
-
-        time.sleep(POLL_SEC)
+        time.sleep(max(5, SIG_POLL_SEC))
 
 if __name__ == "__main__":
     main()
