@@ -2,21 +2,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Notifier Bot (core) — DC-safe, token-validated, env-safe, override-friendly
+Notifier Bot (core) — quiet on import, layered env, retries, rate limit, media helpers.
 
-What this module gives you:
-- Root .env discovery with override=True so .env beats stale User/System env vars.
-- Token format validation + masked previews to avoid leaking secrets in logs.
-- getMe probe with clear diagnostics and optional getUpdates fetch.
-- Optional multi-recipient via TELEGRAM_CHAT_IDS (comma-separated).
-- Optional thread routing via TELEGRAM_THREAD_ID (for forum topics).
-- Rate limiting, retries with backoff, silent mode, preview toggles.
-- Tiny CLI: --validate, --ping, --echo, --updates for quick checks.
+What you get:
+- Loads env via core/env_bootstrap (layered .env, repo-safe paths).
+- Token format validation with masked previews (logs only on CLI).
+- Multi-recipient via TELEGRAM_CHAT_IDS (overrides TELEGRAM_CHAT_ID).
+- Optional thread routing (forum topics) via TELEGRAM_THREAD_ID.
+- Rate limiting (token bucket), retries with backoff + jitter.
+- Chunking for >4096 char messages.
+- Media helpers: tg_send_photo(), tg_send_document().
+- Console mirror for every message; Telegram send is optional and never raises.
+- CLI: --validate, --updates, --ping [name], --echo "msg".
 
-Environment variables honored (in .env or real env):
-  TELEGRAM_BOT_TOKEN=123456:ABC…
+Env (in .env or process):
+  TELEGRAM_BOT_TOKEN=123456:ABC...
   TELEGRAM_CHAT_ID=7776809236
-  TELEGRAM_CHAT_IDS=777,888,-100123…   (overrides CHAT_ID if set)
+  TELEGRAM_CHAT_IDS=777,888,-100123...
   TELEGRAM_THREAD_ID=123
   TELEGRAM_SILENT=0|1
   TELEGRAM_DISABLE_PREVIEW=1|0
@@ -25,46 +27,32 @@ Environment variables honored (in .env or real env):
   TELEGRAM_MAX_RETRIES=3
   TELEGRAM_BACKOFF_BASE_MS=400
   TELEGRAM_RATE_LIMIT_TPS=1.5
+  TELEGRAM_DEBUG=0|1       # extra console notes
   TZ=America/Phoenix
 """
 
 from __future__ import annotations
 import os
 import re
+import io
 import time
 import json
+import random
 import threading
 import datetime
-from typing import Any, Iterable, Optional, List
+from typing import Any, Iterable, Optional, List, Union
+
+# Layered env + safe paths
+try:
+    from core.env_bootstrap import LOGS_DIR  # ensures layered .env already loaded
+except Exception:
+    LOGS_DIR = None
 
 import requests
 
-# ------------------------------------------------------------------------------
-# dotenv: load project .env reliably and OVERRIDE existing env (this is key)
-# We try: CWD .env, then parent chain using find_dotenv, and we force override.
-# ------------------------------------------------------------------------------
-_ENV_PATH = None
-try:
-    from dotenv import load_dotenv, find_dotenv
-    if os.path.exists(".env"):
-        _ENV_PATH = os.path.abspath(".env")
-        load_dotenv(_ENV_PATH, override=True)
-        print(f"[notifier] Loaded .env (override=True): {_ENV_PATH}")
-    else:
-        _ENV_PATH = find_dotenv(filename=".env", usecwd=True)
-        if _ENV_PATH:
-            load_dotenv(_ENV_PATH, override=True)
-            print(f"[notifier] Loaded .env (override=True): {_ENV_PATH}")
-        else:
-            load_dotenv(override=True)
-            print("[notifier/warn] No project .env found via find_dotenv; relying on process env (override=True).")
-except Exception:
-    _ENV_PATH = None
-    print("[notifier/warn] python-dotenv not available; relying on process env only.")
-
-# ------------------------------------------------------------------------------
-# Config
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# Config helpers
+# --------------------------------------------------------------------------------------
 def _is_placeholder(s: str) -> bool:
     try:
         val = (s or "").strip().lower()
@@ -72,57 +60,50 @@ def _is_placeholder(s: str) -> bool:
         return True
     return val in {"", "<chat_id>", "<chat_ids>", "<token>", "changeme", "todo"}
 
-_TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
-_TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
-_TELEGRAM_CHAT_IDS = [c.strip() for c in (os.getenv("TELEGRAM_CHAT_IDS", "") or "").split(",") if c.strip()]
+def _getenv(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or default).strip()
 
-# Sanitize placeholders and choose a valid destination list
+_TELEGRAM_BOT_TOKEN = _getenv("TELEGRAM_BOT_TOKEN")
+_TELEGRAM_CHAT_ID = _getenv("TELEGRAM_CHAT_ID")
+_TELEGRAM_CHAT_IDS = [c.strip() for c in (_getenv("TELEGRAM_CHAT_IDS")).split(",") if c.strip()]
+# Sanitize placeholders
 _TELEGRAM_CHAT_IDS = [c for c in _TELEGRAM_CHAT_IDS if not _is_placeholder(c)]
 if not _TELEGRAM_CHAT_IDS and not _is_placeholder(_TELEGRAM_CHAT_ID):
     _TELEGRAM_CHAT_IDS = [_TELEGRAM_CHAT_ID]
 
-_TELEGRAM_THREAD_ID = (os.getenv("TELEGRAM_THREAD_ID", "") or "").strip()
+# Optional thread routing
 try:
-    _TELEGRAM_THREAD_ID = int(_TELEGRAM_THREAD_ID) if _TELEGRAM_THREAD_ID else None
+    _TELEGRAM_THREAD_ID: Optional[int] = int(_getenv("TELEGRAM_THREAD_ID")) if _getenv("TELEGRAM_THREAD_ID") else None
 except Exception:
     _TELEGRAM_THREAD_ID = None
 
-_TELEGRAM_SILENT = (os.getenv("TELEGRAM_SILENT", "0") or "0") == "1"
-_DISABLE_PREVIEW = (os.getenv("TELEGRAM_DISABLE_PREVIEW", "1") or "1") != "0"
-_DEFAULT_PARSE_MODE = (os.getenv("TELEGRAM_DEFAULT_PARSE_MODE", "") or "").strip()
-_DEFAULT_NOTIFY = (os.getenv("TELEGRAM_NOTIFY", "1") or "1") != "0"
-_MAX_RETRIES = max(0, int((os.getenv("TELEGRAM_MAX_RETRIES", "3") or "3")))
-_BACKOFF_BASE_MS = max(50, int((os.getenv("TELEGRAM_BACKOFF_BASE_MS", "400") or "400")))
-_RATE_LIMIT_TPS = max(0.1, float((os.getenv("TELEGRAM_RATE_LIMIT_TPS", "1.5") or "1.5")))
-_TZ = (os.getenv("TZ", "America/Phoenix") or "America/Phoenix")
+_TELEGRAM_SILENT = (_getenv("TELEGRAM_SILENT", "0") or "0") == "1"
+_DISABLE_PREVIEW = (_getenv("TELEGRAM_DISABLE_PREVIEW", "1") or "1") != "0"
+_DEFAULT_PARSE_MODE = _getenv("TELEGRAM_DEFAULT_PARSE_MODE")
+_DEFAULT_NOTIFY = (_getenv("TELEGRAM_NOTIFY", "1") or "1") != "0"
+_MAX_RETRIES = max(0, int(_getenv("TELEGRAM_MAX_RETRIES", "3") or "3"))
+_BACKOFF_BASE_MS = max(50, int(_getenv("TELEGRAM_BACKOFF_BASE_MS", "400") or "400"))
+_RATE_LIMIT_TPS = max(0.1, float(_getenv("TELEGRAM_RATE_LIMIT_TPS", "1.5") or "1.5"))
+_TELEGRAM_DEBUG = (_getenv("TELEGRAM_DEBUG", "0") or "0") == "1"
+_TZ = (_getenv("TZ", "America/Phoenix") or "America/Phoenix")
 
-# ------------------------------------------------------------------------------
-# Token validation and API base
-# ------------------------------------------------------------------------------
 _TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{30,}$")
 
 def _mask_token(tok: str) -> str:
-    if not tok:
-        return "<empty>"
-    if len(tok) < 12:
-        return tok[0:2] + "…" + tok[-2:]
+    if not tok: return "<empty>"
+    if len(tok) < 12: return tok[:2] + "…" + tok[-2:]
     return tok[:6] + "…" + tok[-6:]
 
 def _valid_token(tok: str) -> bool:
-    return bool(_TOKEN_RE.match(tok))
-
-def _bom_prefix_debug(tok: str) -> str:
-    if not tok:
-        return "len=0"
-    prv = [f"{ord(c):#06x}" for c in tok[:3]]
-    nxt = [f"{ord(c):#06x}" for c in tok[-3:]]
-    return f"len={len(tok)} first={prv} last={nxt}"
+    # Defensive trim for stray BOM/whitespace
+    s = tok.strip().replace("\ufeff", "")
+    return bool(_TOKEN_RE.match(s))
 
 _API_BASE = f"https://api.telegram.org/bot{_TELEGRAM_BOT_TOKEN}" if _TELEGRAM_BOT_TOKEN else "https://api.telegram.org/bot"
 
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 # Rate limiter
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 _bucket_lock = threading.Lock()
 _bucket_tokens = _RATE_LIMIT_TPS
 _bucket_last = time.monotonic()
@@ -142,9 +123,9 @@ def _rate_limit_consume(cost: float = 1.0):
         time.sleep(wait)
     return wait
 
-# ------------------------------------------------------------------------------
-# Utilities
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# Time utilities
+# --------------------------------------------------------------------------------------
 def _tzinfo():
     if not _TZ or _TZ.upper() == "UTC":
         return datetime.timezone.utc
@@ -164,6 +145,9 @@ def _console_print(prefix: str, msg: str):
     flat = " ".join((msg or "").split())
     print(f"[{_now_iso()}] {prefix} {flat}")
 
+# --------------------------------------------------------------------------------------
+# Message chunking
+# --------------------------------------------------------------------------------------
 def _split_message(msg: str, limit: int = 4096) -> List[str]:
     if msg is None:
         return [""]
@@ -193,29 +177,16 @@ def _split_message(msg: str, limit: int = 4096) -> List[str]:
 def _telegram_enabled() -> bool:
     return bool(_TELEGRAM_BOT_TOKEN and _TELEGRAM_CHAT_IDS) and not _TELEGRAM_SILENT
 
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 # HTTP helpers
-# ------------------------------------------------------------------------------
-def _post_telegram(chat_id: str, text: str, *,
-                   parse_mode: Optional[str],
-                   disable_preview: bool,
-                   notify: bool,
-                   thread_id: Optional[int],
-                   reply_to: Optional[int]) -> Optional[requests.Response]:
-    url = f"{_API_BASE}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": disable_preview,
-        "disable_notification": not notify,
-    }
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if thread_id:
-        payload["message_thread_id"] = thread_id
-    if reply_to:
-        payload["reply_to_message_id"] = reply_to
+# --------------------------------------------------------------------------------------
+def _retry_delay(attempt: int) -> float:
+    # Exponential backoff with small jitter
+    base = (_BACKOFF_BASE_MS / 1000.0) * (2 ** attempt)
+    return min(8.0, base) + random.uniform(0, 0.15)
 
+def _post_telegram_json(path: str, payload: dict) -> Optional[requests.Response]:
+    url = f"{_API_BASE}/{path.lstrip('/')}"
     last_exc = None
     for attempt in range(_MAX_RETRIES + 1):
         _rate_limit_consume(1.0)
@@ -224,16 +195,48 @@ def _post_telegram(chat_id: str, text: str, *,
             if resp.ok:
                 return resp
             if resp.status_code in (429, 500, 502, 503, 504):
-                delay = min(8.0, (_BACKOFF_BASE_MS / 1000.0) * (2 ** attempt))
-                _console_print("notifier/telegram/retry:", f"HTTP {resp.status_code}; retry in {delay:.2f}s")
-                time.sleep(delay); continue
+                delay = _retry_delay(attempt)
+                if _TELEGRAM_DEBUG:
+                    _console_print("notifier/telegram/retry:", f"HTTP {resp.status_code}; retry in {delay:.2f}s")
+                time.sleep(delay)
+                continue
             _console_print("notifier/telegram/error:", f"HTTP {resp.status_code} {resp.text[:300]}")
             return resp
         except Exception as e:
             last_exc = e
-            delay = min(8.0, (_BACKOFF_BASE_MS / 1000.0) * (2 ** attempt))
-            _console_print("notifier/telegram/except:", f"{e}; retry in {delay:.2f}s")
-            time.sleep(delay); continue
+            delay = _retry_delay(attempt)
+            if _TELEGRAM_DEBUG:
+                _console_print("notifier/telegram/except:", f"{e}; retry in {delay:.2f}s")
+            time.sleep(delay)
+            continue
+    if last_exc:
+        _console_print("notifier/telegram/error:", f"{last_exc}")
+    return None
+
+def _post_telegram_multipart(path: str, fields: dict, files: dict) -> Optional[requests.Response]:
+    url = f"{_API_BASE}/{path.lstrip('/')}"
+    last_exc = None
+    for attempt in range(_MAX_RETRIES + 1):
+        _rate_limit_consume(1.0)
+        try:
+            resp = requests.post(url, data=fields, files=files, timeout=30)
+            if resp.ok:
+                return resp
+            if resp.status_code in (429, 500, 502, 503, 504):
+                delay = _retry_delay(attempt)
+                if _TELEGRAM_DEBUG:
+                    _console_print("notifier/telegram/retry:", f"HTTP {resp.status_code}; retry in {delay:.2f}s")
+                time.sleep(delay)
+                continue
+            _console_print("notifier/telegram/error:", f"HTTP {resp.status_code} {resp.text[:300]}")
+            return resp
+        except Exception as e:
+            last_exc = e
+            delay = _retry_delay(attempt)
+            if _TELEGRAM_DEBUG:
+                _console_print("notifier/telegram/except:", f"{e}; retry in {delay:.2f}s")
+            time.sleep(delay)
+            continue
     if last_exc:
         _console_print("notifier/telegram/error:", f"{last_exc}")
     return None
@@ -246,19 +249,23 @@ def _get_telegram(path: str, *, params: Optional[dict] = None) -> Optional[reque
         _console_print("notifier/telegram/error:", f"GET {path}: {e}")
         return None
 
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 # Diagnostics
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+def _bom_prefix_debug(tok: str) -> str:
+    if not tok:
+        return "len=0"
+    prv = [f"{ord(c):#06x}" for c in tok[:3]]
+    nxt = [f"{ord(c):#06x}" for c in tok[-3:]]
+    return f"len={len(tok)} first={prv} last={nxt}"
+
 def tg_diag(verbose_updates: bool = False) -> bool:
-    """
-    Validate token with getMe and optionally fetch getUpdates.
-    Returns True if token looks valid (getMe ok).
-    """
-    masked = _mask_token(_TELEGRAM_BOT_TOKEN)
-    _console_print("notifier/info:", f"Token preview: {masked} ({_bom_prefix_debug(_TELEGRAM_BOT_TOKEN)})")
+    """Validate token with getMe and optionally fetch getUpdates. Logs more under CLI."""
+    if _TELEGRAM_DEBUG:
+        _console_print("notifier/info:", f"Token preview: {_mask_token(_TELEGRAM_BOT_TOKEN)} ({_bom_prefix_debug(_TELEGRAM_BOT_TOKEN)})")
     if not _valid_token(_TELEGRAM_BOT_TOKEN):
         _console_print("notifier/error:", "Bot token format is invalid. Get a fresh token from @BotFather.")
-        _console_print("notifier/help:", "Ensure .env is UTF-8 (NO BOM) and line is exactly TELEGRAM_BOT_TOKEN=<token>")
+        _console_print("notifier/help:", "Ensure .env is UTF-8 (no BOM) and line is TELEGRAM_BOT_TOKEN=<token>")
         return False
 
     r = _get_telegram("getMe")
@@ -275,21 +282,15 @@ def tg_diag(verbose_updates: bool = False) -> bool:
         code = data.get("error_code")
         desc = data.get("description", "")
         _console_print("notifier/telegram/error:", f"getMe → {code} {desc}")
-        if code == 401:
-            _console_print("notifier/help:", "Unauthorized: token is wrong or revoked.")
-        elif code == 404:
-            _console_print("notifier/help:", "Not Found: malformed/empty token hitting wrong endpoint. Check BOM/whitespace.")
-        else:
-            _console_print("notifier/help:", "Fix token in .env (TELEGRAM_BOT_TOKEN) and try again.")
         return False
 
-    me = data.get("result", {})
-    _console_print("notifier/success:", f"getMe ok. Bot: @{me.get('username')} id={me.get('id')}")
-
-    if _TELEGRAM_CHAT_IDS:
-        _console_print("notifier/info:", f"Destinations: {', '.join(map(str, _TELEGRAM_CHAT_IDS))}")
-    else:
-        _console_print("notifier/warn:", "No TELEGRAM_CHAT_ID(S) configured.")
+    if _TELEGRAM_DEBUG:
+        me = data.get("result", {})
+        _console_print("notifier/success:", f"getMe ok. Bot: @{me.get('username')} id={me.get('id')}")
+        if _TELEGRAM_CHAT_IDS:
+            _console_print("notifier/info:", f"Destinations: {', '.join(map(str, _TELEGRAM_CHAT_IDS))}")
+        else:
+            _console_print("notifier/warn:", "No TELEGRAM_CHAT_ID(S) configured.")
 
     if verbose_updates:
         up = _get_telegram("getUpdates")
@@ -303,9 +304,9 @@ def tg_diag(verbose_updates: bool = False) -> bool:
             _console_print("notifier/info:", "getUpdates empty. Send /start to your bot, then try again.")
     return True
 
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 # Public API
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 def set_chat_ids(ids: Iterable[str | int]) -> None:
     """Override destination chat IDs at runtime."""
     global _TELEGRAM_CHAT_IDS
@@ -340,15 +341,19 @@ def tg_send(msg: str,
         parts = _split_message(msg)
         for chat_id in _TELEGRAM_CHAT_IDS:
             for part in parts:
-                _post_telegram(
-                    chat_id=str(chat_id),
-                    text=part,
-                    parse_mode=use_parse,
-                    disable_preview=use_preview,
-                    notify=use_notify,
-                    thread_id=use_thread,
-                    reply_to=reply_to,
-                )
+                payload = {
+                    "chat_id": str(chat_id),
+                    "text": part,
+                    "disable_web_page_preview": use_preview,
+                    "disable_notification": not use_notify,
+                }
+                if use_parse:
+                    payload["parse_mode"] = use_parse
+                if use_thread:
+                    payload["message_thread_id"] = use_thread
+                if reply_to:
+                    payload["reply_to_message_id"] = reply_to
+                _post_telegram_json("sendMessage", payload)
     except Exception as e:
         _console_print("notifier/soft-fail:", f"{e}")
 
@@ -404,15 +409,15 @@ def tg_validate(verbose_updates: bool = False) -> bool:
     test_msg = f"🟢 Notifier validate @ {_now_iso()}"
     parts = _split_message(test_msg)
     for chat_id in _TELEGRAM_CHAT_IDS:
-        resp = _post_telegram(
-            chat_id=str(chat_id),
-            text=parts[0],
-            parse_mode=None,
-            disable_preview=True,
-            notify=True,
-            thread_id=_TELEGRAM_THREAD_ID,
-            reply_to=None,
-        )
+        payload = {
+            "chat_id": str(chat_id),
+            "text": parts[0],
+            "disable_web_page_preview": True,
+            "disable_notification": False,
+        }
+        if _TELEGRAM_THREAD_ID:
+            payload["message_thread_id"] = _TELEGRAM_THREAD_ID
+        resp = _post_telegram_json("sendMessage", payload)
         if resp and resp.ok:
             ok_any = True
         else:
@@ -427,19 +432,104 @@ def tg_validate(verbose_updates: bool = False) -> bool:
                 elif "forbidden" in desc:
                     _console_print("notifier/help:", "Bot is blocked or not a member of the group/channel.")
                 elif code == 404 or "not found" in desc:
-                    _console_print("notifier/help:", "Not Found: usually malformed/empty token or BOM at start of line.")
+                    _console_print("notifier/help:", "Not Found: malformed/empty token or BOM at start of line.")
                 else:
                     _console_print("notifier/help:", "See Telegram API response above for details.")
             except Exception:
                 _console_print("notifier/help:", "Non-JSON error; check network/mitm.")
     return ok_any
 
+# --------------------------------------------------------------------------------------
+# Media helpers
+# --------------------------------------------------------------------------------------
+def tg_send_photo(photo: Union[str, bytes, io.BytesIO],
+                  caption: Optional[str] = None,
+                  *,
+                  notify: Optional[bool] = None,
+                  thread_id: Optional[int] = None,
+                  reply_to: Optional[int] = None,
+                  priority: str = "info") -> None:
+    """Send a photo to all configured chats. Accepts file path, bytes, or BytesIO."""
+    try:
+        _console_print(f"notifier/{priority}:", f"🖼️ photo {('with caption' if caption else '')}")
+        if not _telegram_enabled():
+            return
+        use_notify = _DEFAULT_NOTIFY if notify is None else notify
+        use_thread = thread_id if thread_id is not None else _TELEGRAM_THREAD_ID
+
+        def _to_file_tuple(p: Union[str, bytes, io.BytesIO]):
+            if isinstance(p, str):
+                return ("photo.jpg", open(p, "rb"), "image/jpeg")
+            if isinstance(p, bytes):
+                return ("photo.jpg", io.BytesIO(p), "image/jpeg")
+            if isinstance(p, io.BytesIO):
+                return ("photo.jpg", p, "image/jpeg")
+            raise TypeError("Unsupported photo type")
+
+        for chat_id in _TELEGRAM_CHAT_IDS:
+            fields = {
+                "chat_id": str(chat_id),
+                "disable_notification": "true" if not use_notify else "false",
+            }
+            if caption:
+                fields["caption"] = caption
+                # Telegram ignores parse_mode here unless specified in fields
+            if use_thread:
+                fields["message_thread_id"] = str(use_thread)
+            files = {"photo": _to_file_tuple(photo)}
+            _post_telegram_multipart("sendPhoto", fields, files)
+    except Exception as e:
+        _console_print("notifier/soft-fail:", f"{e}")
+
+def tg_send_document(document: Union[str, bytes, io.BytesIO],
+                     filename: Optional[str] = None,
+                     caption: Optional[str] = None,
+                     *,
+                     notify: Optional[bool] = None,
+                     thread_id: Optional[int] = None,
+                     reply_to: Optional[int] = None,
+                     priority: str = "info") -> None:
+    """Send a document to all configured chats."""
+    try:
+        _console_print(f"notifier/{priority}:", f"📎 document {filename or ''}".strip())
+        if not _telegram_enabled():
+            return
+        use_notify = _DEFAULT_NOTIFY if notify is None else notify
+        use_thread = thread_id if thread_id is not None else _TELEGRAM_THREAD_ID
+
+        def _to_file_tuple(d: Union[str, bytes, io.BytesIO], fname: Optional[str]):
+            if isinstance(d, str):
+                path = d
+                name = fname or os.path.basename(path) or "file.bin"
+                return (name, open(path, "rb"))
+            if isinstance(d, bytes):
+                name = fname or "file.bin"
+                return (name, io.BytesIO(d))
+            if isinstance(d, io.BytesIO):
+                name = fname or "file.bin"
+                return (name, d)
+            raise TypeError("Unsupported document type")
+
+        for chat_id in _TELEGRAM_CHAT_IDS:
+            fields = {
+                "chat_id": str(chat_id),
+                "disable_notification": "true" if not use_notify else "false",
+            }
+            if caption:
+                fields["caption"] = caption
+            if use_thread:
+                fields["message_thread_id"] = str(use_thread)
+            files = {"document": _to_file_tuple(document, filename)}
+            _post_telegram_multipart("sendDocument", fields, files)
+    except Exception as e:
+        _console_print("notifier/soft-fail:", f"{e}")
+
 # Backward compatibility alias
 send = tg_send
 
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 # CLI entry point
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
 
@@ -450,8 +540,8 @@ if __name__ == "__main__":
     parser.add_argument("--echo", type=str, help="Send a custom message to configured chat(s)")
     args = parser.parse_args()
 
-    print(f"[notifier] .env path: {_ENV_PATH or '<none>'}")
-    print(f"[notifier] token ok: {bool(_valid_token(_TELEGRAM_BOT_TOKEN))}  chats: {', '.join(_TELEGRAM_CHAT_IDS) if _TELEGRAM_CHAT_IDS else '<none>'}")
+    # Verbose only on CLI
+    _console_print("notifier/info:", f".env layered via env_bootstrap; token ok: {bool(_valid_token(_TELEGRAM_BOT_TOKEN))}  chats: {', '.join(_TELEGRAM_CHAT_IDS) if _TELEGRAM_CHAT_IDS else '<none>'}")
 
     ran = False
 
