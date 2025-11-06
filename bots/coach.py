@@ -1,4 +1,3 @@
-# bots/coach.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -7,30 +6,29 @@ Milestone Coach (master or per-subaccount; monitor-only)
 What it does
 - Watches total equity and announces level-ups across a milestone ladder.
 - Tracks best equity (peak) and optional drawdown alerts off the peak.
-- Sends Telegram via core.base44_client.tg_send (if configured).
+- Sends Telegram via core.notifier_bot.tg_send (if available) else core.base44_client.tg_send.
 - Can target:
     • MASTER account (default), or
-    • A specific SUB-ACCOUNT by memberId (COACH_MEMBER_ID)
+    • A specific SUB-ACCOUNT by subUid OR memberId (COACH_SUB_UID / COACH_MEMBER_ID)
 - Reads registry/sub_map.json to pretty-print sub name/role/tier when available.
 - Keeps separate state files per scope (master vs each sub).
+- Emits structured events to core/decision_log (if present).
 
 ENV (optional):
   COACH_POLL_SEC=30
   COACH_ACCOUNT_TYPE=UNIFIED
-  COACH_MEMBER_ID=           # e.g., "302355261" for a sub; unset = master
-  COACH_NAME=                # override display name (else from sub_map or fallback)
-  COACH_TIER_LABEL=          # override tier label (else Tier 1/2/3 by level, or sub_map if available)
+  COACH_SUB_UID=              # preferred for subs
+  COACH_MEMBER_ID=            # legacy alias
+  COACH_NAME=
+  COACH_TIER_LABEL=
   STATE_DIR=.state
   COACH_DRAWDOWN_PCT=12
   COACH_DRAWDOWN_COOLDOWN_MIN=60
   COACH_ANNOUNCE_MIN_GAP_SEC=5
   TELEGRAM_SILENT=0
-
-Milestones & tiers:
-  L1 $25 • L2 $50 • L3 $100 • L4 $250  → Tier 1
-  L5 $500 • L6 $1k • L7 $2.5k          → Tier 2
-  L8 $5k • L9 $10k • L10 $25k          → Tier 3
 """
+
+from __future__ import annotations
 
 import os
 import sys
@@ -38,35 +36,75 @@ import time
 import json
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Any, Tuple
 
 # ── Robust import: add project root, then import from core package
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# Prefer rich notifier if present; else fallback to base44_client
+def _resolve_notifier():
+    try:
+        from core.notifier_bot import tg_send as _tg  # type: ignore
+        return _tg
+    except Exception:
+        pass
+    try:
+        from core.base44_client import tg_send as _tg  # type: ignore
+        return _tg
+    except Exception:
+        def _console_only(msg: str, **_):
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            print(f"[{ts}] {msg}")
+        return _console_only
+
+tg_send = _resolve_notifier()
+
+# Data helpers
 from core.base44_client import (  # type: ignore
-    get_wallet_balance, tg_send, load_sub_uids
+    get_wallet_balance
 )
+
+# Decision log if available
+def _resolve_decision_logger():
+    try:
+        from core.decision_log import log_event as _log  # type: ignore
+        return _log
+    except Exception:
+        def _noop(*_a, **_k):  # never crash if missing
+            return None
+        return _noop
+
+log_event = _resolve_decision_logger()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config / State
 # ──────────────────────────────────────────────────────────────────────────────
 POLL = int(os.getenv("COACH_POLL_SEC", "30"))
 ACCOUNT_TYPE = os.getenv("COACH_ACCOUNT_TYPE", "UNIFIED")
-MEMBER_ID = (os.getenv("COACH_MEMBER_ID") or "").strip()  # if set, we coach this sub UID
+
+SUB_UID = (os.getenv("COACH_SUB_UID") or "").strip()
+# Legacy alias support
+MEMBER_ID = (os.getenv("COACH_MEMBER_ID") or "").strip()
+if SUB_UID and MEMBER_ID:
+    # prefer explicit subUid when both are set
+    MEMBER_ID = ""
+
 NAME_OVERRIDE = (os.getenv("COACH_NAME") or "").strip()
 TIER_OVERRIDE = (os.getenv("COACH_TIER_LABEL") or "").strip()
 
 STATE_DIR = Path(os.getenv("STATE_DIR", ".state"))
 STATE_DIR.mkdir(parents=True, exist_ok=True)
-STATE_PATH = STATE_DIR / (f"coach_state_sub_{MEMBER_ID}.json" if MEMBER_ID else "coach_state_master.json")
+scope_key = f"sub_{SUB_UID}" if SUB_UID else (f"member_{MEMBER_ID}" if MEMBER_ID else "master")
+STATE_PATH = STATE_DIR / f"coach_state_{scope_key}.json"
 
 DRAWDOWN_PCT = float(os.getenv("COACH_DRAWDOWN_PCT", "12"))
 DRAWDOWN_COOLDOWN_MIN = int(os.getenv("COACH_DRAWDOWN_COOLDOWN_MIN", "60"))
 ANNOUNCE_MIN_GAP_SEC = int(os.getenv("COACH_ANNOUNCE_MIN_GAP_SEC", "5"))
 TELEGRAM_SILENT = os.getenv("TELEGRAM_SILENT", "0") == "1"
 
-# Milestones + tiers
+# Milestones + tiers (leave as-is so your ladder matches the plan)
 LEVELS = [
     (1,     25.0,   "Tier 1"),
     (2,     50.0,   "Tier 1"),
@@ -100,35 +138,35 @@ def _safe_tg_send(text: str) -> None:
     except Exception as e:
         print(f"[coach] telegram send failed: {e}\n{text}")
 
-def _read_sub_meta():
+def _read_sub_meta() -> dict:
     """
-    Returns:
-      - name_map: Dict[str, Any]
-        * If sub_map.json is { "302..": "Vehicle", ... } → value is str
-        * If it's { "302..": {"name":"Vehicle","role":"vehiclefund","tier":"Tier 2","flags":{"vehicle":true}} }
-          → value is dict with fields.
+    Returns mapping for sub display:
+      - If sub_map.json is { "302..": "Vehicle", ... } → value is str
+      - If it's { "subs": { "302..": {name, role, tier, flags} } } → value is object
+      - If it's { "302..": {name, role, ...} } → value is object
     """
     name_map: dict = {}
     try:
-        _, name_map_simple = load_sub_uids(str(SUB_CSV), str(SUB_MAP))
-        # load_sub_uids returns either simple map (str->str) or empty
-        if name_map_simple:
-            name_map = name_map_simple
-        # If it's a file with objects, read raw to capture roles/tiers/flags
+        # Try to read rich map first
         if SUB_MAP.exists():
             raw = json.loads(SUB_MAP.read_text(encoding="utf-8"))
-            # Merge: raw wins (richer)
-            if isinstance(raw, dict):
-                for k, v in raw.items():
-                    name_map[k] = v
+            if isinstance(raw, dict) and "subs" in raw and isinstance(raw["subs"], dict):
+                for uid, rec in raw["subs"].items():
+                    name_map[str(uid)] = rec
+            elif isinstance(raw, dict):
+                for uid, rec in raw.items():
+                    name_map[str(uid)] = rec
+        # Fallback: CSV-only adds keys with uid as display name
+        if SUB_CSV.exists():
+            for line in SUB_CSV.read_text(encoding="utf-8").splitlines()[1:]:
+                parts = [p.strip() for p in line.split(",")]
+                if parts and parts[0]:
+                    name_map.setdefault(parts[0], parts[0])
     except Exception:
         pass
     return name_map
 
-def _display_for_member(member_id: str, name_map: dict) -> tuple[str, str]:
-    """
-    Returns (display_name, display_tier_hint)
-    """
+def _display_for_member(member_id: str, name_map: dict) -> Tuple[str, str]:
     if NAME_OVERRIDE:
         nm = NAME_OVERRIDE
     else:
@@ -139,16 +177,11 @@ def _display_for_member(member_id: str, name_map: dict) -> tuple[str, str]:
             nm = val.strip()
         else:
             nm = str(member_id)
-
-    # Tier hint priority: env override → sub_map tier → None
     if TIER_OVERRIDE:
         th = TIER_OVERRIDE
     else:
         val = name_map.get(member_id, {})
-        if isinstance(val, dict):
-            th = val.get("tier") or ""
-        else:
-            th = ""
+        th = val.get("tier") if isinstance(val, dict) else ""
     return nm, th
 
 def load_state() -> dict:
@@ -157,23 +190,23 @@ def load_state() -> dict:
             return json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {
-        "current_level": 0,
-        "best_equity": 0.0,
-        "last_levelup_ts": "",
-        "last_drawdown_ts": "",
-    }
+    return {"current_level": 0, "best_equity": 0.0, "last_levelup_ts": "", "last_drawdown_ts": ""}
 
 def save_state(st: dict) -> None:
     STATE_PATH.write_text(json.dumps(st, indent=2), encoding="utf-8")
 
-def read_equity(account_type: str, member_id: str | None) -> float:
+def read_equity(account_type: str, sub_uid: str | None, member_id: str | None) -> float:
     """
-    Uses core.base44_client.get_wallet_balance with optional memberId.
+    Uses base44_client.get_wallet_balance with optional subUid/memberId.
     Returns totalEquity as float for the chosen scope.
     """
-    body = get_wallet_balance(accountType=account_type, memberId=member_id) if member_id else \
-           get_wallet_balance(accountType=account_type)
+    if sub_uid:
+        body = get_wallet_balance(accountType=account_type, subUid=sub_uid)
+    elif member_id:
+        body = get_wallet_balance(accountType=account_type, memberId=member_id)
+    else:
+        body = get_wallet_balance(accountType=account_type)
+
     if (body or {}).get("retCode") not in (0, "0"):
         raise RuntimeError(f"Bybit retCode={body.get('retCode')} retMsg={body.get('retMsg')}")
     lst = (body.get("result") or {}).get("list") or []
@@ -216,20 +249,20 @@ def fmt_money(x: float) -> str:
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
-    scope = f"sub:{MEMBER_ID}" if MEMBER_ID else "master"
+    scope = f"sub:{SUB_UID}" if SUB_UID else (f"member:{MEMBER_ID}" if MEMBER_ID else "master")
     name_map = _read_sub_meta()
-    sub_name, tier_hint = (_display_for_member(MEMBER_ID, name_map) if MEMBER_ID else ("MASTER", ""))
+    sub_name, tier_hint = (_display_for_member(SUB_UID or MEMBER_ID, name_map) if (SUB_UID or MEMBER_ID) else ("MASTER", ""))
 
     print(f"Coach running • scope={scope} • poll {POLL}s • accountType={ACCOUNT_TYPE} • state={STATE_PATH}")
-    if MEMBER_ID:
-        print(f"→ Watching sub-account {sub_name} (UID {MEMBER_ID})"
-              + (f" • role/tier: {tier_hint}" if tier_hint else ""))
+    if SUB_UID or MEMBER_ID:
+        uid_display = SUB_UID or MEMBER_ID
+        print(f"→ Watching sub-account {sub_name} (UID {uid_display})" + (f" • role/tier: {tier_hint}" if tier_hint else ""))
 
     st = load_state()
 
     # Startup snapshot
     try:
-        eq0 = read_equity(ACCOUNT_TYPE, MEMBER_ID or None)
+        eq0 = read_equity(ACCOUNT_TYPE, SUB_UID or None, MEMBER_ID or None)
         lvl0 = compute_level(eq0)
         print(f"[startup] equity={eq0:.4f} level={lvl0} ({tier_of(lvl0)}) best={st.get('best_equity', 0.0):.4f}")
     except Exception as e:
@@ -237,7 +270,7 @@ def main():
 
     while True:
         try:
-            eq = read_equity(ACCOUNT_TYPE, MEMBER_ID or None)
+            eq = read_equity(ACCOUNT_TYPE, SUB_UID or None, MEMBER_ID or None)
 
             # Track best equity
             best = float(st.get("best_equity", 0.0))
@@ -254,7 +287,7 @@ def main():
                 ladder_tier = tier_of(lvl_now)
 
                 hdr = f"🏆 Level Up → Level {lvl_now} ({ladder_tier})"
-                scope_line = (f"Sub: {sub_name} (UID {MEMBER_ID})" if MEMBER_ID else "Scope: MASTER")
+                scope_line = (f"Sub: {sub_name} (UID {SUB_UID or MEMBER_ID})" if (SUB_UID or MEMBER_ID) else "Scope: MASTER")
                 extra = []
                 if tier_hint:
                     extra.append(f"Assigned: {tier_hint}")
@@ -275,6 +308,17 @@ def main():
 
                 print(msg)
                 _safe_tg_send(msg)
+                try:
+                    log_event(
+                        component="coach",
+                        event="level_up",
+                        symbol="",
+                        account_uid=(SUB_UID or MEMBER_ID or "master"),
+                        payload={"equity": eq, "best_equity": best, "level": lvl_now, "tier": ladder_tier},
+                        level="info",
+                    )
+                except Exception:
+                    pass
                 save_state(st)
 
             # Optional drawdown alert from best equity
@@ -286,7 +330,7 @@ def main():
                         st["last_drawdown_ts"] = _utc_now_iso()
                         pct = ((best_equity - eq) / best_equity) * 100.0 if best_equity else 0.0
                         hdr = "⚠️ Drawdown Alert"
-                        scope_line = (f"Sub: {sub_name} (UID {MEMBER_ID})" if MEMBER_ID else "Scope: MASTER")
+                        scope_line = (f"Sub: {sub_name} (UID {SUB_UID or MEMBER_ID})" if (SUB_UID or MEMBER_ID) else "Scope: MASTER")
                         msg = (
                             f"{hdr}: {pct:.1f}% from peak\n"
                             f"{scope_line}\n"
@@ -295,6 +339,17 @@ def main():
                         )
                         print(msg)
                         _safe_tg_send(msg)
+                        try:
+                            log_event(
+                                component="coach",
+                                event="drawdown_alert",
+                                symbol="",
+                                account_uid=(SUB_UID or MEMBER_ID or "master"),
+                                payload={"peak": best_equity, "now": eq, "pct": pct, "threshold": threshold},
+                                level="warn",
+                            )
+                        except Exception:
+                            pass
                         save_state(st)
 
             time.sleep(POLL)
