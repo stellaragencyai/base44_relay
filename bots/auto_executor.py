@@ -1,345 +1,331 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-bots/auto_executor.py — Semi-auto Breakout-Impulse Executor
-- End-to-end from scan → validate → size → place entry + SL.
-- No TPs here; your TP/SL Manager handles exits via reduce-only ladder.
-- Obeys PortfolioGuard limits and DRY_RUN/SAFE_MODE.
+Base44 — Auto Executor (consume signals/observed.jsonl, maker-first entries)
 
-Env (.env):
-  SYMBOL_SCAN_LIST=BTCUSDT,ETHUSDT,HBARUSDT
-  SIGNAL_INTERVAL=5
-  LOOKBACK=200
-  BO_LOOKBACK=20
-  MIN_VOL_Z=1.5
-  MIN_ADX=20
-  MIN_ATR_PCT=0.6
-  MAX_ATR_PCT=5.0
-  ENTRY_MODE=LIMIT_PULLBACK     # LIMIT_PULLBACK | LIMIT_BREAK | MARKET
-  PULLBACK_BPS=40               # 0.40% into the breakout
-  POST_ONLY=1                   # 1=maker only for limit orders
-  SAFE_MODE=1                   # forbids any flattening/closing ops
-  DRY_RUN=1                     # simulate orders
-  LEVERAGE=20
-  BASE_ASSET=USDT
-  RELAY_URL
-  RELAY_TOKEN
-  TELEGRAM_BOT_TOKEN
-  TELEGRAM_CHAT_ID
+What this does now
+- Tails signals/observed.jsonl lines emitted by bots/signal_engine.py.
+- For each new signal, enforces breaker, dedupes, validates spread, and places a maker-first limit.
+- DRY_RUN safe path prints and notifies but does not touch the exchange.
+- No TP/SL logic here; your TP/SL Manager owns exits. This only opens.
+
+Core dependencies
+- core.config.settings          → envs, paths, defaults
+- core.logger                   → unified logging
+- core.bybit_client.Bybit       → Bybit v5 client (signed)
+- tools.notifier_telegram.tg    → Telegram notifications
+
+Key settings (put in .env if you want to override defaults)
+  # From core.config / signal engine
+  SIG_MAKER_ONLY=true
+  SIG_SPREAD_MAX_BPS=8
+  SIG_TAG=B44
+  SIG_DRY_RUN=true
+
+  # Executor-specific
+  EXEC_QTY_USDT=5.0            # notional in quote; used if EXEC_QTY_BASE==0
+  EXEC_QTY_BASE=0.0            # set >0 to override notional sizing
+  EXEC_POST_ONLY=true          # force PostOnly on maker entries
+  EXEC_SYMBOLS=                # optional allowlist, e.g. BTCUSDT,ETHUSDT
+  EXEC_POLL_SEC=2              # how often to check the queue when idle
+
+Files
+  signals/observed.jsonl       # input queue (append-only)
+  .state/executor_seen.json    # dedupe registry for orderLinkId
+  .state/executor_offset.json  # last read byte offset for resilient tailing
+  .state/risk_state.json       # breaker flag file ({"breach": true}) blocks opens
 """
 
-import os, time, math, requests, uuid
-from typing import Dict, List, Tuple
+from __future__ import annotations
+import json
+import time
+from pathlib import Path
+from typing import Dict, Optional, Tuple, List
 
-try:
-    from core.portfolio_guard import guard
-except Exception as e:
-    raise RuntimeError(f"Portfolio guard required: {e}")
+from core.config import settings
+from core.logger import get_logger, bind_context
+from core.bybit_client import Bybit
+from tools.notifier_telegram import tg
 
-# Optional regime gate, if you dropped it in
-_gate = None
-try:
-    from core.regime_gate import gate as _gate
-except Exception:
-    _gate = None
+log = get_logger("bots.auto_executor")
+log = bind_context(log, comp="executor")
 
-def env_csv(name: str, default: str="") -> List[str]:
-    raw = os.getenv(name, default)
-    return [x.strip().upper() for x in raw.split(",") if x.strip()]
+# ------------------------
+# Config
+# ------------------------
 
-def tg(text: str):
-    tok = os.getenv("TELEGRAM_BOT_TOKEN")
-    cid = os.getenv("TELEGRAM_CHAT_ID")
-    if not tok or not cid: 
-        print("[auto_executor] no Telegram configured")
-        return
-    url = f"https://api.telegram.org/bot{tok}/sendMessage"
-    requests.post(url, json={"chat_id": cid, "text": text, "disable_web_page_preview": True})
+ROOT = settings.ROOT
+STATE_DIR = ROOT / ".state"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-def _relay_headers():
-    tok = os.getenv("RELAY_TOKEN","")
-    return {"Authorization": f"Bearer {tok}"} if tok else {}
+SIGNALS_DIR = settings.DIR_SIGNALS
+QUEUE_PATH = SIGNALS_DIR / "observed.jsonl"
 
-def _relay_url(path: str) -> str:
-    base = os.getenv("RELAY_URL","http://127.0.0.1:8080").rstrip("/")
-    return base + (path if path.startswith("/") else "/" + path)
+# Inherit common knobs from signal-engine defaults
+MAKER_ONLY = bool(getattr(settings, "SIG_MAKER_ONLY", True))
+SPREAD_MAX_BPS = float(getattr(settings, "SIG_SPREAD_MAX_BPS", 8.0))
+TAG = str(getattr(settings, "SIG_TAG", "B44")).strip() or "B44"
 
-# ---------- Bybit helpers ----------
-def bybit_proxy(target: str, params: Dict, method: str="GET"):
-    url = _relay_url("/bybit/proxy")
-    payload = {"target": target, "method": method, "params": params}
-    r = requests.post(url, headers=_relay_headers(), json=payload, timeout=10)
-    r.raise_for_status()
-    js = r.json()
-    if js.get("retCode") not in (0, "0", None) and "result" not in js:
-        raise RuntimeError(f"Bybit proxy error: {js}")
-    return js
+DRY_RUN = bool(getattr(settings, "SIG_DRY_RUN", True))
 
-def instruments_info(symbol: str) -> Dict:
-    js = bybit_proxy("/v5/market/instruments-info", {"category":"linear","symbol":symbol}, "GET")
-    lst = ((js.get("result") or {}).get("list") or [])
-    return lst[0] if lst else {}
+# Executor-specific knobs
+def _get_env_num(name: str, default: float) -> float:
+    try:
+        v = getattr(settings, name)
+    except AttributeError:
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
 
-def place_order(symbol: str, side: str, qty: float, price: float=None, post_only: bool=True, reduce_only: bool=False, order_type: str="Limit") -> Dict:
-    params = {
-        "category":"linear",
-        "symbol":symbol,
-        "side":side,                     # Buy or Sell
-        "orderType":order_type,          # Limit/Market
-        "qty": str(qty),
-        "reduceOnly": reduce_only
-    }
-    if order_type == "Limit":
-        params["price"] = f"{price:.8f}"
-        if post_only:
-            params["timeInForce"] = "PostOnly"
-        else:
-            params["timeInForce"] = "GoodTillCancel"
+EXEC_QTY_USDT = _get_env_num("EXEC_QTY_USDT", 5.0)    # notional in quote (e.g., USDT)
+EXEC_QTY_BASE = _get_env_num("EXEC_QTY_BASE", 0.0)    # if >0, overrides notional sizing
+EXEC_POST_ONLY = str(getattr(settings, "EXEC_POST_ONLY", "true")).strip().lower() in ("1","true","yes","on")
+EXEC_POLL_SEC = int(getattr(settings, "EXEC_POLL_SEC", 2))
+
+# Optional symbol allowlist
+_allow_raw = str(getattr(settings, "EXEC_SYMBOLS", "") or "").strip()
+EXEC_SYMBOLS: Optional[List[str]] = [s.strip().upper() for s in _allow_raw.split(",") if s.strip()] or None
+
+# persistent registries
+SEEN_FILE = STATE_DIR / "executor_seen.json"      # orderLinkId registry
+OFFSET_FILE = STATE_DIR / "executor_offset.json"  # queue offset, for resilience
+
+# Bybit client
+by = Bybit()
+by.sync_time()  # best-effort
+
+# ------------------------
+# Helpers
+# ------------------------
+
+def breaker_active() -> bool:
+    path = STATE_DIR / "risk_state.json"
+    try:
+        if not path.exists():
+            return False
+        js = json.loads(path.read_text(encoding="utf-8"))
+        return bool(js.get("breach") or js.get("breaker") or js.get("active"))
+    except Exception:
+        return False
+
+def _load_json(path: Path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("failed reading %s: %s", path.name, e)
+    return default
+
+def _save_json(path: Path, obj) -> None:
+    try:
+        path.write_text(json.dumps(obj, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log.error("failed writing %s: %s", path.name, e)
+
+def _mk_link_id(symbol: str, ts_ms: int, signal: str, extra: str = "") -> str:
+    # Keep <= 36 chars for Bybit; compact but deterministic
+    base = f"{TAG}-{symbol}-{int(ts_ms/1000)}-{signal}"
+    if extra:
+        base = f"{base}-{extra}"
+    return base[:36]
+
+def _fetch_best_prices(symbol: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    ok, data, err = by.get_tickers(category="linear", symbol=symbol)
+    if not ok:
+        log.warning("ticker fail %s: %s", symbol, err)
+        return None, None, None
+    try:
+        items = (data.get("result") or {}).get("list") or []
+        if not items:
+            return None, None, None
+        item = items[0]
+        bid = float(item.get("bid1Price"))
+        ask = float(item.get("ask1Price"))
+        if bid <= 0 or ask <= 0:
+            return None, None, None
+        mid = (bid + ask) / 2.0
+        return bid, ask, mid
+    except Exception as e:
+        log.warning("ticker parse fail %s: %s", symbol, e)
+        return None, None, None
+
+def _spread_bps(bid: float, ask: float) -> float:
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return 1e9
+    return (ask - bid) / mid * 10000.0
+
+def _qty_from_notional(price: float) -> str:
+    if EXEC_QTY_BASE > 0:
+        qty = EXEC_QTY_BASE
     else:
-        params["timeInForce"] = "ImmediateOrCancel"
+        notional = max(0.0, EXEC_QTY_USDT)
+        qty = (notional / max(price, 1e-9))
+    return f"{qty:.10f}".rstrip("0").rstrip(".") or "0"
 
-    js = bybit_proxy("/v5/order/create", params, "POST")
-    return js
+def _direction_to_side(direction: str) -> str:
+    return "Buy" if direction.lower().startswith("long") else "Sell"
 
-def place_stop_loss(symbol: str, side: str, stop_px: float, qty: float) -> Dict:
-    # SL opposite side, reduce-only, trigger as market
-    params = {
-        "category":"linear",
-        "symbol":symbol,
-        "side": "Sell" if side=="Buy" else "Buy",
-        "orderType":"Market",
-        "qty": str(qty),
-        "reduceOnly": True,
-        "stopLoss": f"{stop_px:.8f}"   # Bybit set_trading_stop style OR conditional if needed
-    }
-    # Preferred: conditional stop order
-    params = {
-        "category":"linear",
-        "symbol":symbol,
-        "side":"Sell" if side=="Buy" else "Buy",
-        "orderType":"Market",
-        "qty":str(qty),
-        "reduceOnly": True,
-        "triggerPrice": f"{stop_px:.8f}",
-        "triggerDirection": 2 if side=="Buy" else 1,  # crosses below for Buy
-        "tpslMode": "Partial"  # keep flexible; TP ladder elsewhere
-    }
-    js = bybit_proxy("/v5/order/create", params, "POST")
-    return js
+# ------------------------
+# Queue tailing
+# ------------------------
 
-def kline(symbol: str, interval: str, limit: int=300) -> List[Dict]:
-    js = bybit_proxy("/v5/market/kline", {"category":"linear","symbol":symbol,"interval":str(interval),"limit":str(limit)}, "GET")
-    rows = ((js.get("result") or {}).get("list") or [])
-    out=[]
-    for row in rows:
-        out.append({"ts":int(row[0]),"open":float(row[1]),"high":float(row[2]),"low":float(row[3]),"close":float(row[4]),"volume":float(row[5])})
-    out.sort(key=lambda x:x["ts"])
-    return out
+def _read_offset() -> int:
+    obj = _load_json(OFFSET_FILE, {"pos": 0})
+    try:
+        return int(obj.get("pos", 0))
+    except Exception:
+        return 0
 
-# ---------- TA (same as advisor, trimmed) ----------
-import math
-def rolling_max(arr, window, upto): 
-    start=max(0,upto-window+1); return max(arr[start:upto+1])
-def true_range(h,l,c):
-    out=[]; pc=None
-    for i in range(len(c)):
-        if pc is None: tr=h[i]-l[i]
-        else: tr=max(h[i]-l[i], abs(h[i]-pc), abs(l[i]-pc))
-        out.append(max(tr,0.0)); pc=c[i]
-    return out
-def wilder(vals,period):
-    out=[]; run=0.0
-    for i,v in enumerate(vals):
-        if i<period: run+=v; out.append(None); continue
-        if i==period: w=run/period
-        else: w=(out[-1]*(period-1)+v)/period
-        out.append(w)
-    return out
-def atr(h,l,c,period=14): return wilder(true_range(h,l,c),period)
-def dx_from_hlc(h,l,c,period=14):
-    plus_dm=[0.0]; minus_dm=[0.0]
-    for i in range(1,len(h)):
-        up=h[i]-h[i-1]; dn=l[i-1]-l[i]
-        plus_dm.append(up if (up>dn and up>0) else 0.0)
-        minus_dm.append(dn if (dn>up and dn>0) else 0.0)
-    TR=true_range(h,l,c)
-    def wl(v): 
-        out=[]; run=0.0
-        for i,val in enumerate(v):
-            if i<period: run+=val; out.append(None); continue
-            if i==period: w=run/period
-            else: w=(out[-1]*(period-1)+val)/period
-            out.append(w)
-        return out
-    atrw=wl(TR); pw=wl(plus_dm); mw=wl(minus_dm)
-    pdi=[]; mdi=[]; dx=[]
-    for i in range(len(h)):
-        if any(x is None for x in (atrw[i],pw[i],mw[i])) or atrw[i]==0:
-            pdi.append(None); mdi.append(None); dx.append(None); continue
-        pdi_v=100.0*(pw[i]/atrw[i]); mdi_v=100.0*(mw[i]/atrw[i]); pdi.append(pdi_v); mdi.append(mdi_v)
-        den=pdi_v+mdi_v; dx.append(0.0 if den==0 else 100.0*abs(pdi_v-mdi_v)/den)
-    return dx
-def adx(h,l,c,period=14):
-    dx=dx_from_hlc(h,l,c,period); out=[]; run=0.0; count=0
-    for v in dx:
-        if v is None: out.append(None); continue
-        count+=1
-        if count<=period: run+=v; out.append(None); continue
-        if count==period+1: avg=run/period
-        else: avg=(out[-1]*(period-1)+v)/period
-        out.append(avg)
-    return out
-def zscore(arr,lookback):
-    out=[]
-    for i in range(len(arr)):
-        if i<lookback: out.append(None); continue
-        window=arr[i-lookback+1:i+1]; m=sum(window)/len(window)
-        var=sum((x-m)**2 for x in window)/len(window); sd=math.sqrt(var)
-        out.append(0.0 if sd==0 else (arr[i]-m)/sd)
-    return out
+def _write_offset(pos: int) -> None:
+    _save_json(OFFSET_FILE, {"pos": int(pos)})
 
-def atr_pct(last_close, atr_val): 
-    if last_close<=0 or not atr_val: return 0.0
-    return (atr_val/last_close)*100.0
+def _load_seen() -> Dict[str, int]:
+    return _load_json(SEEN_FILE, {})
 
-# ---------- sizing ----------
-def get_filters(symbol: str):
-    info = instruments_info(symbol)
-    lot = (info.get("lotSizeFilter") or {})
-    pricef = (info.get("priceFilter") or {})
-    min_qty = float(lot.get("minOrderQty", "0.001"))
-    step_qty = float(lot.get("qtyStep", "0.001"))
-    tick = float(pricef.get("tickSize", "0.0001"))
-    return min_qty, step_qty, tick
+def _save_seen(seen: Dict[str, int]) -> None:
+    _save_json(SEEN_FILE, seen)
 
-def round_step(x: float, step: float) -> float:
-    return math.floor(x/step)*step
+def _tail_queue(path: Path, start_pos: int) -> Tuple[int, list]:
+    """
+    Read new lines from 'path' starting at byte offset start_pos.
+    Returns (new_pos, lines[])
+    """
+    if not path.exists():
+        return start_pos, []
 
-def calc_qty(symbol: str, entry: float, stop: float) -> float:
-    risk_val = guard.current_risk_value()   # equity * RISK_PCT%
-    risk_val = max(0.0, risk_val)
-    px_delta = abs(entry - stop)
-    if px_delta <= 0:
-        return 0.0
-    # For linear perps: PnL per 1 unit price move ≈ qty
-    qty = risk_val / px_delta
-    min_qty, step_qty, _ = get_filters(symbol)
-    qty = max(min_qty, round_step(qty, step_qty))
-    return qty
+    new_pos = start_pos
+    lines: list = []
+    with open(path, "r", encoding="utf-8") as fh:
+        fh.seek(start_pos, 0)
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            lines.append(line)
+        new_pos = fh.tell()
+    return new_pos, lines
 
-# ---------- signal ----------
-def breakout_signal(c, bo_lb, min_vol_z, min_adx, min_atr_pct, max_atr_pct):
-    if len(c) < max(bo_lb+30, 80): 
-        return False, {"reason":"insufficient"}
-    closes=[x["close"] for x in c]; highs=[x["high"] for x in c]; lows=[x["low"] for x in c]; vols=[x["volume"] for x in c]
-    adx14=adx(highs,lows,closes,14); atr14=atr(highs,lows,closes,14); volz=zscore(vols,30)
-    i=len(c)-1; last=closes[i]; hh=rolling_max(highs, bo_lb, i-1)
-    is_bo = highs[i] > hh and last > hh
-    last_adx=adx14[i]; prev_adx=adx14[i-1] if i-1>=0 else None
-    adx_ok = last_adx is not None and last_adx>=min_adx and (prev_adx is None or last_adx>=prev_adx)
-    atrp = atr_pct(last, atr14[i]); atr_ok = min_atr_pct <= atrp <= max_atr_pct
-    vz = volz[i]; vz_ok = (vz is not None and vz >= min_vol_z)
-    if not is_bo: return False, {"reason":"no breakout"}
-    if not adx_ok: return False, {"reason":f"adx {last_adx:.2f if last_adx else -1} < {min_adx}"}
-    if not atr_ok: return False, {"reason":f"atr% {atrp:.2f} outside [{min_atr_pct},{max_atr_pct}]"}
-    if not vz_ok: return False, {"reason":f"volz {vz:.2f if vz else -99} < {min_vol_z}"}
-    pullback = hh*(1 - float(os.getenv("PULLBACK_BPS","40"))/10000.0)
-    invalidation = min(lows[i], hh*0.985)
-    return True, {"last":last, "break":hh, "pullback":pullback, "stop":invalidation, "atrp":atrp, "adx":last_adx, "volz":vz}
+# ------------------------
+# Core execution
+# ------------------------
 
-# ---------- main loop ----------
-def main():
-    symbols = env_csv("SYMBOL_SCAN_LIST","BTCUSDT,ETHUSDT")
-    interval = os.getenv("SIGNAL_INTERVAL","5")
-    lookback = int(os.getenv("LOOKBACK","200"))
-    bo_lb = int(os.getenv("BO_LOOKBACK","20"))
-    min_vol_z = float(os.getenv("MIN_VOL_Z","1.5"))
-    min_adx_v = float(os.getenv("MIN_ADX","20"))
-    min_atr = float(os.getenv("MIN_ATR_PCT","0.6"))
-    max_atr = float(os.getenv("MAX_ATR_PCT","5.0"))
-    mode = os.getenv("ENTRY_MODE","LIMIT_PULLBACK").upper()
-    post_only = os.getenv("POST_ONLY","1") == "1"
-    dry = os.getenv("DRY_RUN","1") == "1"
-    safe = os.getenv("SAFE_MODE","1") == "1"
-    lev = int(os.getenv("LEVERAGE","20"))
+def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint: Optional[float]) -> Tuple[bool, str]:
+    """
+    Place a maker-first limit at the edge of the book, enforcing spread ceiling.
+    """
+    bid, ask, mid = _fetch_best_prices(symbol)
+    if bid is None or ask is None:
+        return False, "no orderbook"
 
-    print(f"[auto_executor] online • {interval}m • mode={mode} • dry={dry} • safe={safe}")
+    spr_bps = _spread_bps(bid, ask)
+    max_bps = float(params.get("spread_max_bps", SPREAD_MAX_BPS))
+    if spr_bps > max_bps:
+        return False, f"spread {spr_bps:.2f} bps > max {max_bps}"
+
+    # maker edge: longs near bid; shorts near ask
+    px = bid if side == "Buy" else ask
+    qty = _qty_from_notional(px)
+    tif = "PostOnly" if (EXEC_POST_ONLY and MAKER_ONLY) else "GoodTillCancel"
+
+    if DRY_RUN:
+        log.info("DRY entry %s %s qty=%s px=%s spr=%.2fbps tif=%s link=%s", symbol, side, qty, px, spr_bps, tif, link_id)
+        tg.safe_text(f"🟡 DRY • {symbol} • {side} qty≈{qty} @ {px} • spr {spr_bps:.2f}bps • tif={tif}", quiet=True)
+        return True, "dry-run"
+
+    ok, data, err = by.place_order(
+        category="linear",
+        symbol=symbol,
+        side=side,
+        orderType="Limit",
+        qty=qty,
+        price=f"{px}",
+        timeInForce=tif,
+        reduceOnly=False,
+        orderLinkId=link_id,
+        tpslMode=None,  # exits handled elsewhere
+    )
+    if not ok:
+        return False, err or "place_order failed"
+    return True, "ok"
+
+# ------------------------
+# Main loop
+# ------------------------
+
+def main() -> None:
+    # Announce
+    tg.safe_text(f"🟢 Executor online • maker={MAKER_ONLY} • postOnly={EXEC_POST_ONLY} • dry={DRY_RUN} • queue={QUEUE_PATH.name}", quiet=True)
+    log.info("Executor online • maker=%s postOnly=%s dry=%s queue=%s", MAKER_ONLY, EXEC_POST_ONLY, DRY_RUN, QUEUE_PATH)
+
+    seen = _load_seen()
+    pos = _read_offset()
 
     while True:
-        for sym in symbols:
-            try:
-                # optional gate
-                if _gate is not None:
-                    ok, why, meta = _gate.ok(sym)
-                    if not ok:
-                        print(f"[gate] {sym} blocked: {why} {meta}")
-                        continue
+        try:
+            # Tail queue
+            new_pos, lines = _tail_queue(QUEUE_PATH, pos)
+            if not lines:
+                time.sleep(max(1, EXEC_POLL_SEC))
+                continue
 
-                c = kline(sym, interval, limit=max(lookback, 200))
-                sig, info = breakout_signal(c, bo_lb, min_vol_z, min_adx_v, min_atr, max_atr)
-                if not sig:
-                    continue
-
-                if not guard.allow_new_trade(sym):
-                    print(f"[guard] {sym} blocked: concurrency/symbol/dd cap")
-                    continue
-
-                entry_break = info["break"]
-                entry_pull  = info["pullback"]
-                stop_px     = info["stop"]
-                last        = info["last"]
-
-                if mode == "LIMIT_PULLBACK":
-                    side = "Buy"
-                    entry_px = entry_pull
-                    order_type = "Limit"
-                elif mode == "LIMIT_BREAK":
-                    side = "Buy"
-                    entry_px = entry_break
-                    order_type = "Limit"
-                else:
-                    side = "Buy"
-                    entry_px = None
-                    order_type = "Market"
-
-                qty = calc_qty(sym, entry_px or last, stop_px)
-                if qty <= 0:
-                    print(f"[size] {sym} qty<=0; skip"); continue
-
-                trade_id = f"{sym}-{uuid.uuid4().hex[:8]}"
-                if dry:
-                    tg(f"🟡 DRY RUN • {sym} • {side} qty≈{qty:.8f} @ {entry_px or last:.8g} SL {stop_px:.8g}")
-                    print(f"[dry] would place {side} {qty} {sym} at {entry_px or last} stop {stop_px}")
-                    guard.register_open(trade_id, sym)
-                    continue
-
-                # set leverage (best-effort; ignore failures silently)
+            for raw in lines:
                 try:
-                    bybit_proxy("/v5/position/set-leverage", {"category":"linear","symbol":sym,"buyLeverage":str(lev),"sellLeverage":str(lev)}, "POST")
-                except Exception as e:
-                    print(f"[leverage] warn: {e}")
+                    obj = json.loads(raw)
+                except Exception:
+                    log.warning("bad jsonl line (skip): %s", raw[:200])
+                    continue
 
-                # entry
-                if order_type == "Limit":
-                    resp = place_order(sym, side, qty, price=entry_px, post_only=post_only, reduce_only=False, order_type="Limit")
+                ts_ms = int(obj.get("ts", 0))
+                symbol = str(obj.get("symbol", "")).upper()
+                tf = obj.get("timeframe")
+                signal = str(obj.get("signal", ""))
+                params = dict(obj.get("params") or {})
+                features = dict(obj.get("features") or {})
+
+                # Optional symbol allowlist
+                if EXEC_SYMBOLS and symbol not in EXEC_SYMBOLS:
+                    log.debug("skip %s (not in EXEC_SYMBOLS)", symbol)
+                    continue
+
+                # Build idempotent link id
+                link_id = _mk_link_id(symbol, ts_ms, "LONG" if "LONG" in signal else "SHORT")
+
+                # Dedup
+                if link_id in seen:
+                    log.debug("dup %s (already seen)", link_id)
+                    continue
+
+                # Breaker gate
+                if breaker_active():
+                    log.info("breaker ON: suppress open for %s (%s)", symbol, signal)
+                    tg.safe_text(f"⛔ Breaker ON • skip open • {symbol} {signal}", quiet=True)
+                    continue
+
+                # Direction to side
+                side = _direction_to_side("long" if "LONG" in signal.upper() else "short")
+
+                # Attempt placement
+                ok, msg = _place_entry(symbol, side, link_id, params, price_hint=None)
+                seen[link_id] = int(time.time())
+                _save_seen(seen)
+
+                if ok:
+                    tg.safe_text(f"✅ ENTRY • {symbol} • {side} • link={link_id}", quiet=True)
+                    log.info("entry ok %s %s link=%s", symbol, side, link_id)
                 else:
-                    resp = place_order(sym, side, qty, price=None, post_only=False, reduce_only=False, order_type="Market")
+                    tg.safe_text(f"⚠️ ENTRY FAIL • {symbol} • {side} • {msg}", quiet=True)
+                    log.warning("entry fail %s %s: %s", symbol, side, msg)
 
-                tg(f"✅ ENTRY PLACED • {sym}\nside: {side} qty: {qty:.8f}\nentry: {(entry_px or last):.8g}\nstop: {stop_px:.8g}\natr%: {info['atrp']:.2f}  adx: {info['adx']:.1f}  vz: {info['volz']:.2f}")
+            # Commit offset after processing batch
+            pos = new_pos
+            _write_offset(pos)
 
-                # stop loss
-                if safe:
-                    try:
-                        place_stop_loss(sym, side, stop_px, qty)
-                    except Exception as e:
-                        tg(f"⚠️ SL place error • {sym}: {e}")
-
-                guard.register_open(trade_id, sym)
-
-            except Exception as e:
-                print(f"[auto_executor] {sym} error: {e}")
-
-        time.sleep(10)
+        except Exception as e:
+            log.error("executor loop error: %s", e)
+            time.sleep(1.0)
 
 if __name__ == "__main__":
     main()
