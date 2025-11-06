@@ -2,42 +2,57 @@
 # -*- coding: utf-8 -*-
 """
 Base44 — Auto Executor (consume signals/observed.jsonl, maker-first entries)
+FINALIZED / unified with core stack (v2025-11-06)
 
-What this does now
-- Tails signals/observed.jsonl lines emitted by bots/signal_engine.py.
-- For each new signal, enforces breaker, dedupes, validates spread, and places a maker-first limit.
-- DRY_RUN safe path prints and notifies but does not touch the exchange.
-- No TP/SL logic here; your TP/SL Manager owns exits. This only opens.
+What this does
+- Tails signals/observed.jsonl emitted by bots/signal_engine.py.
+- For each new signal:
+  • Checks global breaker (core.breaker.is_active / .state/risk_state.json fallback).
+  • Optional allow-list by symbol (EXEC_SYMBOLS).
+  • Idempotent de-dupe via orderLinkId registry in .state/executor_seen.json.
+  • Validates orderbook spread vs params.spread_max_bps or SIG_SPREAD_MAX_BPS.
+  • Computes qty from either EXEC_QTY_BASE, or notional (EXEC_QTY_USDT/px), or
+    risk-based if params.stop_dist is provided (uses core.portfolio_guard.guard.current_risk_value()).
+  • Places maker-first PostOnly limit at best bid/ask (edge) when maker_only=true,
+    or uses Market when maker_only=false (respecting EXEC_POST_ONLY).
+- DRY_RUN path prints & notifies only; no exchange calls.
+- Exits (TP/SL) are handled by TP/SL Manager; executor only opens.
 
-Core dependencies
-- core.config.settings          → envs, paths, defaults
-- core.logger                   → unified logging
-- core.bybit_client.Bybit       → Bybit v5 client (signed)
-- tools.notifier_telegram.tg    → Telegram notifications
-
-Key settings (put in .env if you want to override defaults)
-  # From core.config / signal engine
+Key env (override in .env as needed)
+  # inherited from signal engine defaults (via core.config.settings)
   SIG_MAKER_ONLY=true
   SIG_SPREAD_MAX_BPS=8
   SIG_TAG=B44
-  SIG_DRY_RUN=true
+  SIG_DRY_RUN=true           # executor honors this as default unless EXEC_DRY_RUN set
 
-  # Executor-specific
-  EXEC_QTY_USDT=5.0            # notional in quote; used if EXEC_QTY_BASE==0
-  EXEC_QTY_BASE=0.0            # set >0 to override notional sizing
-  EXEC_POST_ONLY=true          # force PostOnly on maker entries
-  EXEC_SYMBOLS=                # optional allowlist, e.g. BTCUSDT,ETHUSDT
-  EXEC_POLL_SEC=2              # how often to check the queue when idle
+  # executor-specific
+  EXEC_DRY_RUN=1             # overrides SIG_DRY_RUN when present
+  EXEC_QTY_USDT=5.0          # notional in quote; used if EXEC_QTY_BASE==0 and no stop-based sizing
+  EXEC_QTY_BASE=0.0          # fixed base qty; if >0, bypasses risk/notional sizing
+  EXEC_POST_ONLY=true        # force PostOnly on limit entries
+  EXEC_SYMBOLS=              # optional CSV allowlist, e.g. BTCUSDT,ETHUSDT
+  EXEC_POLL_SEC=2            # tailing cadence (s)
+  EXEC_MAX_SIGNAL_AGE_SEC=120# drop stale signals
+  EXEC_ACCOUNT_UID=          # optional Bybit subUid to route entries (MAIN if empty)
 
 Files
   signals/observed.jsonl       # input queue (append-only)
-  .state/executor_seen.json    # dedupe registry for orderLinkId
+  .state/executor_seen.json    # de-dupe registry for orderLinkId
   .state/executor_offset.json  # last read byte offset for resilient tailing
   .state/risk_state.json       # breaker flag file ({"breach": true}) blocks opens
+
+Depends on:
+  core.config.settings         — paths + env defaults
+  core.logger                  — unified logging
+  core.bybit_client.Bybit      — thin wrapper over pybit v5 HTTP
+  core.notifier_bot.tg_send    — Telegram with retries/rate-limit
+  core.portfolio_guard.guard   — risk budget + concurrency caps
+  core.breaker                 — global breaker state (file-backed)
 """
 
 from __future__ import annotations
 import json
+import os
 import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
@@ -45,62 +60,107 @@ from typing import Dict, Optional, Tuple, List
 from core.config import settings
 from core.logger import get_logger, bind_context
 from core.bybit_client import Bybit
-from tools.notifier_telegram import tg
+from core.notifier_bot import tg_send
+try:
+    from core.portfolio_guard import guard
+except Exception:
+    guard = None  # graceful degrade if not present
+try:
+    from core.breaker import is_active as breaker_is_active  # preferred
+except Exception:
+    breaker_is_active = None
 
-log = get_logger("bots.auto_executor")
-log = bind_context(log, comp="executor")
+# Optional structured decision log (soft dep)
+try:
+    from core.decision_log import log_event
+except Exception:
+    def log_event(*_, **__):  # type: ignore
+        pass
+
+log = bind_context(get_logger("bots.auto_executor"), comp="executor")
 
 # ------------------------
 # Config
 # ------------------------
 
-ROOT = settings.ROOT
+ROOT: Path = settings.ROOT
 STATE_DIR = ROOT / ".state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-SIGNALS_DIR = settings.DIR_SIGNALS
-QUEUE_PATH = SIGNALS_DIR / "observed.jsonl"
+SIGNALS_DIR: Path = getattr(settings, "DIR_SIGNALS", ROOT / "signals")
+SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
+QUEUE_PATH = SIGNALS_DIR / (getattr(settings, "SIGNAL_QUEUE_FILE", "observed.jsonl"))
 
-# Inherit common knobs from signal-engine defaults
-MAKER_ONLY = bool(getattr(settings, "SIG_MAKER_ONLY", True))
-SPREAD_MAX_BPS = float(getattr(settings, "SIG_SPREAD_MAX_BPS", 8.0))
-TAG = str(getattr(settings, "SIG_TAG", "B44")).strip() or "B44"
+# Inherit common knobs from signal-engine defaults, allow executor overrides
+def _get_env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return bool(getattr(settings, name, default))
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
-DRY_RUN = bool(getattr(settings, "SIG_DRY_RUN", True))
-
-# Executor-specific knobs
-def _get_env_num(name: str, default: float) -> float:
-    try:
-        v = getattr(settings, name)
-    except AttributeError:
-        return default
+def _get_env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None:
+        try:
+            return float(getattr(settings, name))
+        except Exception:
+            return default
     try:
         return float(v)
     except Exception:
         return default
 
-EXEC_QTY_USDT = _get_env_num("EXEC_QTY_USDT", 5.0)    # notional in quote (e.g., USDT)
-EXEC_QTY_BASE = _get_env_num("EXEC_QTY_BASE", 0.0)    # if >0, overrides notional sizing
-EXEC_POST_ONLY = str(getattr(settings, "EXEC_POST_ONLY", "true")).strip().lower() in ("1","true","yes","on")
-EXEC_POLL_SEC = int(getattr(settings, "EXEC_POLL_SEC", 2))
+def _get_env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None:
+        try:
+            return int(getattr(settings, name))
+        except Exception:
+            return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+# Maker/Tag/Spread from signal-engine defaults
+MAKER_ONLY      = _get_env_bool("SIG_MAKER_ONLY", True)
+SPREAD_MAX_BPS  = _get_env_float("SIG_SPREAD_MAX_BPS", 8.0)
+TAG             = (getattr(settings, "SIG_TANGLED", None) or getattr(settings, "SIG_TAG", "B44")).strip() or "B44"
+SIG_DRY_DEFAULT = _get_env_bool("SIG_DRY_RUN", True)
+
+# Executor-specific
+EXEC_DRY_RUN         = _get_env_bool("EXEC_REALLY_DRY_RUN", SIG_DRY_DEFAULT)  # keeps old var if present
+if os.getenv("EXEC_DRY_RUN") is not None:  # prefer explicit EXEC_DRY_RUN when set
+    EXEC_DRY_RUN = _get_env_bool("EXEC_DRY_RUN", SIG_DRY_DEFAULT)
+
+EXEC_QTY_USDT        = _get_env_float("EXEC_QTY_USDT", 5.0)
+EXEC_QTY_BASE        = _get_env_float("EXEC_QTY_BASE", 0.0)
+EXEC_POST_ONLY       = _get_env_bool("EXEC_POST_ONLY", True)
+EXEC_POLL_SEC        = _get_env_int("EXEC_POLL_SEC", 2)
+EXEC_MAX_SIGNAL_AGE  = _get_env_int("EXEC_MAX_SIGNAL_AGE_SEC", 120)
+EXEC_ACCOUNT_UID     = (os.getenv("EXEC_ACCOUNT_UID") or "").strip() or None
 
 # Optional symbol allowlist
-_allow_raw = str(getattr(settings, "EXEC_SYMBOLS", "") or "").strip()
-EXEC_SYMBOLS: Optional[List[str]] = [s.strip().upper() for s in _allow_raw.split(",") if s.strip()] or None
+_raw_allow = (os.getenv("EXEC_SYMBOL_LIST") or getattr(settings, "EXEC_SYMBOLS", "") or "").strip()
+EXEC_SYMBOLS: Optional[List[str]] = [s.strip().upper() for s in _raw_allow.split(",") if s.strip()] or None
 
 # persistent registries
-SEEN_FILE = STATE_DIR / "executor_seen.json"      # orderLinkId registry
-OFFSET_FILE = STATE_DIR / "executor_offset.json"  # queue offset, for resilience
+SEEN_FILE   = STATE_DIR / "executor_seen.json"      # orderLinkId registry
+OFFSET_FILE = STATE_DIR / "executor_offset.json"    # queue offset, for resilience
 
 # Bybit client
 by = Bybit()
-by.sync_time()  # best-effort
+try:
+    by.sync_time()  # best-effort
+except Exception as e:
+    log.warning("time sync failed: %s", e)
 
 # ------------------------
 # Helpers
 # ------------------------
 
-def breaker_active() -> bool:
+def _fallback_breaker_active() -> bool:
+    """File-based breaker fallback used if core.breaker.is_active is unavailable."""
     path = STATE_DIR / "risk_state.json"
     try:
         if not path.exists():
@@ -109,6 +169,14 @@ def breaker_active() -> bool:
         return bool(js.get("breach") or js.get("breaker") or js.get("active"))
     except Exception:
         return False
+
+def breaker_active() -> bool:
+    if callable(breaker_is_secondary := breaker_is_active):
+        try:
+            return bool(breaker_is_secondary())
+        except Exception:
+            return _fallback_breaker_active()
+    return _fallback_breaker_active()
 
 def _load_json(path: Path, default):
     try:
@@ -124,9 +192,9 @@ def _save_json(path: Path, obj) -> None:
     except Exception as e:
         log.error("failed writing %s: %s", path.name, e)
 
-def _mk_link_id(symbol: str, ts_ms: int, signal: str, extra: str = "") -> str:
+def _mk_link_id(symbol: str, ts_ms: int, signal: str, tag: str, extra: str = "") -> str:
     # Keep <= 36 chars for Bybit; compact but deterministic
-    base = f"{TAG}-{symbol}-{int(ts_ms/1000)}-{signal}"
+    base = f"{tag}-{symbol}-{int(ts_ms/1000)}-{signal}"
     if extra:
         base = f"{base}-{extra}"
     return base[:36]
@@ -157,20 +225,34 @@ def _spread_bps(bid: float, ask: float) -> float:
         return 1e9
     return (ask - bid) / mid * 10000.0
 
-def _qty_from_notional(price: float) -> str:
+def _qty_from_signal(price: float, params: Dict) -> str:
+    """
+    Sizing precedence:
+      1) EXEC_QTY_BASE (>0) → fixed base qty
+      2) If params.stop_dist present AND guard available → risk_value / stop_dist
+      3) Fallback to notional: EXEC_QTY_USDT / price
+    """
     if EXEC_QTY_BASE > 0:
         qty = EXEC_QTY_BASE
+    elif params.get("stop_dist") and hasattr(guard, "current_risk_value"):
+        try:
+            risk_val = float(guard.current_risk_value())
+            px_delta = float(params["stop_dist"])
+            if px_delta > 0:
+                qty = max(0.0, risk_val / max(px_delta, 1e-9))
+            else:
+                qty = max(0.0, EXEC_QID := EXEC_QTY_USDT / max(price, 1e-9))  # fallback if zero/neg
+        except Exception:
+            qty = max(0.0, EXEC_QTY_USDT / max(price, 1e-9))
     else:
-        notional = max(0.0, EXEC_QTY_USDT)
-        qty = (notional / max(price, 1e-9))
-    return f"{qty:.10f}".rstrip("0").rstrip(".") or "0"
+        qty = max(0.0, EXEC_QTY_USDT / max(price, 1e-9))
+
+    # format to Bybit-friendly string (trim trailing zeros)
+    txt = f"{qty:.10f}".rstrip("0").rstrip(".")
+    return txt or "0"
 
 def _direction_to_side(direction: str) -> str:
     return "Buy" if direction.lower().startswith("long") else "Sell"
-
-# ------------------------
-# Queue tailing
-# ------------------------
 
 def _read_offset() -> int:
     obj = _load_json(OFFSET_FILE, {"pos": 0})
@@ -188,18 +270,20 @@ def _load_seen() -> Dict[str, int]:
 def _save_seen(seen: Dict[str, int]) -> None:
     _save_json(SEEN_FILE, seen)
 
-def _tail_queue(path: Path, start_pos: int) -> Tuple[int, list]:
+def _tail_queue(path: Path, start_pos: int) -> Tuple[int, List[str]]:
     """
     Read new lines from 'path' starting at byte offset start_pos.
-    Returns (new_pos, lines[])
+    Handles truncation (e.g., log rotated) by resetting to 0 if needed.
     """
     if not path.exists():
         return start_pos, []
+    size = path.stat().st_size
+    pos = start_pos if 0 <= start_pos <= size else 0
 
-    new_pos = start_pos
-    lines: list = []
+    new_pos = pos
+    lines: List[str] = []
     with open(path, "r", encoding="utf-8") as fh:
-        fh.seek(start_pos, 0)
+        fh.seek(pos, 0)
         for line in fh:
             line = line.strip()
             if not line:
@@ -214,7 +298,8 @@ def _tail_queue(path: Path, start_pos: int) -> Tuple[int, list]:
 
 def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint: Optional[float]) -> Tuple[bool, str]:
     """
-    Place a maker-first limit at the edge of the book, enforcing spread ceiling.
+    Place a maker-first limit at the edge of the book (PostOnly) when maker_only, or Market otherwise.
+    Enforces spread ceiling (bps). Respects DRY mode.
     """
     bid, ask, mid = _fetch_best_prices(symbol)
     if bid is None or ask is None:
@@ -225,30 +310,49 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
     if spr_bps > max_bps:
         return False, f"spread {spr_bps:.2f} bps > max {max_bps}"
 
-    # maker edge: longs near bid; shorts near ask
-    px = bid if side == "Buy" else ask
-    qty = _qty_from_notional(px)
-    tif = "PostOnly" if (EXEC_POST_ONLY and MAKER_ONLY) else "GoodTillCancel"
+    maker_only = bool(params.get("maker_only", MAKER_ONLY))
+    # Choose price: if hint provided and maker_only, nudge to edge that will post
+    if maker_only:
+        px = bid if side == "Buy" else ask
+        # If a hint exists and is *inside* the spread on our posting side, prefer hint to anchor ladder alignment
+        if isinstance(price_hint, (int, float)) and price_hint > 0:
+            if side == "Buy":
+                px = min(px, float(price_hint))
+            else:
+                px = max(px, float(price_hint))
+    else:
+        px = None  # we’ll use Market
 
-    if DRY_RUN:
-        log.info("DRY entry %s %s qty=%s px=%s spr=%.2fbps tif=%s link=%s", symbol, side, qty, px, spr_bps, tif, link_id)
-        tg.safe_text(f"🟡 DRY • {symbol} • {side} qty≈{qty} @ {px} • spr {spr_bps:.2f}bps • tif={tif}", quiet=True)
+    qty = _qty_from_signal(price=px or mid, params=params)
+    tif = "PostOnly" if (EXEC_POST_ONLY and maker_only) else "ImmediateOrCancel"  # IOC for market-ish
+
+    if EXEC_DRY_RUN:
+        msg = f"🟡 DRY • {symbol} • {side} qty≈{qty} @ {px if px else 'MKT'} • spr {spr_bps:.2f}bps • tif={tif} • link={link_id}"
+        tg_send(msg, priority="info")
+        log_event("executor", "entry_dry", symbol, "MAIN", {"side": side, "qty": qty, "px": px, "spr_bps": spr_bps, "tif": tif, "link": link_id})
         return True, "dry-run"
 
-    ok, data, err = by.place_order(
+    # Build request
+    req = dict(
         category="linear",
         symbol=symbol,
         side=side,
-        orderType="Limit",
-        qty=qty,
-        price=f"{px}",
-        timeInForce=tif,
+        orderType=("Limit" if px is not None else "Market"),
+        qty=str(qty),
         reduceOnly=False,
+        timeInForce=("PostOnly" if px is not None and EXEC_POST_ONLY and maker_only else ("IOC" if px is None else "GoodTillCancel")),
         orderLinkId=link_id,
-        tpslMode=None,  # exits handled elsewhere
+        tpslMode=None,  # exits handled by TP/SL manager
     )
+    if px is not None:
+        req["price"] = f"{px}"
+
+    # Attempt placement
+    ok, data, err = by.place_order(**req)
     if not ok:
-        return False, err or "place_order failed"
+        # If PostOnly reject because price would take, log and surface cause
+        return False, (err or "place_order failed")
+
     return True, "ok"
 
 # ------------------------
@@ -256,75 +360,107 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
 # ------------------------
 
 def main() -> None:
-    # Announce
-    tg.safe_text(f"🟢 Executor online • maker={MAKER_ONLY} • postOnly={EXEC_POST_ONLY} • dry={DRY_RUN} • queue={QUEUE_PATH.name}", quiet=True)
-    log.info("Executor online • maker=%s postOnly=%s dry=%s queue=%s", MAKER_ONLY, EXEC_POST_ONLY, DRY_RUN, QUEUE_PATH)
+    tg_send(f"🟢 Executor online • maker={MAKER_ONLY} • postOnly={EXEC_POST_ONLY} • dry={EXEC_DRY_RUN} • queue={QUEUE_PATH.name}", priority="success")
+    log.info("online • maker=%s postOnly=%s dry=%s queue=%s", MAKER_ONLY, EXEC_POST_ONLY, EXEC_DRY_RUN, QUEUE_PATH)
 
     seen = _load_seen()
     pos = _read_offset()
 
     while True:
         try:
-            # Tail queue
             new_pos, lines = _tail_queue(QUEUE_PATH, pos)
             if not lines:
                 time.sleep(max(1, EXEC_POLL_SEC))
+                # heal truncation
+                if new_pos < pos:
+                    pos = new_pos
+                    _write_offset(pos)
                 continue
 
             for raw in lines:
+                # parse
                 try:
                     obj = json.loads(raw)
                 except Exception:
-                    log.warning("bad jsonl line (skip): %s", raw[:200])
+                    log.warning("bad jsonl line (skip): %s", (raw[:200] + "…") if len(raw) > 200 else raw)
                     continue
 
-                ts_ms = int(obj.get("ts", 0))
-                symbol = str(obj.get("symbol", "")).upper()
-                tf = obj.get("timeframe")
-                signal = str(obj.get("signal", ""))
-                params = dict(obj.get("params") or {})
-                features = dict(obj.get("features") or {})
+                ts_ms   = int(obj.get("ts", 0))
+                now_ms  = int(time.time() * 1000)
+                symbol  = str(obj.get("symbol", "")).upper()
+                signal  = str(obj.get("signal", "")).upper()
+                params  = dict(obj.get("params") or {})
+                features= dict(obj.get("features") or {})
+                hint_px = None
+                if "entry_price" in params:
+                    try:
+                        hint_px = float(params["entry_price"])
+                    except Exception:
+                        hint_px = None
 
-                # Optional symbol allowlist
+                # optional allowlist
                 if EXEC_SYMBOLS and symbol not in EXEC_SYMBOLS:
                     log.debug("skip %s (not in EXEC_SYMBOLS)", symbol)
                     continue
 
-                # Build idempotent link id
-                link_id = _mk_link_id(symbol, ts_ms, "LONG" if "LONG" in signal else "SHORT")
+                # staleness filter
+                if ts_ms and EXEC_MAX_SIGNAL_ARG := EXEC_MAX_SIGNAL_AGE:
+                    if now_ms - ts_ms > EXEC_MAX_SIGNAL_ARG * 1000:
+                        log.info("stale signal %s dropped (age=%ds)", symbol, int((now_ms - ts_ms)/1000))
+                        continue
 
-                # Dedup
+                # override tag if provided
+                tag = str(params.get("tag", TAG) or "B44")
+                link_id = _mk_link_id(symbol, ts_ms or now_ms, ("LONG" if "LONG" in signal else "SHORT"), tag)
+
+                # de-dupe
                 if link_id in seen:
                     log.debug("dup %s (already seen)", link_id)
                     continue
 
-                # Breaker gate
+                # breaker gate
                 if breaker_active():
-                    log.info("breaker ON: suppress open for %s (%s)", symbol, signal)
-                    tg.safe_text(f"⛔ Breaker ON • skip open • {symbol} {signal}", quiet=True)
+                    msg = f"⛔ Breaker ON • skip open • {symbol} {signal}"
+                    tg_send(msg, priority="warn")
+                    log_event("executor", "block_breaker", symbol, "MAIN", {"signal": signal})
                     continue
 
-                # Direction to side
-                side = _direction_to_side("long" if "LONG" in signal.upper() else "short")
+                # portfolio guard gates (optional)
+                if guard is not None:
+                    try:
+                        if not guard.allow_new_trade(symbol):
+                            tg_send(f"⏸️ Guard block • {symbol} • max concurrency/symbol or daily cap hit", priority="warn")
+                            log_event("executor", "block_guard", symbol, "MAIN")
+                            continue
+                        # if we will use risk-based sizing, guard.current_risk_value() is read in _qty_from_signal
+                    except Exception as e:
+                        log.warning("guard check error: %s", e)
 
-                # Attempt placement
-                ok, msg = _place_entry(symbol, side, link_id, params, price_hint=None)
+                side = "Buy" if "LONG" in signal else "Sell"
+
+                ok, msg = _place_entry(symbol, side, link_id, params, hint_px)
                 seen[link_id] = int(time.time())
                 _save_seen(seen)
 
                 if ok:
-                    tg.safe_text(f"✅ ENTRY • {symbol} • {side} • link={link_id}", quiet=True)
+                    tg_send(f"✅ ENTRY • {symbol} • {side} • link={link_id}", priority="success")
+                    log_event("executor", "entry_ok", symbol, "MAIN", {"side": side, "link": link_id})
                     log.info("entry ok %s %s link=%s", symbol, side, link_id)
+                    # NOTE: TP/SL Manager will observe position and create exits
                 else:
-                    tg.safe_text(f"⚠️ ENTRY FAIL • {symbol} • {side} • {msg}", quiet=True)
+                    tg_send(f"⚠️ ENTRY FAIL • {symbol} • {side} • {msg}", priority="warn")
+                    log_event("executor", "entry_fail", symbol, "MAIN", {"side": side, "error": msg})
                     log.warning("entry fail %s %s: %s", symbol, side, msg)
 
-            # Commit offset after processing batch
+            # commit offset after processing batch
             pos = new_pos
             _write_offset(pos)
 
+        except KeyboardInterrupt:
+            log.info("shutdown requested by user")
+            break
         except Exception as e:
-            log.error("executor loop error: %s", e)
+            log.error("loop error: %s", e)
             time.sleep(1.0)
 
 if __name__ == "__main__":
