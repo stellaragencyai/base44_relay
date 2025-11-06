@@ -20,6 +20,11 @@ Safety rail additions (env-driven):
   TP_WS_DISABLE=false           # disable WS entirely; rely on HTTP sweep
   TP_PERIODIC_SWEEP_SEC=12      # sweep frequency (seconds)
 
+Policy + telemetry:
+  - Respects per-account policy (who may manage exits).
+  - Can still "protect manual" accounts (SL/TP maintenance) if policy enables it.
+  - Decision logging for every action to logs/decisions (JSONL/Parquet).
+
 Requires:
   pip install pybit requests python-dotenv pyyaml
 """
@@ -44,6 +49,24 @@ try:
 except Exception:
     def tg_send(msg: str, priority: str = "info", **kwargs):
         logging.getLogger("tp5eq").info(f"[notify/{priority}] {msg}")
+
+# Account policy + decision logging (soft imports; no hard fail)
+try:
+    from core.account_policy import (
+        may_manage_exits,
+        reconciler_can_protect_manual,
+        get_account,
+    )
+except Exception:
+    def may_manage_exits(_uid: str) -> bool: return True
+    def reconciler_can_protect_manual() -> bool: return True
+    def get_account(uid: str) -> dict: return {"uid": uid, "mode": "auto"}
+
+try:
+    from core.decision_log import log_event
+except Exception:
+    def log_event(component, event, symbol, account_uid, payload=None, trade_id=None, level="info"):
+        print(f"[DECLOG/{component}/{event}] {symbol} @{account_uid} {payload or {}}")
 
 getcontext().prec = 28
 
@@ -82,7 +105,6 @@ CFG = {
     "tp_rungs": 5,
     "tp_equal_r_start": 0.5,   # first TP at 0.5R
     "tp_equal_r_step": 0.5,    # step between rungs
-    "tp_equal_alloc": 1.0,     # total allocation across rungs; split equally
 
     # maker placement
     "maker_post_only": True,
@@ -125,7 +147,7 @@ CFG = {
     # periodic sweep to catch misses
     "periodic_sweep_sec": 12,
 
-    # WS optional toggle (overridden by env) — added
+    # WS optional toggle (overridden by env)
     "ws_optional": False,
 }
 
@@ -153,6 +175,15 @@ def breaker_active() -> bool:
         return bool(js.get("breach"))
     except Exception:
         return False
+
+# ---------- account mapping ----------
+def account_key_to_uid(account_key: str) -> str:
+    """Convert internal key to policy UID."""
+    if account_key == "main":
+        return "MAIN"
+    if account_key.startswith("sub:"):
+        return account_key.split(":", 1)[1]
+    return account_key
 
 # ---------- precision / symbol meta ----------
 @dataclass
@@ -267,10 +298,12 @@ def _pick_closer_stop(entry: Decimal, a: Optional[Decimal], b: Optional[Decimal]
     choices = [x for x in (a, b) if x is not None]
     if choices:
         return min(choices, key=lambda s: abs(entry - s))
+    # fallback minimal buffer
     return round_price_to_tick(entry - tick * Decimal(CFG["sl_min_tick_buffer"]) if side_word == "long"
                                else entry + tick * Decimal(CFG["sl_min_tick_buffer"]), tick)
 
-def ensure_stop(symbol: str, side_word: str, entry: Decimal, pos_idx: int, tick: Decimal, extra: dict) -> Decimal:
+def ensure_stop(account_uid: str, symbol: str, side_word: str, entry: Decimal, pos_idx: int, tick: Decimal, extra: dict) -> Decimal:
+    # check existing SL
     try:
         res = http.get_positions(category=CFG["category"], symbol=symbol, **extra)
         lst = res.get("result", {}).get("list", [])
@@ -288,16 +321,18 @@ def ensure_stop(symbol: str, side_word: str, entry: Decimal, pos_idx: int, tick:
     try:
         if TP_DRY_RUN:
             tg_send(f"🛑 {symbol}: DRY_RUN would set SL at {stop}", priority="info")
+            log_event("tp_manager", "sl_compute_dry", symbol, account_uid, {"stop": str(stop)})
         else:
             http.set_trading_stop(category=CFG["category"], symbol=symbol, positionIdx=str(pos_idx), stopLoss=str(stop), **extra)
             tg_send(f"🛑 <b>{symbol}</b>: Auto-SL set at {stop}.", priority="success")
+            log_event("tp_manager", "sl_set", symbol, account_uid, {"stop": str(stop)})
     except Exception as e:
         log.warning(f"set SL failed: {e}")
+        log_event("tp_manager", "sl_set_error", symbol, account_uid, {"error": str(e)}, level="error")
     return Decimal(stop)
 
 # ---------- guardrails ----------
 _t0 = time.monotonic()
-
 def in_grace() -> bool:
     return (time.monotonic() - _t0) < max(0, TP_GRACE_SEC)
 
@@ -316,18 +351,21 @@ def make_link(link_hint: Optional[str] = None) -> str:
     return base
 
 # ---------- orders ----------
-def place_limit_reduce(symbol: str, side: str, price: Decimal, qty: Decimal, tick: Decimal, extra: dict) -> Optional[str]:
+def place_limit_reduce(account_uid: str, symbol: str, side: str, price: Decimal, qty: Decimal, tick: Decimal, extra: dict) -> Optional[str]:
     if TP_DRY_RUN:
         tg_send(f"🧪 DRY_RUN: place {side} {symbol} qty={qty} @ {price}", priority="info")
+        log_event("tp_manager", "tp_create_dry", symbol, account_uid, {"side": side, "qty": str(qty), "px": str(price)})
         return None
+    # maker shading
     maker_ticks = adaptive_offset_ticks(symbol, tick, extra)
     px = price - tick * maker_ticks if side == "Sell" else price + tick * maker_ticks
 
-    # skip illegal tiny qtys early
+    # min qty check early
     try:
         filters = get_symbol_filters(symbol, extra)
         if qty < filters.min_order_qty:
             tg_send(f"⚠️ {symbol}: skip rung qty<{filters.min_order_qty} (rounded too small)", priority="warn")
+            log_event("tp_manager", "tp_skip_too_small", symbol, account_uid, {"qty": str(qty), "minQty": str(filters.min_order_qty)})
             return None
     except Exception:
         pass
@@ -345,6 +383,7 @@ def place_limit_reduce(symbol: str, side: str, price: Decimal, qty: Decimal, tic
             r = http.place_order(**body, **extra)
             if r.get("retCode") in (0, "0"):
                 oid = (r.get("result") or {}).get("orderId")
+                log_event("tp_manager", "tp_create", symbol, account_uid, {"orderId": oid, "side": side, "qty": str(qty), "px": str(px)})
                 return oid
             # price band/invalid price → walk one tick and retry
             if attempt < retries:
@@ -355,44 +394,57 @@ def place_limit_reduce(symbol: str, side: str, price: Decimal, qty: Decimal, tic
             log.warning(f"place_order ex: {e}")
             if attempt < retries:
                 time.sleep(0.3)
+    log_event("tp_manager", "tp_create_fail", symbol, account_uid, {"side": side, "qty": str(qty), "px": str(price)})
     return None
 
-def amend_order_qty(order_id: str, qty: Decimal, extra: dict) -> bool:
+def amend_order_qty(account_uid: str, symbol: str, order_id: str, qty: Decimal, extra: dict) -> bool:
     if TP_DRY_RUN:
         tg_send(f"🧪 DRY_RUN: amend qty orderId={order_id} → {qty}", priority="info")
+        log_event("tp_manager", "tp_amend_qty_dry", symbol, account_uid, {"orderId": order_id, "qty": str(qty)})
         return True
     try:
         r = http.amend_order(category=CFG["category"], orderId=order_id, qty=str(qty.normalize()), **extra)
-        return r.get("retCode") in (0, "0")
+        ok = r.get("retCode") in (0, "0")
+        log_event("tp_manager", "tp_amend_qty", symbol, account_uid, {"orderId": order_id, "qty": str(qty), "ok": ok})
+        return ok
     except Exception as e:
         log.warning(f"amend qty ex: {e}")
+        log_event("tp_manager", "tp_amend_qty_error", symbol, account_uid, {"orderId": order_id, "error": str(e)}, level="error")
         return False
 
-def amend_order_price(order_id: str, price: Decimal, extra: dict) -> bool:
+def amend_order_price(account_uid: str, symbol: str, order_id: str, price: Decimal, extra: dict) -> bool:
     if TP_DRY_RUN:
         tg_send(f"🧪 DRY_RUN: amend price orderId={order_id} → {price}", priority="info")
+        log_event("tp_manager", "tp_amend_px_dry", symbol, account_uid, {"orderId": order_id, "px": str(price)})
         return True
     try:
         r = http.amend_order(category=CFG["category"], orderId=order_id, price=str(price.normalize()), **extra)
-        return r.get("retCode") in (0, "0")
+        ok = r.get("retCode") in (0, "0")
+        log_event("tp_manager", "tp_amend_px", symbol, account_uid, {"orderId": order_id, "px": str(price), "ok": ok})
+        return ok
     except Exception as e:
         log.warning(f"amend price ex: {e}")
+        log_event("tp_manager", "tp_amend_px_error", symbol, account_uid, {"orderId": order_id, "error": str(e)}, level="error")
         return False
 
-def cancel_order(order_id: str, link_id: Optional[str], extra: dict) -> None:
+def cancel_order(account_uid: str, symbol: str, order_id: str, link_id: Optional[str], extra: dict) -> None:
     if in_grace():
         tg_send(f"🔒 Cancel blocked (grace): orderId={order_id}", priority="warn")
+        log_event("tp_manager", "tp_cancel_block_grace", symbol, account_uid, {"orderId": order_id})
         return
     if (not managed_link(link_id)) and (not TP_CANCEL_NON_B44):
         tg_send(f"🔒 Cancel blocked (non-Base44): orderId={order_id}", priority="info")
+        log_event("tp_manager", "tp_cancel_block_foreign", symbol, account_uid, {"orderId": order_id, "link": link_id})
         return
     if TP_DRY_RUN:
         tg_send(f"🧪 DRY_RUN: cancel orderId={order_id}", priority="info")
+        log_event("tp_manager", "tp_cancel_dry", symbol, account_uid, {"orderId": order_id})
         return
     try:
         http.cancel_order(category=CFG["category"], orderId=order_id, **extra)
-    except Exception:
-        pass
+        log_event("tp_manager", "tp_cancel", symbol, account_uid, {"orderId": order_id})
+    except Exception as e:
+        log_event("tp_manager", "tp_cancel_error", symbol, account_uid, {"orderId": order_id, "error": str(e)}, level="error")
 
 def fetch_open_tp_orders(symbol: str, close_side: str, extra: dict) -> List[dict]:
     try:
@@ -420,7 +472,6 @@ class PositionState:
     def __init__(self):
         self.pos: Dict[Tuple[str, str], Dict] = {}
         self.lock = threading.Lock()
-
 STATE = PositionState()
 
 def account_iter():
@@ -436,8 +487,7 @@ class PolicyCheck:
     filters: Optional['SymbolFilters']
 
 def symbol_allowed_by_policy(symbol: str, extra: dict) -> PolicyCheck:
-    if CFG["symbol_blocklist"] and symbol.upper() in {s.upper() for s in CFG["symbol_blocklist"]}:
-        return PolicyCheck(False, "blocked by symbol_blocklist", None)
+    # instrument meta + leverage sanity
     try:
         filters = get_symbol_filters(symbol, extra)
     except Exception as e:
@@ -468,6 +518,7 @@ def _split_even(total: Decimal, step: Decimal, minq: Decimal, n: int) -> List[De
                     diff_abs -= step
             if diff_abs < step:
                 break
+    # min qty repair
     for i in range(n):
         if chunks[i] == 0:
             continue
@@ -489,10 +540,8 @@ def build_equal_r_targets(entry: Decimal, stop: Decimal, side_word: str, tick: D
     n = CFG.get("tp_rungs", 5)
     r_start = Decimal(str(CFG.get("tp_equal_r_start", 0.5)))
     r_step  = Decimal(str(CFG.get("tp_equal_r_step", 0.5)))
-
     r_value = abs(entry - stop)
     targets: List[Decimal] = []
-
     for i in range(n):
         dist_R = r_start + Decimal(i) * r_step
         offset = (dist_R * r_value) if r_value > Decimal("0") else (dist_R * tick)
@@ -501,23 +550,42 @@ def build_equal_r_targets(entry: Decimal, stop: Decimal, side_word: str, tick: D
     return targets
 
 def place_or_sync_ladder(account_key: str, extra: dict, symbol: str, side_word: str, entry: Decimal, qty: Decimal, pos_idx: int):
+    uid = account_key_to_uid(account_key)
+
+    # Policy gate: may we manage exits for this account?
+    if not may_manage_exits(uid):
+        # If policy allows protection for manual accounts, we still set/maintain SL only
+        if reconciler_can_protect_manual():
+            try:
+                filters = get_symbol_filters(symbol, extra)
+                stop = ensure_stop(uid, symbol, side_word, entry, pos_idx, filters.tick_size, extra)
+                log_event("tp_manager", "policy_protect_only", symbol, uid, {"stop": str(stop)})
+                tg_send(f"🛡️ {account_key}:{symbol} protect-only: SL ensured; TP maintenance skipped by policy.", priority="info")
+            except Exception:
+                pass
+        else:
+            log_event("tp_manager", "policy_block_exits", symbol, uid, {"reason": "may_manage_exits=false"})
+        return
+
     check = symbol_allowed_by_policy(symbol, extra)
     if not check.allowed:
         with STATE.lock:
             STATE.pos.setdefault((account_key, symbol), {})["tp_placed"] = True
         tg_send(f"⏸️ {account_key}:{symbol} skipped — {check.reason}", priority="warn")
+        log_event("tp_manager", "symbol_block", symbol, uid, {"reason": check.reason})
         return
 
     if breaker_active():
         tick = check.filters.tick_size
-        stop = ensure_stop(symbol, side_word, entry, pos_idx, tick, extra)
+        stop = ensure_stop(uid, symbol, side_word, entry, pos_idx, tick, extra)
         with STATE.lock:
             STATE.pos.setdefault((account_key, symbol), {})["tp_placed"] = True
         tg_send(f"⛔ {account_key}:{symbol} breaker active — SL ensured at {stop}, TPs paused.", priority="warn")
+        log_event("tp_manager", "breaker_pause", symbol, uid, {"stop": str(stop)})
         return
 
     tick, step, minq = check.filters.tick_size, check.filters.step_size, check.filters.min_order_qty
-    stop = ensure_stop(symbol, side_word, entry, pos_idx, tick, extra)
+    stop = ensure_stop(uid, symbol, side_word, entry, pos_idx, tick, extra)
     targets = build_equal_r_targets(entry, stop, side_word, tick)
     close_side = side_to_close(side_word)
 
@@ -527,7 +595,7 @@ def place_or_sync_ladder(account_key: str, extra: dict, symbol: str, side_word: 
 
     adopt_only = in_grace() or TP_ADOPT_EXISTING
 
-    two_ticks = max(tick, tick * 2)  # defensive
+    two_ticks = max(tick, tick * 2)
     matched = [None] * CFG["tp_rungs"]
     used = set()
     for order in existing:
@@ -553,14 +621,15 @@ def place_or_sync_ladder(account_key: str, extra: dict, symbol: str, side_word: 
         if tq <= 0:
             if ex_id:
                 if managed_link(ex_link):
-                    cancel_order(ex_id, ex_link, extra)
+                    cancel_order(uid, symbol, ex_id, ex_link, extra)
                 else:
                     tg_send(f"🤝 Adopt keep (qty=0 target): {account_key}:{symbol} rung {i+1} foreign order", priority="info")
+                    log_event("tp_manager", "adopt_keep_foreign", symbol, uid, {"rung": i+1, "orderId": ex_id})
             rung_info.append({"px": tpx, "qty": Decimal("0"), "orderId": ex_id})
             continue
 
         if not ex_id:
-            oid = place_limit_reduce(symbol, close_side, tpx, tq, tick, extra)
+            oid = place_limit_reduce(uid, symbol, close_side, tpx, tq, tick, extra)
             rung_info.append({"px": tpx, "qty": tq, "orderId": oid})
             if oid:
                 placed += 1
@@ -568,15 +637,16 @@ def place_or_sync_ladder(account_key: str, extra: dict, symbol: str, side_word: 
 
         if ex_id and (not managed_link(ex_link)) and adopt_only:
             rung_info.append({"px": Decimal(str(ex.get("price"))), "qty": Decimal(str(ex.get("qty"))), "orderId": ex_id})
+            log_event("tp_manager", "adopt_foreign", symbol, uid, {"rung": i+1, "orderId": ex_id})
             continue
 
         cur_px = Decimal(str(ex.get("price")))
         cur_qty = Decimal(str(ex.get("qty")))
         if abs(cur_px - tpx) > tick:
-            amend_order_price(ex_id, tpx, extra)
+            amend_order_price(uid, symbol, ex_id, tpx, extra)
             cur_px = tpx
         if abs(cur_qty - tq) >= step:
-            amend_order_qty(ex_id, tq, extra)
+            amend_order_qty(uid, symbol, ex_id, tq, extra)
             cur_qty = tq
         rung_info.append({"px": cur_px, "qty": cur_qty, "orderId": ex_id})
 
@@ -597,16 +667,24 @@ def place_or_sync_ladder(account_key: str, extra: dict, symbol: str, side_word: 
     px_str = ", ".join([str(x) for x in targets])
     mode = "DRY_RUN" if TP_DRY_RUN else ("ADOPT" if adopt_only else "SYNC")
     tg_send(f"✅ {account_key}:{symbol} ladder {mode} • qty={qty} • entry={entry} • stop={stop}\nTPs: {px_str}", priority="success")
+    log_event("tp_manager", "ladder_sync", symbol, uid, {
+        "mode": mode, "qty": str(qty), "entry": str(entry), "stop": str(stop),
+        "targets": [str(x) for x in targets]
+    })
 
 def set_sl(account_key: str, extra: dict, symbol: str, pos_idx: int, new_sl: Decimal):
+    uid = account_key_to_uid(account_key)
     try:
         if TP_DRY_RUN:
             tg_send(f"🧪 DRY_RUN: SL → {new_sl} ({account_key}:{symbol})", priority="info")
+            log_event("tp_manager", "sl_adjust_dry", symbol, uid, {"new_sl": str(new_sl)})
             return
         http.set_trading_stop(category=CFG["category"], symbol=symbol, positionIdx=str(pos_idx), stopLoss=str(new_sl), **extra)
         tg_send(f"🛡️ {account_key}:{symbol} SL → {new_sl}", priority="success")
+        log_event("tp_manager", "sl_adjust", symbol, uid, {"new_sl": str(new_sl)})
     except Exception as e:
         log.warning(f"set SL error {account_key}:{symbol}: {e}")
+        log_event("tp_manager", "sl_adjust_error", symbol, uid, {"error": str(e)}, level="error")
 
 # ---------- fills: laddered SL ----------
 def handle_tp_fill(account_key: str, extra: dict, ev: dict):
@@ -624,6 +702,9 @@ def handle_tp_fill(account_key: str, extra: dict, ev: dict):
 
     filled_px = ev.get("avgPrice") or ev.get("execPrice") or ev.get("price")
     tg_send(f"🎯 {account_key}:{symbol} TP filled {filled_count}/{CFG['tp_rungs']} @ {filled_px}", priority="info")
+    log_event("tp_manager", "tp_fill", symbol, account_key_to_uid(account_key), {
+        "filled": filled_count, "price": str(filled_px)
+    })
 
     if targets and filled_count >= 2:
         prev_index = min(filled_count - 2, CFG["tp_rungs"] - 2)  # 2->0, 3->1, 4->2, 5->3
@@ -634,6 +715,7 @@ def handle_tp_fill(account_key: str, extra: dict, ev: dict):
 # ---------- bootstrap/sweep ----------
 def load_positions_once():
     for acct_key, extra in account_iter():
+        uid = account_key_to_uid(acct_key)
         for coin in CFG["settle_coins"]:
             try:
                 res = http.get_positions(category=CFG["category"], settleCoin=coin, **extra)
@@ -644,22 +726,23 @@ def load_positions_once():
                         continue
                     if CFG["listen_symbols"] != "*" and symbol not in CFG["listen_symbols"]:
                         continue
-                    if CFG["symbol_blocklist"] and symbol.upper() in {s.upper() for s in CFG["symbol_blocklist"]}:
-                        continue
                     size = Decimal(p.get("size") or "0")
                     if size == 0:
                         continue
                     side_word = "long" if (p.get("side", "").lower().startswith("b")) else "short"
                     entry = Decimal(p.get("avgPrice") or "0")
                     pos_idx = int(p.get("positionIdx") or 0)
+                    log_event("tp_manager", "bootstrap_pos", symbol, uid, {"qty": str(size), "entry": str(entry)})
                     place_or_sync_ladder(acct_key, extra, symbol, side_word, entry, size, pos_idx)
             except Exception as e:
                 log.error(f"load pos {acct_key} {coin} error: {e}")
+                log_event("tp_manager", "bootstrap_error", "", uid, {"error": str(e)}, level="error")
 
 def periodic_sweep_loop():
     while True:
         try:
             for acct_key, extra in account_iter():
+                uid = account_key_to_uid(acct_key)
                 for coin in CFG["settle_coins"]:
                     try:
                         res = http.get_positions(category=CFG["category"], settleCoin=coin, **extra)
@@ -673,6 +756,7 @@ def periodic_sweep_loop():
                                 with STATE.lock:
                                     if (acct_key, symbol) in STATE.pos:
                                         tg_send(f"🏁 {acct_key}:{symbol} position closed.", priority="info")
+                                        log_event("tp_manager", "pos_closed", symbol, uid)
                                     STATE.pos.pop((acct_key, symbol), None)
                                 continue
                             side_word = "long" if (p.get("side", "").lower().startswith("b")) else "short"
@@ -686,6 +770,7 @@ def periodic_sweep_loop():
                                 place_or_sync_ladder(acct_key, extra, symbol, side_word, entry, size, pos_idx)
                     except Exception as e:
                         log.warning(f"sweep {acct_key} {coin} err: {e}")
+                        log_event("tp_manager", "sweep_error", "", uid, {"error": str(e)}, level="error")
             time.sleep(CFG["periodic_sweep_sec"])
         except Exception as e:
             log.warning(f"periodic loop err: {e}")
@@ -739,6 +824,7 @@ def ws_private_handler(message):
                         with STATE.lock:
                             if (acct_key, symbol) in STATE.pos:
                                 tg_send(f"🏁 {acct_key}:{symbol} position closed.", priority="info")
+                                log_event("tp_manager", "pos_closed", symbol, account_key_to_uid(acct_key))
                             STATE.pos.pop((acct_key, symbol), None)
                         continue
                     place_or_sync_ladder(acct_key, extra, symbol, side_word, entry, size, pos_idx)
@@ -762,10 +848,12 @@ def _spawn_ws():
             _ws_obj.position_stream(callback=ws_private_handler)
             _ws_obj.execution_stream(callback=ws_private_handler)
             log.info("Subscribed to private streams.")
+            log_event("tp_manager", "ws_subscribed", "", "MAIN")
     except Exception as e:
         log.error(f"WS spawn failed: {e}; disabling WS and relying on HTTP sweep.")
         CFG["ws_optional"] = True
         tg_send("⚠️ TP/SL Manager: WS spawn failed; falling back to HTTP-only mode.", priority="warn")
+        log_event("tp_manager", "ws_spawn_fail", "", "MAIN", {"error": str(e)}, level="error")
 
 def _close_ws():
     global _ws_obj
@@ -799,6 +887,10 @@ def _ws_watchdog():
 # ---------- main ----------
 def bootstrap():
     tg_send(f"🟢 TP/SL Manager online • dry_run={TP_DRY_RUN} grace={TP_GRACE_SEC}s adopt={TP_ADOPT_EXISTING} tag={TP_TAG} ws_optional={CFG['ws_optional']} sweep={CFG['periodic_sweep_sec']}s", priority="success")
+    log_event("tp_manager", "startup", "", "MAIN", {
+        "dry_run": TP_DRY_RUN, "grace_sec": TP_GRACE_SEC, "adopt": TP_ADOPT_EXISTING, "tag": TP_TAG,
+        "ws_optional": CFG["ws_optional"], "sweep_sec": CFG["periodic_sweep_sec"]
+    })
     log.info("TP/SL Manager started (5 equal TPs, hardened guards)")
 
     load_positions_once()
@@ -821,6 +913,7 @@ def bootstrap():
         _stop_ws = True
         _close_ws()
         log.info("Shutting down.")
+        log_event("tp_manager", "shutdown", "", "MAIN")
 
 if __name__ == "__main__":
     bootstrap()
