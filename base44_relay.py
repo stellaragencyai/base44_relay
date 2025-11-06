@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 Relay — Hardened + Diagnostics (Flask)
+Base44 Relay — Hardened + Normalization + Diagnostics (Flask)
 
 - Auth: Bearer or x-relay-token (also ?token= for quick curls)
-- Generic proxy:        POST /bybit/proxy      (Bybit v5 only; signed)
-- Native helpers:       GET  /bybit/wallet/balance
+- Generic proxy:        POST /bybit/proxy      (Bybit v5 only; signed)  → adds body.normalized
+- Native helpers:       GET  /bybit/wallet/balance                        → adds normalized
                         GET  /bybit/positions
                         GET  /bybit/tickers
                         GET  /bybit/subuids
 - Base44 helpers:       GET  /getAccountData   ← ALWAYS returns an ARRAY of accounts
+                         Each item includes: equity, walletBalance, unrealisedPnl, availableBalance
                         GET  /getEquityCurve
 - Legacy shims:         GET  /v1/wallet/balance
                         GET  /v1/order/realtime
@@ -21,10 +22,11 @@ Base44 Relay — Hardened + Diagnostics (Flask)
                         GET  /diag/bybit       (auth sanity)
                         GET  /heartbeat        (TG ping)
                         GET  /diag/telegram    (verifies token + recent chat IDs)
+                        GET  /diag/wallet-normalized  ← proves availableBalance is present
 
 .env keys:
   RELAY_TOKEN=...
-  ALLOWED_ORIGINS=http://localhost:5000
+  ALLOWED_ORIGINS=http://localhost:5000,https://your-ngrok.ngrok-free.app
   BYBIT_ENV=mainnet  # or testnet
   BYBIT_BASE=        # optional; auto-picked from BYBIT_ENV if empty
   BYBIT_API_KEY=...
@@ -34,7 +36,7 @@ Base44 Relay — Hardened + Diagnostics (Flask)
   TELEGRAM_BOT_TOKEN=...
   TELEGRAM_CHAT_ID=...
   RELAY_HOST=0.0.0.0
-  RELAY_PORT=8080
+  RELAY_PORT=5000
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ import time
 import hmac
 import json
 import csv
+import math
 import hashlib
 import logging
 from pathlib import Path
@@ -103,7 +106,7 @@ def tg_send(text: str):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=10,
         )
     except Exception:
@@ -246,6 +249,98 @@ def _passthrough_primary(prox: Dict[str, Any]):
     return resp
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Normalization for wallet-balance (adds availableBalance)
+# ──────────────────────────────────────────────────────────────────────────────
+def _to_f(x, default=0.0) -> float:
+    try:
+        if x is None or x == "" or (isinstance(x, str) and x.lower() == "null"):
+            return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
+
+def normalize_wallet_balance(bybit_body: dict, request_params: dict | None = None) -> dict | None:
+    """
+    Normalize Bybit wallet-balance body to always include availableBalance per coin,
+    plus totals per account. Safe for UNIFIED with optional memberId/subUid passthrough.
+    """
+    try:
+        if not isinstance(bybit_body, dict):
+            return None
+        if int(bybit_body.get("retCode", -1)) != 0:
+            return None
+
+        result = bybit_body.get("result", {}) or {}
+        accounts_list = result.get("list", []) or []
+        req_member = (request_params or {}).get("memberId") or (request_params or {}).get("subUid")
+
+        normalized_accounts = []
+        for account in accounts_list:
+            account_type = account.get("accountType", "UNIFIED")
+            total_equity = _to_f(account.get("totalEquity"))
+
+            coins_out = []
+            for c in (account.get("coin", []) or []):
+                symbol          = c.get("coin", "UNKNOWN")
+                equity          = _to_f(c.get("equity"))
+                wallet_balance  = _to_f(c.get("walletBalance"))
+                order_margin    = _to_f(c.get("totalOrderIM"))
+                position_margin = _to_f(c.get("totalPositionIM"))
+                maint_margin    = _to_f(c.get("totalPositionMM"))
+                unreal          = _to_f(c.get("unrealisedPnl"))
+                realised        = _to_f(c.get("cumRealisedPnl"))
+                avail_wd        = c.get("availableToWithdraw")
+                avail_wd        = (_to_f(avail_wd) if avail_wd is not None else None)
+
+                # availableBalance = max(WB - OrderIM - PositionIM, 0). If WB missing, derive from equity - unreal.
+                if wallet_balance > 0:
+                    available_balance = wallet_balance - order_margin - position_margin
+                elif equity > 0:
+                    computed_wb = equity - unreal
+                    available_balance = computed_wb - order_margin - position_margin
+                else:
+                    available_balance = 0.0
+
+                if not math.isfinite(available_balance):
+                    available_balance = 0.0
+                available_balance = max(available_balance, 0.0)
+
+                coins_out.append({
+                    "coin": symbol,
+                    "equity": equity,
+                    "walletBalance": wallet_balance,
+                    "orderMargin": order_margin,
+                    "positionMargin": position_margin,
+                    "maintMargin": maint_margin,
+                    "unrealisedPnl": unreal,
+                    "realisedPnl": realised,
+                    "availableToWithdraw": avail_wd,
+                    "availableBalance": available_balance
+                })
+
+            totals = {
+                "availableBalance": float(sum(x["availableBalance"] for x in coins_out)),
+                "walletBalance": float(sum(x["walletBalance"]   for x in coins_out)),
+                "orderMargin": float(sum(x["orderMargin"]       for x in coins_out)),
+                "positionMargin": float(sum(x["positionMargin"] for x in coins_out)),
+            }
+
+            acc = {
+                "accountType": account_type,
+                "totalEquity": total_equity,
+                "coins": coins_out,
+                "totals": totals
+            }
+            if req_member:
+                acc["memberId"] = str(req_member)
+            normalized_accounts.append(acc)
+
+        return {"accounts": normalized_accounts}
+    except Exception as e:
+        log.error(f"[normalize_wallet_balance] {e}")
+        return None
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Registry helpers for sub accounts
 # ──────────────────────────────────────────────────────────────────────────────
 def _load_sub_uids() -> List[str]:
@@ -327,6 +422,26 @@ def diag_telegram():
         pass
     return _json_ok(ok=data.get("ok", False), chats=chats)
 
+@app.get("/diag/wallet-normalized")
+@require_auth
+def diag_wallet_normalized():
+    """Signed sanity check that availableBalance exists in normalized output."""
+    params = {"accountType": "UNIFIED"}
+    status, body = _http_call("GET", "/v5/account/wallet-balance", params, None)
+    if status != 200 or not isinstance(body, dict):
+        return _json_err(502, "bybit_error", status=status, body=body)
+    norm = normalize_wallet_balance(body, params) or {}
+    ok = False
+    sample = []
+    try:
+        accs = norm.get("accounts") or []
+        if accs:
+            sample = (accs[0].get("coins") or [])[:2]
+            ok = all("availableBalance" in c for c in sample)
+    except Exception:
+        ok = False
+    return _json_ok(has_availableBalance=ok, sample=sample, retCode=body.get("retCode"))
+
 # ---- Generic proxy (v5 only) ----
 @app.post("/bybit/proxy")
 @require_auth
@@ -337,7 +452,22 @@ def bybit_proxy():
     path = payload["path"]
     if not path.startswith("/v5/"):
         return _json_err(400, "only /v5/* paths are allowed")
+
     prox = bybit_proxy_internal(payload)
+
+    # Attach normalization when asking wallet-balance
+    try:
+        if path.endswith("/v5/account/wallet-balance"):
+            primary = prox.get("primary", {}) or {}
+            body = primary.get("body", {}) or {}
+            params = payload.get("params") or {}
+            normalized = normalize_wallet_balance(body, params)
+            if isinstance(body, dict):
+                body["normalized"] = normalized
+                prox["primary"]["body"] = body
+    except Exception as e:
+        log.error(f"[proxy] normalization error: {e}")
+
     return jsonify(prox)
 
 # ---- Native helpers ----
@@ -350,8 +480,11 @@ def wallet_balance_native():
     member = request.args.get("memberId") or request.args.get("subUid")
     if coin: params["coin"] = coin
     if member: params["memberId"] = member
-    prox = bybit_proxy_internal({"method": "GET", "path": "/v5/account/wallet-balance", "params": params})
-    return _passthrough_primary(prox)
+    status, body = _http_call("GET", "/v5/account/wallet-balance", params, None)
+    if not isinstance(body, dict):
+        return make_response(body or "", status)
+    body["normalized"] = normalize_wallet_balance(body, params)
+    return make_response(jsonify(body), status)
 
 @app.get("/bybit/positions")
 @require_auth
@@ -398,50 +531,67 @@ def bybit_subuids():
 def get_account_data():
     """
     Returns an ARRAY of accounts, always.
-    Each item: { uid, label, accountType, equity, walletBalance, unrealisedPnl }
+    Each item: { uid, label, accountType, equity, walletBalance, unrealisedPnl, availableBalance }
     Includes main, plus any registry/ sub_uids.csv if present.
     """
     coin = request.args.get("coin", "USDT")
     account_type = request.args.get("accountType", "UNIFIED")
 
-    accounts = []
+    accounts: List[Dict[str, Any]] = []
 
-    # main
-    params = {"accountType": account_type, "coin": coin}
-    d_main = bybit_proxy_internal({"method": "GET", "path": "/v5/account/wallet-balance", "params": params})
-    body_m = d_main.get("primary", {}).get("body", {}) or {}
-    lst_m  = (((body_m.get("result") or {}).get("list")) or [])
-    if lst_m:
-        r = lst_m[0]
+    def _pull_account(member_id: str | None, label: str):
+        params = {"accountType": account_type, "coin": coin}
+        if member_id:
+            params["memberId"] = member_id
+        status, body = _http_call("GET", "/v5/account/wallet-balance", params, None)
+        if status != 200 or not isinstance(body, dict):
+            return
+        norm = normalize_wallet_balance(body, params) or {}
+        # derive totals safely
+        total_equity = 0.0
+        wallet_balance = 0.0
+        unreal = 0.0
+        avail = 0.0
+        try:
+            # prefer normalized totals if present
+            accs = (norm.get("accounts") or [])
+            if accs:
+                totals = accs[0].get("totals") or {}
+                avail = float(totals.get("availableBalance") or 0.0)
+                wallet_balance = float(totals.get("walletBalance") or 0.0)
+                total_equity = float(accs[0].get("totalEquity") or 0.0)
+            else:
+                # fall back to raw shape
+                lst = ((body.get("result") or {}).get("list") or [])
+                if lst:
+                    a0 = lst[0]
+                    total_equity = float(a0.get("totalEquity") or 0.0)
+                    # Bybit doesn't give account-level walletBalance explicitly; compute from coins if available
+                    coins = a0.get("coin") or []
+                    wallet_balance = float(sum(float(c.get("walletBalance") or 0.0) for c in coins))
+                    unreal = float(sum(float(c.get("unrealisedPnl") or 0.0) for c in coins))
+                    # compute available from coins if missing normalization
+                    order_im = float(sum(float(c.get("totalOrderIM") or 0.0) for c in coins))
+                    pos_im   = float(sum(float(c.get("totalPositionIM") or 0.0) for c in coins))
+                    avail = max(wallet_balance - order_im - pos_im, 0.0)
+        except Exception:
+            pass
+
         accounts.append({
-            "uid": "main",
-            "label": "main",
+            "uid": member_id or "main",
+            "label": label,
             "accountType": account_type,
-            "equity": float(r.get("totalEquity") or 0),
-            "walletBalance": float(r.get("walletBalance") or 0),
-            "unrealisedPnl": float(r.get("unrealisedPnl") or 0),
+            "equity": total_equity,
+            "walletBalance": wallet_balance,
+            "unrealisedPnl": unreal,
+            "availableBalance": avail
         })
 
+    # main
+    _pull_account(None, "main")
     # subs (optional)
     for uid in _load_sub_uids():
-        params = {"accountType": account_type, "coin": coin, "memberId": uid}
-        d_sub = bybit_proxy_internal({"method": "GET", "path": "/v5/account/wallet-balance", "params": params})
-        body_s = d_sub.get("primary", {}).get("body", {}) or {}
-        lst_s  = (((body_s.get("result") or {}).get("list")) or [])
-        if lst_s:
-            r = lst_s[0]
-            accounts.append({
-                "uid": uid,
-                "label": _pretty_name(uid),
-                "accountType": account_type,
-                "equity": float(r.get("totalEquity") or 0),
-                "walletBalance": float(r.get("walletBalance") or 0),
-                "unrealisedPnl": float(r.get("unrealisedPnl") or 0),
-            })
-
-    # normalize to array, always
-    if not isinstance(accounts, list):
-        accounts = [accounts] if accounts else []
+        _pull_account(uid, _pretty_name(uid))
 
     return jsonify(accounts), 200
 
@@ -471,8 +621,11 @@ def legacy_wallet_balance():
     member = request.args.get("memberId") or request.args.get("subUid")
     if coin: params["coin"] = coin
     if member: params["memberId"] = member
-    prox = bybit_proxy_internal({"method": "GET", "path": "/v5/account/wallet-balance", "params": params})
-    return _passthrough_primary(prox)
+    status, body = _http_call("GET", "/v5/account/wallet-balance", params, None)
+    if not isinstance(body, dict):
+        return make_response(body or "", status)
+    body["normalized"] = normalize_wallet_balance(body, params)
+    return make_response(jsonify(body), status)
 
 @app.get("/v1/order/realtime")
 @require_auth
