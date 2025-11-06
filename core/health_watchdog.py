@@ -19,8 +19,13 @@ What it does:
 - Tracks EWMA latency for noisy links and rate-limits repetitive alerts.
 - Optional CSV logging of each probe.
 
+Enhancement:
+- If RELAY_TOKEN is set (or HW_RELAY_TOKEN), automatically inject Authorization and x-relay-token headers unless already provided via HW_HEADERS_JSON.
+
 Env vars (all optional unless noted):
 - RELAY_BASE                      : base URL (default http://127.0.0.1:8080)
+- RELAY_TOKEN                     : bearer/x-relay-token for protected health endpoints
+- HW_RELAY_TOKEN                  : override token for this watchdog only
 - HW_POLL_SEC                     : seconds between probes (default 20)
 - HW_JITTER_MS                    : random jitter added to each poll (default 250)
 - HW_TIMEOUT_SEC                  : HTTP timeout per attempt (default 10)
@@ -136,11 +141,22 @@ STARTUP_GRACE_SEC     = _env_int("HW_STARTUP_GRACE_SEC", 10)
 VERIFY_TLS            = _env_int("HW_VERIFY_TLS", 1) == 1
 LOG_CSV               = os.getenv("HW_LOG_CSV", "").strip()
 
+# Optional auth: prefer HW_RELAY_TOKEN override, else RELAY_TOKEN from .env
+RELAY_TOKEN           = (os.getenv("HW_RELAY_TOKEN") or os.getenv("RELAY_TOKEN") or os.getenv("RELAY_SECRET") or "").strip()
+
 DEFAULT_HEADERS = {
-    "User-Agent": "Base44-HealthWatchdog/1.1",
+    "User-Agent": "Base44-HealthWatchdog/1.2",
     "Accept": "application/json, text/plain;q=0.8, */*;q=0.5",
 }
 HEADERS = {**DEFAULT_HEADERS, **CUSTOM_HEADERS}
+
+# If a token is present and caller didn’t explicitly override Authorization/x-relay-token, inject them.
+if RELAY_TOKEN:
+    lower_keys = {k.lower() for k in HEADERS.keys()}
+    if "authorization" not in lower_keys:
+        HEADERS["Authorization"] = f"Bearer {RELAY_TOKEN}"
+    if "x-relay-token" not in lower_keys:
+        HEADERS["x-relay-token"] = RELAY_TOKEN
 
 # ----- logging -----------------------------------------------------------------
 def _log_csv(ts_iso: str, status: int, ms: int, ok: bool, note: str):
@@ -181,14 +197,14 @@ def _probe_once():
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT_SEC, verify=VERIFY_TLS)
         ct = resp.headers.get("content-type","")
         json_obj = None
-        if ct.startswith("application/json"):
+        if ct and ct.startswith("application/json"):
             try:
                 json_obj = resp.json()
                 body_text = json.dumps(json_obj, ensure_ascii=False)
             except Exception:
-                body_text = resp.text
+                body_text = resp.text or ""
         else:
-            body_text = resp.text
+            body_text = resp.text or ""
     ms = int((time.perf_counter() - t0) * 1000)
     return resp.status_code, ms, body_text, json_obj
 
@@ -207,7 +223,7 @@ def _probe():
 # ----- main loop ---------------------------------------------------------------
 def main():
     print(f"Health Watchdog → {RELAY_BASE}{PATH} every {POLL_SEC}s ±{JITTER_MS}ms "
-          f"(warn>{WARN_MS}ms, crit>{CRIT_MS}ms, timeout={TIMEOUT_SEC}s, retries={RETRIES}, verifyTLS={VERIFY_TLS})")
+          f"(warn>{WARN_MS}ms, crit>{CRIT_MS}ms, timeout={TIMEOUT_SEC}s, retries={RETRIES}, verifyTLS={VERIFY_TLS}, auth={'on' if RELAY_TOKEN else 'off'})")
 
     boot_ts = time.time()
     consecutive_fail = 0
