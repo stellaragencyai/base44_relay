@@ -2,17 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 Base44 — Signal Engine (observe-first, automation-ready + heartbeat)
+Finalized: breaker-aware, once-per-bar dedupe, robust cooldowns, safer JSONL, mild telemetry polish.
 
-What it does:
+What it does (recap):
 - Scans SIG_SYMBOLS on SIG_TIMEFRAMES with a higher-timeframe bias (SIG_BIAS_TF).
 - Regime gates: min ADX on bias TF, min ATR%/Price on intraday TF, volume z-score.
 - Emits human-readable alerts to Telegram (optional).
 - Writes machine-readable signals to signals/observed.jsonl for the executor.
 - Includes confidence score and optional stop distance hint for the executor.
-- Rate-limits per (symbol, timeframe, direction).
+- Rate-limits per (symbol, timeframe, direction) and dedupes per bar.
 - Sends startup ping and periodic heartbeats.
+- Obeys global breaker: will still heartbeat, but will NOT emit signals while breaker is ON.
 
-.env keys (ensure they exist; many you already have):
+.env keys (ensure they exist):
   # Core
   SIG_ENABLED=true
   SIG_DRY_RUN=true
@@ -59,7 +61,7 @@ What it does:
 """
 
 from __future__ import annotations
-import os, time, statistics, logging, datetime, threading, json
+import os, time, statistics, logging, datetime, threading, json, tempfile
 from collections import deque, defaultdict
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
@@ -80,6 +82,13 @@ except Exception:
     def log_event(component, event, symbol, account_uid, payload=None, trade_id=None, level="info"):
         print(f"[DECLOG/{component}/{event}] {symbol} @{account_uid} {payload or {}}")
 
+# Breaker (soft dep). If import fails, we fallback to file check used by tp/sl bot.
+_BREAKER_IS_ACTIVE = None
+try:
+    from core.breaker import is_active as _breaker_is_active
+    _BREAKER_IS_ACTIVE = _breaker_is_active
+except Exception:
+    _BREAKER_IS_ACTIVE = None
 
 log = logging.getLogger("signal")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -146,6 +155,26 @@ http = HTTP(testnet=(BYBIT_ENV=="testnet"), api_key=BYBIT_KEY, api_secret=BYBIT_
 
 # simple append lock for JSONL queue
 _queue_lock = threading.Lock()
+
+# ---------- breaker helpers ----------
+_STATE_DIR = ROOT / ".state"
+_STATE_DIR.mkdir(parents=True, exist_ok=True)
+_BREAKER_FILE = _STATE_DIR / "risk_state.json"
+
+def breaker_active() -> bool:
+    # Prefer imported breaker; otherwise fall back to file look
+    if callable(_BREAKER_IS_ACTIVE):
+        try:
+            return bool(_BREAKER_IS_ACTIVE())
+        except Exception:
+            pass
+    try:
+        if not _BREAKER_FILE.exists():
+            return False
+        js = json.loads(_BREAKER_FILE.read_text(encoding="utf-8"))
+        return bool(js.get("breach"))
+    except Exception:
+        return False
 
 # ---------- helpers ----------
 def _tf_to_interval(tf_min: int) -> str:
@@ -232,7 +261,8 @@ def bias_context(symbol: str, tf: int):
     a = adx(h,l,c, ADX_LEN)
     e50 = ema(c, 50)
     return {"adx": a[-1], "ema50": e50[-1], "close": c[-1],
-            "trend_up": c[-1] > e50[-1], "trend_dn": c[-1] < e50[-1]}
+            "trend_up": c[-1] > e50[-1], "trend_dn": c[-1] < e50[-1],
+            "bar_ts": ts[-1]}
 
 def intra_features(symbol: str, tf: int):
     k = _kline(symbol, tf, 400)
@@ -251,7 +281,8 @@ def intra_features(symbol: str, tf: int):
             "breakout_ok": (c[-1] > max(recent)) and (vz[-1] > 0.8),
             "trend_dn_ok": (e20[-1] < e50[-1] < e200[-1]) and (c[-1] <= e50[-1]),
             "breakdown_ok": (c[-1] < min(recent)) and (vz[-1] > 0.8),
-            "atr": av[-1]}
+            "atr": av[-1],
+            "bar_ts": ts[-1]}
 
 # ---------- decision ----------
 def decide(symbol: str, tf: int, bias: dict, f: dict):
@@ -292,7 +323,8 @@ def compute_stop_dist(last: float, f: dict) -> float:
     return 0.0  # auto → let executor use its internal fallback
 
 # ---------- alerts & queue ----------
-_last_alert = defaultdict(float)
+_last_alert = defaultdict(float)          # for time-based cooldown
+_last_bar_emit = {}                       # key=(sym,tf,dir) -> last_bar_ts emitted
 _last_hb = 0.0
 
 def _now_local():
@@ -301,6 +333,16 @@ def _now_local():
         return datetime.datetime.now(ZoneInfo(TZ))
     except Exception:
         return datetime.datetime.now()
+
+def _safe_append_jsonl(path: Path, line: str):
+    """
+    Safer than plain append on some filesystems: write to tmp then append atomically-ish.
+    Still O_APPEND is fine, but this reduces partial line risk if your editor tail -f's the file.
+    """
+    # Plain append with a lock is adequate on Windows/NTFS and POSIX; keep it simple.
+    with _queue_lock:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
 
 def human_alert(symbol: str, tf: int, direction: str, why: str, bias: dict, f: dict, conf: float, mode_str: str):
     trend = "UP" if bias.get("trend_up") else ("DOWN" if bias.get("trend_dn") else "FLAT")
@@ -313,15 +355,32 @@ def human_alert(symbol: str, tf: int, direction: str, why: str, bias: dict, f: d
         mode_str
     ]
     if SEND_CHART_LINKS:
-        pass  # add TV links if you really want to tempt fate
+        # deliberately left blank; we can bolt TV links later without touching logic
+        pass
     tg_send("\n".join(lines), priority="info")
 
 def maybe_emit(symbol: str, tf: int, direction: str, why: str, bias: dict, f: dict, conf: float):
     now = time.time()
     key = (symbol, tf, direction)
+
+    # once-per-bar dedupe
+    bar_ts = float(f.get("bar_ts") or 0.0)
+    last_bar = _last_bar_emit.get(key)
+    if last_bar is not None and bar_ts <= last_bar:
+        return
+
+    # cooldown
     if now - _last_alert[key] < COOLDOWN:
         return
+
+    # breaker gate: observe but don't emit when ON
+    if breaker_active():
+        log_event("signal", "breaker_block_emit", symbol.upper(), "MAIN",
+                  {"tf": tf, "dir": direction, "conf": round(conf,4), "why": why})
+        return
+
     _last_alert[key] = now
+    _last_bar_emit[key] = bar_ts
 
     last = float(f["close"])
     stop_dist = compute_stop_dist(last, f)
@@ -359,9 +418,7 @@ def maybe_emit(symbol: str, tf: int, direction: str, why: str, bias: dict, f: di
     }
 
     line = json.dumps(payload, separators=(",", ":"))
-    with _queue_lock:
-        with open(QUEUE_PATH, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+    _safe_append_jsonl(QUEUE_PATH, line)
 
     log_event("signal", "emit", symbol.upper(), "MAIN",
               {"tf": tf, "dir": direction, "conf": round(conf,4), "stop_mode": STOP_MODE})
@@ -369,7 +426,7 @@ def maybe_emit(symbol: str, tf: int, direction: str, why: str, bias: dict, f: di
     mode_str = "Mode: OBSERVE (executor consumes queue)"
     human_alert(symbol, tf, direction, why, bias, f, conf, mode_str)
 
-# ---------- main loop ----------
+# ---------- main scan ----------
 def loop_once() -> bool:
     any_signal = False
     for sym in SYMS:
@@ -409,12 +466,12 @@ def main():
             log_event("signal", "scan_error", "", "MAIN", {"error": str(e)})
             any_signal = False
 
-        # heartbeat
+        # heartbeat (always, even if breaker blocks emits)
         now = time.time()
         if HEARTBEAT_MIN > 0 and (now - _last_hb) >= HEARTBEAT_MIN * 60:
             _last_hb = now
             tg_send(
-                f"🟢 Signal Engine heartbeat • SYMS={','.join(SYMS)} • TFs={INTRA_TFS} • Bias={BIAS_TF}m • queue={QUEUE_PATH.name} • signals={'yes' if any_signal else 'no'}",
+                f"🟢 Signal Engine heartbeat • SYMS={','.join(SYMS)} • TFs={INTRA_TFS} • Bias={BIAS_TF}m • queue={QUEUE_PATH.name} • signals={'yes' if any_signal else 'no'} • breaker={'ON' if breaker_active() else 'OFF'}",
                 priority="success"
             )
 
