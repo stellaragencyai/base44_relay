@@ -1,0 +1,22 @@
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial; background: #0b0c0f; color: #e6e6e6; }
+header { padding: 16px 20px; border-bottom: 1px solid #1a1d24; background: #0e1015; }
+h1 { margin: 0 0 6px 0; font-size: 20px; }
+p { margin: 0; color: #8b92a1; }
+.grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 12px; padding: 14px; }
+.card { grid-column: span 4; background: #12151c; border: 1px solid #1a1d24; border-radius: 10px; padding: 12px 14px; min-height: 110px; }
+.card.wide { grid-column: span 12; }
+.loading { color: #6b7280; }
+h2 { font-size: 16px; margin: 0 0 10px 0; color: #eaeef9; }
+.kv { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px dashed #1f2430; }
+.kv:last-child { border-bottom: none; }
+.ok { color: #55d38a; }
+.warn { color: #e9c46a; }
+.err { color: #ef6a6a; }
+.tab { width: 100%; border-collapse: collapse; }
+.tab th, .tab td { text-align: left; border-bottom: 1px solid #1a1d24; padding: 6px 8px; font-size: 13px; }
+.tab thead th { color: #aab4c4; font-weight: 600; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.small { font-size: 12px; opacity: .8; }
+@media (max-width: 1100px) { .card { grid-column: span 12; } }

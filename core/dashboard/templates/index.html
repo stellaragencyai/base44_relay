@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Base44 Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+  <header>
+    <h1>Base44 — Glass Cockpit</h1>
+    <p>Read-only. If something’s red, it’s your fault.</p>
+  </header>
+
+  <section class="grid">
+    <div class="card" hx-get="/api/summary" hx-trigger="load,every {{ refresh_ms }}ms" hx-swap="innerHTML">
+      <div class="loading">Loading summary…</div>
+    </div>
+
+    <div class="card" hx-get="/api/breaker" hx-trigger="load,every {{ refresh_ms }}ms" hx-swap="innerHTML">
+      <div class="loading">Loading breaker…</div>
+    </div>
+
+    <div class="card wide" hx-get="/api/positions" hx-trigger="load,every {{ refresh_ms }}ms" hx-swap="innerHTML">
+      <div class="loading">Loading positions…</div>
+    </div>
+
+    <div class="card wide" hx-get="/api/orders" hx-trigger="load,every {{ refresh_ms }}ms" hx-swap="innerHTML">
+      <div class="loading">Loading orders…</div>
+    </div>
+
+    <div class="card" hx-get="/api/health" hx-trigger="load,every {{ refresh_ms }}ms" hx-swap="innerHTML">
+      <div class="loading">Loading health…</div>
+    </div>
+  </section>
+
+  <template id="summary-template"></template>
+  <script>
+    document.body.addEventListener('htmx:afterOnLoad', function(evt) {
+      const path = evt.detail.pathInfo && evt.detail.pathInfo.requestPath;
+      if (!path) return;
+      const el = evt.detail.elt;
+
+      function fmt(n){ return (n===null||n===undefined) ? '—' : Number(n).toLocaleString(undefined, {maximumFractionDigits:2}); }
+
+      if (path === '/api/summary') {
+        const d = evt.detail.xhr.response ? JSON.parse(evt.detail.xhr.response) : {};
+        el.innerHTML = `
+          <h2>Summary</h2>
+          <div class="kv"><span>Total:</span><b>$${fmt(d.total)}</b></div>
+          <div class="kv"><span>Baseline:</span><b>$${fmt(d.baseline_total)}</b></div>
+          <div class="kv"><span>DD:</span><b class="${d.dd_pct>0 ? 'warn':''}">${fmt(d.dd_pct)}%</b></div>
+          <details><summary>By account</summary><pre>${JSON.stringify(d.by_account, null, 2)}</pre></details>
+        `;
+      }
+
+      if (path === '/api/breaker') {
+        const b = JSON.parse(evt.detail.xhr.response || "{}");
+        el.innerHTML = `
+          <h2>Breaker</h2>
+          <div class="kv"><span>Active:</span><b class="${b.active ? 'err':'ok'}">${b.active ? 'ON':'OFF'}</b></div>
+          <div class="kv"><span>Reason:</span><b>${b.reason||'—'}</b></div>
+          <div class="kv"><span>TTL:</span><b>${b.ttl||0}s</b></div>
+        `;
+      }
+
+      if (path === '/api/positions') {
+        const p = JSON.parse(evt.detail.xhr.response || '{"rows":[]}');
+        const rows = p.rows || [];
+        el.innerHTML = `
+          <h2>Positions</h2>
+          <table class="tab">
+            <thead><tr><th>Acct</th><th>Symbol</th><th>Side</th><th>Size</th><th>Avg</th><th>U-PnL</th><th>Lev</th></tr></thead>
+            <tbody>
+            ${rows.map(r=>`
+              <tr>
+                <td>${r.account}</td><td>${r.symbol}</td><td>${r.side}</td>
+                <td>${r.size}</td><td>${r.avgPrice}</td><td>${r.unrealizedPnl}</td><td>${r.leverage}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        `;
+      }
+
+      if (path === '/api/orders') {
+        const o = JSON.parse(evt.detail.xhr.response || '{"rows":[]}');
+        const rows = o.rows || [];
+        el.innerHTML = `
+          <h2>Reduce-only TP Orders</h2>
+          <table class="tab">
+            <thead><tr><th>Acct</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Link</th></tr></thead>
+            <tbody>
+            ${rows.map(r=>`
+              <tr>
+                <td>${r.account}</td><td>${r.symbol}</td><td>${r.side}</td>
+                <td>${r.qty}</td><td>${r.price}</td><td class="mono">${r.orderLinkId||''}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        `;
+      }
+
+      if (path === '/api/health') {
+        const h = JSON.parse(evt.detail.xhr.response || '{"rows":[]}');
+        el.innerHTML = `
+          <h2>Health</h2>
+          <table class="tab">
+            <thead><tr><th>Component</th><th>Status</th><th>Age</th><th>Path</th></tr></thead>
+            <tbody>
+              ${h.rows.map(r => `
+                <tr>
+                  <td>${r.component}</td>
+                  <td class="${r.status==='ok'?'ok':(r.status==='stale'?'warn':'err')}">${r.status}</td>
+                  <td>${r.age_sec===null?'—':(r.age_sec+'s')}</td>
+                  <td class="mono small">${r.path}</td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        `;
+      }
+    });
+  </script>
+</body>
+</html>
