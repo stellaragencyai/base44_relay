@@ -1,40 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 — Bybit v5 Client (zero external deps)
+Base44 — Bybit v5 Client (zero external deps, subaccount-aware)
 
 Goals
 - One tiny, dependable wrapper for Bybit v5.
-- Works with mainnet/testnet via core.config.settings.
+- Works with mainnet/testnet via core.config.settings (auto base_url fallback).
 - Signed private requests, robust timestamp handling with drift correction.
 - Simple retry policy for flaky network and timestamp errors.
 - Proxy support via settings.PROXY_URL.
 - Helpful logging that doesn't drown you.
+- Compatible with existing bots that expect:
+    • (ok, data, err) tuples
+    • Bybit.PRIVATE_EXTRA_KEYS = ("memberId", "subUid")
+    • Ability to pass memberId/subUid into private endpoints
 
 Usage
     from core.bybit_client import Bybit
-    from core.logger import get_logger
-
-    log = get_logger("core.bybit_client.demo")
     by = Bybit()
-
     ok, data, err = by.get_wallet_balance(coin="USDT")
-    if not ok:
-        log.error("balance fail: %s", err)
-    else:
-        log.info("balance: %s", data)
-
-Design notes
-- No third-party HTTP libs (uses urllib).
-- Returns (ok, data, err) everywhere:
-    ok=True  -> data=dict (server JSON 'result' or full data)
-    ok=False -> err=str   (human-readable), data may hold raw response
-- Does not throw unless you asked for it; your bots shouldn't crash on a 10010.
-
-Caveats
-- You’re responsible for providing valid API keys and IP permissions on Bybit.
-- This file doesn’t place position-level TP via set_trading_stop because you told me not to earlier. Add it if you want.
-
 """
 
 from __future__ import annotations
@@ -53,6 +37,15 @@ from core.logger import get_logger
 
 log = get_logger("core.bybit_client")
 
+# ---------- module defaults ----------
+DEFAULT_TIMEOUT_S = getattr(settings, "HTTP_TIMEOUT_S", 15)
+DEFAULT_ENV = (getattr(settings, "BYBIT_ENV", "mainnet") or "mainnet").strip().lower()
+
+def _env_base_url(env: str) -> str:
+    if env == "testnet":
+        return "https://api-testnet.bybit.com"
+    return "https://api.bybit.com"
+
 # ---------- helpers ----------
 
 def _now_ms_utc() -> int:
@@ -68,9 +61,20 @@ def _build_opener(proxy_url: Optional[str]):
         return urllib.request.build_opener(urllib.request.ProxyHandler(proxy))
     return urllib.request.build_opener()
 
+def _with_extra(d: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+    """Whitelists known subaccount-scoping keys into params/body."""
+    for k in ("memberId", "subUid"):
+        v = extra.get(k)
+        if v is not None and v != "":
+            d[k] = v
+    return d
+
 # ---------- client ----------
 
 class Bybit:
+    # Compatibility shim some of your code references
+    PRIVATE_EXTRA_KEYS = ("memberId", "subUid")
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -80,12 +84,16 @@ class Bybit:
         max_retries: int = 3,
         proxy_url: Optional[str] = None,
     ):
-        self.api_key = (api_key or settings.BYBIT_API_KEY or "").strip()
-        self.api_secret = (api_secret or settings.BYBIT_API_SECRET or "").strip()
-        self.base_url = (base_url or settings.BYBIT_BASE_URL).rstrip("/")
-        self.recv_window_ms = recv_window_ms
-        self.max_retries = max_retries
-        self.opener = _build_opener(proxy_url or settings.PROXY_URL)
+        self.api_key = (api_key or getattr(settings, "BYBIT_API_KEY", "") or "").strip()
+        self.api_secret = (api_secret or getattr(settings, "BYBIT_API_SECRET", "") or "").strip()
+
+        env = (getattr(settings, "BYBIT_ENV", DEFAULT_ENV) or DEFAULT_ENV).strip().lower()
+        inferred_base = _env_base_url(env)
+        self.base_url = (base_url or getattr(settings, "BYBIT_BASE_URL", inferred_base) or inferred_base).rstrip("/")
+
+        self.recv_window_ms = int(recv_window_ms)
+        self.max_retries = max(0, int(max_retries))
+        self.opener = _build_opener(proxy_url or getattr(settings, "PROXY_URL", None))
         self._time_delta_ms = 0  # server_time - local_time
 
         if not self.api_key or not self.api_secret:
@@ -102,7 +110,7 @@ class Bybit:
             log.warning("[bybit] time sync failed: %s", err)
             return False
         try:
-            # Bybit returns {"retCode":0,"retMsg":"OK","result":{"timeSecond":"...","timeNano":"..."}}
+            # {"retCode":0,"retMsg":"OK","result":{"timeSecond":"...","timeNano":"..."}}
             server_ms = int(data["result"]["timeSecond"]) * 1000
             local_ms = _now_ms_utc()
             self._time_delta_ms = server_ms - local_ms
@@ -145,7 +153,7 @@ class Bybit:
 
         req = urllib.request.Request(url=url, method=method)
         try:
-            with self.opener.open(req, timeout=settings.HTTP_TIMEOUT_S) as resp:
+            with self.opener.open(req, timeout=DEFAULT_TIMEOUT_S) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
             raw = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
@@ -158,7 +166,7 @@ class Bybit:
         except Exception:
             return False, {}, f"bad json: {raw[:300]}"
 
-        if data.get("retCode") == 0 or data.get("ok") is True:
+        if data.get("retCode") in (0, "0") or data.get("ok") is True:
             return True, data, ""
         return False, data, f"retCode={data.get('retCode')} retMsg={data.get('retMsg')}"
 
@@ -173,10 +181,12 @@ class Bybit:
 
         attempt = 0
         last_err = ""
+        payload_base = body or {}
+
         while attempt < self.max_retries:
             attempt += 1
             ts = self._ts_ms()
-            payload_str = _json_dumps(body or {})
+            payload_str = _json_dumps(payload_base)
             sign = self._sign(ts, payload_str)
             headers = self._headers_private(ts, sign)
 
@@ -184,12 +194,12 @@ class Bybit:
             req = urllib.request.Request(url=url, data=payload_str.encode("utf-8"), headers=headers, method=method)
 
             try:
-                with self.opener.open(req, timeout=settings.HTTP_TIMEOUT_S) as resp:
+                with self.opener.open(req, timeout=DEFAULT_TIMEOUT_S) as resp:
                     raw = resp.read().decode("utf-8", errors="replace")
             except urllib.error.HTTPError as e:
                 raw = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
                 code = e.code
-                # Retry 400/401 only if timestamp related
+                # Retry 400/401 if timestamp/recvWindow related
                 if self._should_resync(raw):
                     self.sync_time()
                     last_err = f"HTTP {code} {raw[:300]}"
@@ -207,9 +217,9 @@ class Bybit:
                 return False, {}, f"bad json: {raw[:300]}"
 
             rc = data.get("retCode")
-            if rc == 0:
+            if rc in (0, "0"):
                 return True, data, ""
-            # Common timestamp/expiry issues -> resync and retry
+            # Timestamp/expiry issues -> resync and retry
             if self._should_resync(json.dumps(data)):
                 self.sync_time()
                 last_err = f"retCode={rc} retMsg={data.get('retMsg')}"
@@ -247,7 +257,7 @@ class Bybit:
             req = urllib.request.Request(url=url, headers=headers, method=method)
 
             try:
-                with self.opener.open(req, timeout=settings.HTTP_TIMEOUT_S) as resp:
+                with self.opener.open(req, timeout=DEFAULT_TIMEOUT_S) as resp:
                     raw = resp.read().decode("utf-8", errors="replace")
             except urllib.error.HTTPError as e:
                 raw = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
@@ -268,7 +278,7 @@ class Bybit:
                 return False, {}, f"bad json: {raw[:300]}"
 
             rc = data.get("retCode")
-            if rc == 0:
+            if rc in (0, "0"):
                 return True, data, ""
             if self._should_resync(json.dumps(data)):
                 self.sync_time()
@@ -285,27 +295,54 @@ class Bybit:
         # Bybit will often say invalid timestamp or expired recv window
         return ("timestamp" in s and ("invalid" in s or "expired" in s)) or "recvwindow" in s
 
-    # ----- convenience wrappers (you’ll actually use these) -----
+    # ----- convenience wrappers (public) -----
 
-    # Public
     def get_tickers(self, category: str = "linear", symbol: Optional[str] = None) -> Tuple[bool, Dict[str, Any], str]:
         params = {"category": category}
         if symbol:
             params["symbol"] = symbol
         return self._request_public("/v5/market/tickers", params=params)
 
-    # Private
-    def get_wallet_balance(self, accountType: str = "UNIFIED", coin: Optional[str] = None) -> Tuple[bool, Dict[str, Any], str]:
-        params = {"accountType": accountType}
+    # ----- convenience wrappers (private, subaccount-aware) -----
+
+    def get_wallet_balance(
+        self,
+        accountType: str = "UNIFIED",
+        coin: Optional[str] = None,
+        **extra,   # may include memberId or subUid
+    ) -> Tuple[bool, Dict[str, Any], str]:
+        params: Dict[str, Any] = {"accountType": accountType}
         if coin:
             params["coin"] = coin
+        params = _with_extra(params, extra)
         return self._request_private_query("/v5/account/wallet-balance", params=params)
 
-    def get_positions(self, category: str = "linear", symbol: Optional[str] = None) -> Tuple[bool, Dict[str, Any], str]:
-        params = {"category": category}
+    def get_positions(
+        self,
+        category: str = "linear",
+        symbol: Optional[str] = None,
+        **extra,   # may include memberId or subUid
+    ) -> Tuple[bool, Dict[str, Any], str]:
+        params: Dict[str, Any] = {"category": category}
         if symbol:
             params["symbol"] = symbol
+        params = _with_extra(params, extra)
         return self._request_private_query("/v5/position/list", params=params)
+
+    def get_open_orders(
+        self,
+        category: str,
+        symbol: Optional[str] = None,
+        openOnly: bool = True,
+        **extra,   # may include memberId or subUid
+    ) -> Tuple[bool, Dict[str, Any], str]:
+        params: Dict[str, Any] = {"category": category}
+        if symbol:
+            params["symbol"] = symbol
+        if openOnly is not None:
+            params["openOnly"] = int(bool(openOnly))
+        params = _with_extra(params, extra)
+        return self._request_private_query("/v5/order/realtime", params=params)
 
     def place_order(
         self,
@@ -324,7 +361,7 @@ class Bybit:
         stopLoss: Optional[str] = None,
         tpslMode: Optional[str] = None,  # "Full" | "Partial"
         marketUnit: Optional[str] = None,  # "baseCoin" | "quoteCoin"
-        # add other fields as needed
+        **extra,   # may include memberId or subUid
     ) -> Tuple[bool, Dict[str, Any], str]:
         body: Dict[str, Any] = {
             "category": category,
@@ -353,6 +390,7 @@ class Bybit:
         if marketUnit is not None:
             body["marketUnit"] = marketUnit
 
+        body = _with_extra(body, extra)
         return self._request_private_json("/v5/order/create", body=body, method="POST")
 
     def cancel_order(
@@ -361,16 +399,14 @@ class Bybit:
         symbol: str,
         orderId: Optional[str] = None,
         orderLinkId: Optional[str] = None,
+        **extra,   # may include memberId or subUid
     ) -> Tuple[bool, Dict[str, Any], str]:
-        body: Dict[str, Any] = {
-            "category": category,
-            "symbol": symbol,
-        }
+        body: Dict[str, Any] = {"category": category, "symbol": symbol}
         if orderId:
             body["orderId"] = orderId
         if orderLinkId:
             body["orderLinkId"] = orderLinkId
-
+        body = _with_extra(body, extra)
         return self._request_private_json("/v5/order/cancel", body=body, method="POST")
 
     def cancel_all(
@@ -379,6 +415,7 @@ class Bybit:
         symbol: Optional[str] = None,
         baseCoin: Optional[str] = None,
         settleCoin: Optional[str] = None,
+        **extra,   # may include memberId or subUid
     ) -> Tuple[bool, Dict[str, Any], str]:
         body: Dict[str, Any] = {"category": category}
         if symbol:
@@ -387,21 +424,49 @@ class Bybit:
             body["baseCoin"] = baseCoin
         if settleCoin:
             body["settleCoin"] = settleCoin
-
+        body = _with_extra(body, extra)
         return self._request_private_json("/v5/order/cancel-all", body=body, method="POST")
 
-    def get_open_orders(
-        self, category: str, symbol: Optional[str] = None, openOnly: bool = True
-    ) -> Tuple[bool, Dict[str, Any], str]:
-        params: Dict[str, Any] = {"category": category}
-        if symbol:
-            params["symbol"] = symbol
-        if openOnly is not None:
-            params["openOnly"] = int(bool(openOnly))
-        return self._request_private_query("/v5/order/realtime", params=params)
+    # Optional helpers many bots expect; safe to keep here
 
-    # Example of position TP/SL adjust if you re-enable it later:
-    # def set_trading_stop(...): return self._request_private_json("/v5/position/trading-stop", body=payload)
+    def set_leverage(
+        self,
+        category: str = "linear",
+        symbol: str = "",
+        buyLeverage: str = "1",
+        sellLeverage: str = "1",
+        **extra,
+    ) -> Tuple[bool, Dict[str, Any], str]:
+        body: Dict[str, Any] = {
+            "category": category,
+            "symbol": symbol,
+            "buyLeverage": buyLeverage,
+            "sellLeverage": sellLeverage,
+        }
+        body = _with_extra(body, extra)
+        return self._request_private_json("/v5/position/set-leverage", body=body, method="POST")
+
+    def set_trading_stop(
+        self,
+        category: str = "linear",
+        symbol: str = "",
+        positionIdx: Optional[int] = None,
+        takeProfit: Optional[str] = None,
+        stopLoss: Optional[str] = None,
+        tpslMode: Optional[str] = None,
+        **extra,
+    ) -> Tuple[bool, Dict[str, Any], str]:
+        body: Dict[str, Any] = {"category": category, "symbol": symbol}
+        if positionIdx is not None:
+            body["positionIdx"] = positionIdx
+        if takeProfit is not None:
+            body["takeProfit"] = takeProfit
+        if stopLoss is not None:
+            body["stopLoss"] = stopLoss
+        if tpslMode is not None:
+            body["tpslMode"] = tpslMode
+        body = _with_extra(body, extra)
+        return self._request_private_json("/v5/position/trading-stop", body=body, method="POST")
 
 # ---------- self-test ----------
 
@@ -415,12 +480,12 @@ if __name__ == "__main__":
 
     ok, data, err = by.get_tickers(category="linear", symbol="BTCUSDT")
     if ok:
-        print("Tickers OK:", _json_dumps(data.get("result", {}) )[:300])
+        print("Tickers OK:", _json_dumps(data.get("result", {}))[:300])
     else:
         print("Tickers ERR:", err)
 
     ok, data, err = by.get_wallet_balance(coin="USDT")
     if ok:
-        print("Balance OK:", _json_dumps(data.get("result", {}) )[:300])
+        print("Balance OK:", _json_dumps(data.get("result", {}))[:300])
     else:
         print("Balance ERR:", err)
