@@ -4,5 +4,10 @@
   "max_dd_pct": 3.0,
   "details": {
     "note": "cleared; no active breaches"
-  }
+  },
+  "version": 1,
+  "reason": "smoke_test",
+  "ts": 1762546341,
+  "ttl": 0,
+  "source": "cli"
 }

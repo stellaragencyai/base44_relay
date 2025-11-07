@@ -34,3 +34,10 @@
 2025-11-07 16:43:45 | WARNING | risk_daemon | risk loop error: 'Bybit' object has no attribute 'PRIVATE_EXTRA_KEYS'
 2025-11-07 17:13:45 | WARNING | risk_daemon | risk loop error: 'Bybit' object has no attribute 'PRIVATE_EXTRA_KEYS'
 2025-11-07 17:43:46 | WARNING | risk_daemon | risk loop error: 'Bybit' object has no attribute 'PRIVATE_EXTRA_KEYS'
+2025-11-07 18:13:47 | WARNING | risk_daemon | risk loop error: 'Bybit' object has no attribute 'PRIVATE_EXTRA_KEYS'
+2025-11-07 18:43:48 | WARNING | risk_daemon | risk loop error: 'Bybit' object has no attribute 'PRIVATE_EXTRA_KEYS'
+2025-11-07 19:13:49 | WARNING | risk_daemon | risk loop error: 'Bybit' object has no attribute 'PRIVATE_EXTRA_KEYS'
+2025-11-07 19:43:50 | WARNING | risk_daemon | risk loop error: 'Bybit' object has no attribute 'PRIVATE_EXTRA_KEYS'
+2025-11-07 20:13:44 | INFO | core.bybit_client | [bybit] time synced: delta=-1043ms
+2025-11-07 20:13:50 | WARNING | risk_daemon | risk loop error: 'Bybit' object has no attribute 'PRIVATE_EXTRA_KEYS'
+2025-11-07 20:13:51 | WARNING | risk_daemon | risk loop error: unsupported operand type(s) for *: 'decimal.Decimal' and 'float'

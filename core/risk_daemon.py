@@ -54,11 +54,7 @@ Env (.env)
 """
 
 from __future__ import annotations
-import os
-import json
-import time
-import logging
-import datetime
+import os, json, time, logging, datetime
 from decimal import Decimal, getcontext
 from pathlib import Path
 from typing import Dict, Tuple, Optional
@@ -72,7 +68,7 @@ except Exception:
     def tg_send(msg: str, priority: str = "info", **_):  # type: ignore
         print(f"[notify/{priority}] {msg}")
 
-# Core stacks we standardize on
+# Core stacks
 from core.bybit_client import Bybit
 from core import breaker
 
@@ -88,8 +84,6 @@ log = logging.getLogger("risk_daemon")
 
 STATE_DIR = ROOT / ".state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
-# This daemon no longer writes risk_state.json directly; the canonical path is owned by core.breaker
-BREAKER_FILE = STATE_DIR / "risk_state.json"
 
 EFFECTIVE_DIR = ROOT / ".state" / "effective"          # where strategy_config writes
 EFFECTIVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -166,48 +160,60 @@ def today_key(dt_in: Optional[datetime.datetime]=None) -> str:
     return d.strftime("%Y-%m-%d")
 
 # ---- equity sampling via core.bybit_client ----
+def _equity_from_wallets(resp: Dict) -> Decimal:
+    wallets = (resp.get("result") or {}).get("list") or []
+    if not wallets:
+        return Decimal("0")
+    coins = wallets[0].get("coin", []) or []
+    eq = Decimal("0")
+    for c in coins:
+        coin = str(c.get("coin") or "").upper()
+        usd = Decimal(str(c.get("usdValue") or "0"))
+        if usd == 0 and coin in {"USDT","USDC"}:
+            usd = Decimal(str(c.get("walletBalance") or "0"))
+        eq += usd
+    return eq
+
+def _equity_unified_try(extra: dict) -> Decimal:
+    ok, data, err = by.get_wallet_balance(accountType="UNIFIED", **extra)
+    if not ok:
+        return Decimal("0")
+    try:
+        return _equity_from_wallets(data)
+    except Exception:
+        return Decimal("0")
+
 def _equity_unified(extra: dict) -> Decimal:
     """
     Returns total equity (USD notionally) for an account (main or sub).
-    extra accepts {"memberId": "..."} or {"subUid": "..."} depending on your Bybit wrapper.
-    Bybit v5 balance returns a list of coins; we sum usdValue and fallback on stables.
     """
     try:
-        ok, data, err = by.get_wallet_balance(accountType="UNIFIED", **extra)
-        if not ok:
-            log.warning(f"equity fetch error ({extra}): {err}")
-            return Decimal("0")
-        wallets = (data.get("result") or {}).get("list") or []
-        if not wallets:
-            return Decimal("0")
-        # Some wrappers return list-of-wallets; choose the first unified wallet
-        coins = wallets[0].get("coin", []) or []
-        eq = Decimal("0")
-        for c in coins:
-            coin = str(c.get("coin") or "").upper()
-            usd = Decimal(str(c.get("usdValue") or "0"))
-            if usd == 0 and coin in {"USDT","USDC"}:
-                usd = Decimal(str(c.get("walletBalance") or "0"))
-            eq += usd
-        return eq
+        return _equity_unified_try(extra)
     except Exception as e:
         log.warning(f"equity fetch exception ({extra}): {e}")
         return Decimal("0")
+
+def _equity_for_uid(uid: str) -> Decimal:
+    """
+    Try memberId first (master querying sub), then subUid (direct sub credential),
+    returning the first non-zero equity we get.
+    """
+    uid = str(uid).strip()
+    if not uid:
+        return Decimal("0")
+    # Try memberId
+    eq = _equity_unified({"memberId": uid})
+    if eq > 0:
+        return eq
+    # Fallback: subUid
+    eq = _equity_unified({"subUid": uid})
+    return eq
 
 def snapshot_equities() -> Dict[str, str]:
     data: Dict[str, str] = {}
     data["main"] = str(_equity_unified({}))
     for uid in SUB_UIDS:
-        # Prefer memberId if your client supports it; fall back to subUid if that's exposed
-        extra = {}
-        # Attempt memberId; if your client maps it differently, swap key here.
-        extra_key = "memberId" if "memberId" in by.PRIVATE_EXTRA_KEYS else ("subUid" if "subUid" in by.PRIVATE_EXTRA_KEYS else None)  # type: ignore[attr-defined]
-        if extra_key:
-            extra[extra_key] = uid
-        else:
-            # Older client variant: try both; only one will be honored
-            extra = {"memberId": uid, "subUid": uid}
-        data[f"sub:{uid}"] = str(_equity_unified(extra))
+        data[f"sub:{uid}"] = str(_equity_for_uid(uid))
     total = sum(Decimal(v) for v in data.values())
     data["total"] = str(total)
     return data
@@ -225,7 +231,8 @@ def append_jsonl(path: Path, row: dict):
 # ---- rollup text ----
 def pct_change(cur: Decimal, base: Decimal) -> str:
     try:
-        return f"{((cur-base)/base*Decimal('100')):.2f}%" if base > 0 else "n/a"
+        pct = ((cur - base) / base * Decimal("100")) if base > 0 else None
+        return f"{pct:.2f}%" if pct is not None else "n/a"
     except Exception:
         return "n/a"
 
@@ -246,15 +253,14 @@ def fmt_rollup(data: Dict[str, str], baseline: Dict[str, str] | None) -> str:
 def compute_dd_pct(cur_total: Decimal, base_total: Decimal) -> float:
     if base_total <= 0:
         return 0.0
-    dd = (base_total - cur_total) / base_total * 100.0
-    return float(max(0.0, dd))
+    dd = (base_total - cur_total) / base_total * Decimal("100")
+    return float(max(Decimal("0"), dd))
 
 # ---- breaker control (shared API) ----
 def breaker_enforce(reason: str):
     """
     Passive enforcement: trip breaker using core.breaker (honors BREAKER_DEFAULT_TTL_SEC).
     """
-    # If you want a specific TTL from this daemon instead of env default, pass ttl_sec=XXXX here.
     breaker.set_on(reason=reason, ttl_sec=None, source="risk_daemon")
     tg_send(f"⛔ Risk breaker SET • {reason}", priority="error")
 
