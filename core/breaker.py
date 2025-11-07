@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-core/breaker.py — file-backed global breaker with TTL, atomic writes, helpers, and CLI.
+core/breaker.py — file-backed global breaker with TTL, atomic writes, helpers, CLI,
+and optional friend-approval enforcement for CLEAR/OFF.
 
 State file: .state/risk_state.json
 Schema:
@@ -15,8 +16,19 @@ Schema:
 }
 
 Env (optional):
-  BREAKER_DEFAULT_TTL_SEC=0       # default TTL when turning ON without explicit ttl
-  BREAKER_NOTIFY_COOLDOWN_SEC=8   # min seconds between identical tg notifications
+  BREAKER_DEFAULT_TTL_SEC=0
+  BREAKER_NOTIFY_COOLDOWN_SEC=8
+
+Approval integration (optional):
+  APPROVAL_REQUIRE_CLEAR=1            # if 1, any set_off() requires friend approval
+  APPROVAL_ACCOUNT_KEY=main           # label shown in approval (e.g., main, sub:<uid>)
+  APPROVAL_SERVICE_URL=http://127.0.0.1:5055
+  APPROVAL_SHARED_SECRET=...          # must match approval_service
+  APPROVAL_TIMEOUT_SEC=180            # how long to wait for approval
+
+Notes:
+- set_on / breach still do NOT require approval (safety first).
+- set_off requires approval if APPROVAL_REQUIRE_CLEAR=1; otherwise behaves as before.
 """
 
 from __future__ import annotations
@@ -34,6 +46,11 @@ NOTIFY_COOLDOWN = int(os.getenv("BREAKER_NOTIFY_COOLDOWN_SEC", "8") or "8")
 
 SCHEMA_VERSION = 1
 
+# --- approval knobs ---
+APPROVAL_REQUIRE_CLEAR = (os.getenv("APPROVAL_REQUIRE_CLEAR", "0") or "0").strip() in {"1","true","yes","on"}
+APPROVAL_ACCOUNT_KEY = (os.getenv("APPROVAL_ACCOUNT_KEY", "main") or "main").strip()
+APPROVAL_TIMEOUT_SEC = int(os.getenv("APPROVAL_TIMEOUT_SEC", "180") or "180")
+
 # optional notifier
 try:
     from core.notifier_bot import tg_send  # type: ignore
@@ -47,6 +64,35 @@ try:
 except Exception:
     def log_event(*_, **__):  # type: ignore
         pass
+
+# optional approval client
+def _approval_available() -> bool:
+    try:
+        from core.approval_client import require_approval  # noqa
+        return True
+    except Exception:
+        return False
+
+def _require_clear_approval(reason: str) -> None:
+    """
+    Call friend-approval before clearing breaker, if enabled.
+    Raises on denial/timeout to prevent unsafe clear.
+    """
+    if not APPROVAL_REQUIRE_CLEAR:
+        return
+    if not _approval_available():
+        raise RuntimeError("Approval required to clear breaker, but approval_client not available.")
+
+    from core.approval_client import require_approval  # type: ignore
+    rid = require_approval(
+        action="breaker_clear",
+        account_key=APPROVAL_ACCOUNT_KEY,
+        reason=reason or "manual_clear",
+        ttl_sec=max(60, APPROVAL_TIMEOUT_SEC),         # request validity
+        timeout_sec=APPROVAL_TIMEOUT_SEC,              # how long we wait here
+        poll_sec=2.5
+    )
+    tg_send(f"🔐 Approval OK • breaker_clear • req={rid}", priority="success")
 
 # ---- low-level IO (atomic) ----------------------------------------------------
 def _atomic_write_json(path: pathlib.Path, data: Dict[str, Any]) -> None:
@@ -141,6 +187,7 @@ def _can_notify(kind: str) -> bool:
 def set_on(reason: str = "manual", ttl_sec: Optional[int] = None, source: str = "human") -> None:
     """
     Turn breaker ON. Optional ttl_sec overrides env default; 0 disables expiry.
+    Approval is NOT required to enable safety.
     """
     ttl = int(ttl_sec if ttl_sec is not None else DEFAULT_TTL)
     cur = status()
@@ -149,7 +196,6 @@ def set_on(reason: str = "manual", ttl_sec: Optional[int] = None, source: str = 
 
     log_event("guard", "breaker_on", symbol="", account_uid="", payload={"reason": reason, "ttl": ttl, "source": source})
 
-    # Notify only if material change (breach or ttl or reason changed)
     changed = (not cur.get("breach")) or (int(cur.get("ttl") or 0) != ttl) or (cur.get("reason") != reason)
     sig = {"breach": True, "reason": reason, "ttl": ttl}
     if changed and (_last_announced != sig) and _can_notify("on"):
@@ -177,11 +223,21 @@ def extend(ttl_delta_sec: int) -> None:
     d.update({"ts": _now(), "ttl": new_ttl})
     _save_raw(d)
     log_event("guard", "breaker_extend", symbol="", account_uid="", payload={"ttl": new_ttl})
-    # reuse ON channel for TTL changes
     if _can_notify("on"):
         tg_send(f"⏩ Breaker TTL set • ttl={new_ttl}s", priority="info")
 
 def set_off(reason: str = "manual_clear", source: str = "human") -> None:
+    """
+    Turn breaker OFF. If APPROVAL_REQUIRE_CLEAR=1, demands friend approval.
+    """
+    # Approval gate (raises on denial/timeout/misconfig)
+    try:
+        _require_clear_approval(reason)
+    except Exception as e:
+        log_event("guard", "breaker_off_block", symbol="", account_uid="", payload={"error": str(e)}, level="error")
+        tg_send(f"❌ Breaker OFF blocked • {e}", priority="error")
+        raise
+
     cur_active = is_active()
     d = status()
     d.update({"breach": False, "reason": reason, "ts": _now(), "ttl": 0, "source": source, "version": SCHEMA_VERSION})
@@ -279,13 +335,9 @@ def _cli():
     args = ap.parse_args()
 
     if args.time_left:
-        print(remaining_ttl())
-        return
-
+        print(remaining_ttl()); return
     if args.status:
-        print(json.dumps(status(), indent=2))
-        return
-
+        print(json.dumps(status(), indent=2)); return
     if args.on:
         if args.for_min is not None:
             set_on_for(args.for_min, reason=(args.reason or "manual"), source=args.source)
@@ -293,20 +345,14 @@ def _cli():
             set_on_until(reason=(args.reason or "manual"), until_epoch_sec=args.until, source=args.source)
         else:
             set_on(reason=(args.reason or "manual"), ttl_sec=args.on_ttl, source=args.source)
-        print(json.dumps(status(), indent=2))
-        return
-
+        print(json.dumps(status(), indent=2)); return
     if args.off:
         set_off(reason=(args.reason or "manual_clear"), source=args.source)
-        print(json.dumps(status(), indent=2))
-        return
-
+        print(json.dumps(status(), indent=2)); return
     if args.extend is not None:
         extend(args.extend)
-        print(json.dumps(status(), indent=2))
-        return
+        print(json.dumps(status(), indent=2)); return
 
-    # default: show help if no actionable flag
     ap.print_help()
 
 def main():
