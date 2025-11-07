@@ -45,3 +45,6 @@
 2025-11-07 20:14:55 | WARNING | risk_daemon | risk loop error: unsupported operand type(s) for *: 'decimal.Decimal' and 'float'
 2025-11-07 20:43:56 | WARNING | risk_daemon | risk loop error: unsupported operand type(s) for *: 'decimal.Decimal' and 'float'
 2025-11-07 20:45:00 | WARNING | risk_daemon | risk loop error: unsupported operand type(s) for *: 'decimal.Decimal' and 'float'
+2025-11-07 21:15:04 | WARNING | risk_daemon | risk loop error: unsupported operand type(s) for *: 'decimal.Decimal' and 'float'
+2025-11-07 21:45:09 | WARNING | risk_daemon | risk loop error: unsupported operand type(s) for *: 'decimal.Decimal' and 'float'
+2025-11-07 22:15:14 | WARNING | risk_daemon | risk loop error: unsupported operand type(s) for *: 'decimal.Decimal' and 'float'
