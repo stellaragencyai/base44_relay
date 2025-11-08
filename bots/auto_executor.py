@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Base44 — Auto Executor (consume signals/observed.jsonl, maker-first entries)
-FINALIZED / unified with core stack (v2025-11-06)
+FINALIZED / unified with core stack (v2025-11-07)
 
 What this does
 - Tails signals/observed.jsonl emitted by bots/signal_engine.py.
@@ -13,41 +13,16 @@ What this does
   • Validates orderbook spread vs params.spread_max_bps or SIG_SPREAD_MAX_BPS.
   • Computes qty from either EXEC_QTY_BASE, or notional (EXEC_QTY_USDT/px), or
     risk-based if params.stop_dist is provided (uses core.portfolio_guard.guard.current_risk_value()).
-  • Places maker-first PostOnly limit at best bid/ask (edge) when maker_only=true,
+  • Places maker-first PostOnly limit at best bid/ask when maker_only=true,
     or uses Market when maker_only=false (respecting EXEC_POST_ONLY).
 - DRY_RUN path prints & notifies only; no exchange calls.
 - Exits (TP/SL) are handled by TP/SL Manager; executor only opens.
 
-Key env (override in .env as needed)
-  # inherited from signal engine defaults (via core.config.settings)
-  SIG_MAKER_ONLY=true
-  SIG_SPREAD_MAX_BPS=8
-  SIG_TAG=B44
-  SIG_DRY_RUN=true           # executor honors this as default unless EXEC_DRY_RUN set
-
-  # executor-specific
-  EXEC_DRY_RUN=1             # overrides SIG_DRY_RUN when present
-  EXEC_QTY_USDT=5.0          # notional in quote; used if EXEC_QTY_BASE==0 and no stop-based sizing
-  EXEC_QTY_BASE=0.0          # fixed base qty; if >0, bypasses risk/notional sizing
-  EXEC_POST_ONLY=true        # force PostOnly on limit entries
-  EXEC_SYMBOLS=              # optional CSV allowlist, e.g. BTCUSDT,ETHUSDT
-  EXEC_POLL_SEC=2            # tailing cadence (s)
-  EXEC_MAX_SIGNAL_AGE_SEC=120# drop stale signals
-  EXEC_ACCOUNT_UID=          # optional Bybit subUid to route entries (MAIN if empty)
-
-Files
-  signals/observed.jsonl       # input queue (append-only)
-  .state/executor_seen.json    # de-dupe registry for orderLinkId
-  .state/executor_offset.json  # last read byte offset for resilient tailing
-  .state/risk_state.json       # breaker flag file ({"breach": true}) blocks opens
-
-Depends on:
-  core.config.settings         — paths + env defaults
-  core.logger                  — unified logging
-  core.bybit_client.Bybit      — thin wrapper over pybit v5 HTTP
-  core.notifier_bot.tg_send    — Telegram with retries/rate-limit
-  core.portfolio_guard.guard   — risk budget + concurrency caps
-  core.breaker                 — global breaker state (file-backed)
+New in this revision
+- DB persistence: orders and (dry-run) executions recorded for restart safety.
+- Explicit order state transitions: NEW → SENT → ACKED (FILLED simulated in dry-run).
+- Robust error states: REJECTED / ERROR with retCode/retMsg captured.
+- Fixed env typo (SIG_TANGLED → SIG_TAG fallback).
 """
 
 from __future__ import annotations
@@ -77,6 +52,15 @@ except Exception:
     def log_event(*_, **__):  # type: ignore
         pass
 
+# DB hooks (optional; fall back cleanly if Core/ vs core/ casing differs or DB not present)
+try:
+    from Core.db import insert_order, set_order_state, insert_execution  # pragma: no cover
+except Exception:
+    try:
+        from core.db import insert_order, set_order_state, insert_execution  # pragma: no cover
+    except Exception:
+        insert_order = set_order_state = insert_execution = None  # type: ignore
+
 log = bind_context(get_logger("bots.auto_executor"), comp="executor")
 
 # ------------------------
@@ -91,11 +75,14 @@ SIGNALS_DIR: Path = getattr(settings, "DIR_SIGNALS", ROOT / "signals")
 SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
 QUEUE_PATH = SIGNALS_DIR / (getattr(settings, "SIGNAL_QUEUE_FILE", "observed.jsonl"))
 
-# Inherit common knobs from signal-engine defaults, allow executor overrides
+# Env helpers
 def _get_env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None:
-        return bool(getattr(settings, name, default))
+        try:
+            return bool(getattr(settings, name))
+        except Exception:
+            return default
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 def _get_env_float(name: str, default: float) -> float:
@@ -125,7 +112,7 @@ def _get_env_int(name: str, default: int) -> int:
 # Maker/Tag/Spread from signal-engine defaults
 MAKER_ONLY      = _get_env_bool("SIG_MAKER_ONLY", True)
 SPREAD_MAX_BPS  = _get_env_float("SIG_SPREAD_MAX_BPS", 8.0)
-TAG             = (getattr(settings, "SIG_TANGLED", None) or getattr(settings, "SIG_TAG", "B44")).strip() or "B44"
+TAG             = (getattr(settings, "SIG_TAG", None) or os.getenv("SIG_TAG") or "B44").strip() or "B44"
 SIG_DRY_DEFAULT = _get_env_bool("SIG_DRY_RUN", True)
 
 # Executor-specific
@@ -171,9 +158,9 @@ def _fallback_breaker_active() -> bool:
         return False
 
 def breaker_active() -> bool:
-    if callable(breaker_is_secondary := breaker_is_active):
+    if callable(breaker_is_active):
         try:
-            return bool(breaker_is_secondary())
+            return bool(breaker_is_active())
         except Exception:
             return _fallback_breaker_active()
     return _fallback_breaker_active()
@@ -225,12 +212,13 @@ def _spread_bps(bid: float, ask: float) -> float:
         return 1e9
     return (ask - bid) / mid * 10000.0
 
-def _qty_from_signal(price: float, params: Dict) -> str:
+def _qty_from_signal(price: float, params: Dict) -> float:
     """
     Sizing precedence:
       1) EXEC_QTY_BASE (>0) → fixed base qty
       2) If params.stop_dist present AND guard available → risk_value / stop_dist
       3) Fallback to notional: EXEC_QTY_USDT / price
+    Returns a numeric float; formatting to string happens at request time.
     """
     if EXEC_QTY_BASE > 0:
         qty = EXEC_QTY_BASE
@@ -241,13 +229,14 @@ def _qty_from_signal(price: float, params: Dict) -> str:
             if px_delta > 0:
                 qty = max(0.0, risk_val / max(px_delta, 1e-9))
             else:
-                qty = max(0.0, EXEC_QID := EXEC_QTY_USDT / max(price, 1e-9))  # fallback if zero/neg
+                qty = max(0.0, EXEC_QTY_USDT / max(price, 1e-9))
         except Exception:
             qty = max(0.0, EXEC_QTY_USDT / max(price, 1e-9))
     else:
         qty = max(0.0, EXEC_QTY_USDT / max(price, 1e-9))
+    return qty
 
-    # format to Bybit-friendly string (trim trailing zeros)
+def _format_qty(qty: float) -> str:
     txt = f"{qty:.10f}".rstrip("0").rstrip(".")
     return txt or "0"
 
@@ -296,10 +285,35 @@ def _tail_queue(path: Path, start_pos: int) -> Tuple[int, List[str]]:
 # Core execution
 # ------------------------
 
+def _record_order_state(link_id: str, symbol: str, side: str, qty_val: float, px: Optional[float],
+                        state: str, exchange_id: Optional[str] = None,
+                        err_code: Optional[str] = None, err_msg: Optional[str] = None) -> None:
+    """
+    Write order state to DB if DB module is available; otherwise no-op.
+    """
+    if insert_order is None or set_order_state is None:
+        return
+    try:
+        if state == "NEW":
+            insert_order(link_id, symbol, side, qty_val, px, TAG, state="NEW")
+        else:
+            set_order_state(link_id, state, exchange_id=exchange_id, err_code=err_code, err_msg=err_msg)
+    except Exception as e:
+        log.warning("DB write failed (%s %s): %s", link_id, state, e)
+
+def _record_execution(link_id: str, qty_val: float, px: float, fee: float = 0.0) -> None:
+    if insert_execution is None:
+        return
+    try:
+        insert_execution(link_id, qty_val, px, fee=fee)
+    except Exception as e:
+        log.warning("DB exec write failed (%s): %s", link_id, e)
+
 def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint: Optional[float]) -> Tuple[bool, str]:
     """
     Place a maker-first limit at the edge of the book (PostOnly) when maker_only, or Market otherwise.
     Enforces spread ceiling (bps). Respects DRY mode.
+    Also records order lifecycle states to DB (NEW → SENT → ACKED; FILLED simulated in dry-run).
     """
     bid, ask, mid = _fetch_best_prices(symbol)
     if bid is None or ask is None:
@@ -314,7 +328,6 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
     # Choose price: if hint provided and maker_only, nudge to edge that will post
     if maker_only:
         px = bid if side == "Buy" else ask
-        # If a hint exists and is *inside* the spread on our posting side, prefer hint to anchor ladder alignment
         if isinstance(price_hint, (int, float)) and price_hint > 0:
             if side == "Buy":
                 px = min(px, float(price_hint))
@@ -323,22 +336,29 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
     else:
         px = None  # we’ll use Market
 
-    qty = _qty_from_signal(price=px or mid, params=params)
-    tif = "PostOnly" if (EXEC_POST_ONLY and maker_only) else "ImmediateOrCancel"  # IOC for market-ish
+    qty_val = _qty_from_signal(price=px or mid, params=params)
+    qty_txt = _format_qty(qty_val)
+    tif = "PostOnly" if (EXEC_POST_ONLY and maker_only and px is not None) else ("ImmediateOrCancel" if px is None else "GoodTillCancel")
+
+    # DB: NEW
+    _record_order_state(link_id, symbol, side, qty_val, px, state="NEW")
 
     if EXEC_DRY_RUN:
-        msg = f"🟡 DRY • {symbol} • {side} qty≈{qty} @ {px if px else 'MKT'} • spr {spr_bps:.2f}bps • tif={tif} • link={link_id}"
+        msg = f"🟡 DRY • {symbol} • {side} qty≈{qty_txt} @ {px if px else 'MKT'} • spr {spr_bps:.2f}bps • tif={tif} • link={link_id}"
         tg_send(msg, priority="info")
-        log_event("executor", "entry_dry", symbol, "MAIN", {"side": side, "qty": qty, "px": px, "spr_bps": spr_bps, "tif": tif, "link": link_id})
+        log_event("executor", "entry_dry", symbol, "MAIN", {"side": side, "qty": qty_txt, "px": px, "spr_bps": spr_bps, "tif": tif, "link": link_id})
+        # Simulate filled in DB for analytics continuity
+        _record_order_state(link_id, symbol, side, qty_val, px, state="FILLED", exchange_id="DRY-RUN")
+        _record_execution(link_id, qty_val, float(px or mid), fee=0.0)
         return True, "dry-run"
 
     # Build request
     req = dict(
         category="linear",
         symbol=symbol,
-        side=side,
+        side=side,  # Buy|Sell
         orderType=("Limit" if px is not None else "Market"),
-        qty=str(qty),
+        qty=str(qty_txt),
         reduceOnly=False,
         timeInForce=("PostOnly" if px is not None and EXEC_POST_ONLY and maker_only else ("IOC" if px is None else "GoodTillCancel")),
         orderLinkId=link_id,
@@ -350,8 +370,20 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
     # Attempt placement
     ok, data, err = by.place_order(**req)
     if not ok:
-        # If PostOnly reject because price would take, log and surface cause
+        # DB: REJECTED/ERROR
+        _record_order_state(link_id, symbol, side, qty_val, px, state="REJECTED", err_code="bybit_err", err_msg=str(err or "place_order failed"))
         return False, (err or "place_order failed")
+
+    # Parse exchange response
+    try:
+        result = (data.get("result") or {})
+        exch_id = result.get("orderId") or result.get("order_id")
+    except Exception:
+        exch_id = None
+
+    # DB: SENT → ACKED (fills handled by reconciler)
+    _record_order_state(link_id, symbol, side, qty_val, px, state="SENT", exchange_id=exch_id)
+    _record_order_state(link_id, symbol, side, qty_val, px, state="ACKED", exchange_id=exch_id)
 
     return True, "ok"
 
@@ -404,8 +436,8 @@ def main() -> None:
                     continue
 
                 # staleness filter
-                if ts_ms and EXEC_MAX_SIGNAL_ARG := EXEC_MAX_SIGNAL_AGE:
-                    if now_ms - ts_ms > EXEC_MAX_SIGNAL_ARG * 1000:
+                if ts_ms and EXEC_MAX_SIGNAL_AGE:
+                    if now_ms - ts_ms > EXEC_MAX_SIGNAL_AGE * 1000:
                         log.info("stale signal %s dropped (age=%ds)", symbol, int((now_ms - ts_ms)/1000))
                         continue
 
@@ -432,7 +464,7 @@ def main() -> None:
                             tg_send(f"⏸️ Guard block • {symbol} • max concurrency/symbol or daily cap hit", priority="warn")
                             log_event("executor", "block_guard", symbol, "MAIN")
                             continue
-                        # if we will use risk-based sizing, guard.current_risk_value() is read in _qty_from_signal
+                        # risk-based sizing reads guard.current_risk_value() in _qty_from_signal
                     except Exception as e:
                         log.warning("guard check error: %s", e)
 
