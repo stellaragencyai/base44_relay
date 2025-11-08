@@ -1,0 +1,154 @@
+﻿Project structure for: C:\Users\nolan\Desktop\Base 44
+├── .state
+│   ├── effective
+│   ├── equity_peak.json
+│   ├── risk_anchors.json
+│   └── risk_state.json
+├── bots
+│   ├── __init__.py
+│   ├── auto_executor.py
+│   ├── breaker_guard.py
+│   ├── coach.py
+│   ├── funding_fees_tracker.py
+│   ├── notifier.py
+│   ├── pnl_backfill_last5days.py
+│   ├── pnl_daily.py
+│   ├── pnl_logger.py
+│   ├── position_watcher.py
+│   ├── reconcile_ladder.py
+│   ├── relay_watchdog.py
+│   ├── security_daemon.py
+│   ├── signal_engine.py
+│   ├── tickers_feed.py
+│   ├── tp_sl_manager.py
+│   ├── trade_executor.py
+│   └── trade_historian.py
+├── config
+│   ├── strategies
+│   │   ├── A1_trend.yaml
+│   │   ├── A2_breakout.yaml
+│   │   ├── A7_canary.yaml
+│   │   ├── base.py
+│   │   ├── breakout_impusle.py
+│   │   └── trend_pullback.py
+│   ├── settings.py
+│   └── trade_guard.json
+├── core
+│   ├── .state
+│   ├── config
+│   ├── dashboard
+│   │   ├── adapters
+│   │   │   ├── breaker_adapter.py
+│   │   │   ├── health.py
+│   │   │   ├── orders.py
+│   │   │   ├── pnl.py
+│   │   │   └── positions.py
+│   │   ├── static
+│   │   │   └── styles.css
+│   │   ├── templates
+│   │   │   └── index.html
+│   │   └── app.py
+│   ├── logs
+│   │   └── app.log
+│   ├── security
+│   │   ├── approver.py
+│   │   ├── config.py
+│   │   ├── guardrail.py
+│   │   ├── timelock.py
+│   │   └── yubikey_guard.py
+│   ├── signals
+│   ├── __init__.py
+│   ├── account_policy.py
+│   ├── approval_client.py
+│   ├── approval_sevice.py
+│   ├── base44_client.py
+│   ├── base44_registry.py
+│   ├── breaker.py
+│   ├── bybit_client.py
+│   ├── bybit_futures_leverage_map.py
+│   ├── config.py
+│   ├── crypto_cmd.py
+│   ├── db.py
+│   ├── decision_log.py
+│   ├── env_bootstrap.py
+│   ├── health_watchdog.py
+│   ├── instruments.py
+│   ├── logger.py
+│   ├── notifier.py
+│   ├── notifier_bot.py
+│   ├── portfolio_guard.py
+│   ├── regime_gate.py
+│   ├── relay_client.py
+│   ├── risk_daemon.py
+│   ├── safety.py
+│   ├── strategy_config.py
+│   ├── time_lock_manager.py
+│   ├── tunnel_watchdog.py
+│   └── wallet_ops.py
+├── Logs
+│   ├── pnl
+│   │   ├── 2025-11-05
+│   │   │   └── baseline.json
+│   │   ├── 2025-11-06
+│   │   ├── 2025-11-05.jsonl
+│   │   ├── 2025-11-06.jsonl
+│   │   ├── daily_2025-11-06.json
+│   │   ├── daily_pnl_log.csv
+│   │   └── daily_pnl_log.jsonl
+│   ├── app.log
+│   ├── app.log.2025-11-06
+│   ├── daily_pnl_log.csv
+│   └── health.csv
+├── Portfolio
+│   └── sub_registry_cli.py
+├── registry
+│   ├── account_policy.json
+│   ├── bybit_subuid_harvester.py
+│   ├── instruments.json
+│   ├── sub_map.json
+│   ├── sub_registry_cli.py
+│   └── sub_uids.csv
+├── relay
+│   └── __init__.py
+├── scripts
+│   ├── auto_sync.ps1
+│   ├── breaker.ps1
+│   ├── register_profit_sweeper.ps1
+│   ├── register_tasks.ps1
+│   ├── run_sub.ps1
+│   ├── start_all.ps1
+│   ├── start_all_monitors.ps1
+│   └── start_trading_suite.ps1
+├── Signals
+│   └── observed.jsonl
+├── strategies
+│   ├── __init__.py
+│   ├── breakout_impulse.py
+│   ├── momentum_scalp.py
+│   └── trend_pullback.py
+├── systemd
+│   └── base44-security.service
+├── tools
+│   ├── clean_env.py
+│   ├── env_doctor.py
+│   ├── list_subuids.py
+│   ├── notifier_telegram.py
+│   ├── print_effective_config.py
+│   ├── relay_test.py
+│   ├── run_profit_sweeper.ps1
+│   ├── send_test.py
+│   ├── telegram_fix_chat_id.py
+│   ├── telegram_probe.py
+│   ├── test_transfer.py
+│   └── validate_env.py
+├── # =================================.txt
+├── .bybit_balance_watcher_state.json
+├── .env
+├── .env.fixed
+├── base44_relay.py
+├── ngrok.yml
+├── pnl_anchors.json
+├── show_structure.py
+├── structure.txt
+├── structure_ascii.txt
+└── sub_uids.csv
