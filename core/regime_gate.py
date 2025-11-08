@@ -1,80 +1,68 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, datetime as dt, requests
-from typing import Tuple, Dict
+"""
+Adaptive regime gate:
+- Tracks rolling realized volatility, volume z-score, and trend proxy
+- Persists regime_state.json for other bots
+"""
+from __future__ import annotations
+import os, json, time, math
+from pathlib import Path
+from collections import deque
+from typing import Dict, Deque
 
-def _hms_to_minutes(hhmm: str) -> int:
-    h, m = map(int, hhmm.split(":"))
-    return h * 60 + m
+STATE = Path(os.getenv("STATE_DIR","./.state")).resolve()
+OUT   = STATE / "regime_state.json"
+WINDOW = int(os.getenv("REGIME_WINDOW", "120"))  # ticks
 
-def _now_local() -> dt.datetime:
-    return dt.datetime.now()
-
-def _parse_windows(raw: str):
-    wins = []
-    for chunk in filter(None, [x.strip() for x in (raw or "").split(",")]):
-        start, end = chunk.split("-")
-        wins.append((_hms_to_minutes(start), _hms_to_minutes(end)))
-    return wins
-
-def _in_windows(now: dt.datetime, wins) -> bool:
-    minutes = now.hour * 60 + now.minute
-    return any(s <= minutes <= e for s, e in wins)
-
-def _atr_pct_from_ohlc(ohlc: Dict) -> float:
-    last = float(ohlc.get("lastPrice", 0) or 0)
-    high = float(ohlc.get("highPrice24h", 0) or 0)
-    low  = float(ohlc.get("lowPrice24h", 0) or 0)
-    if last <= 0 or high <= 0 or low <= 0: 
-        return 0.0
-    rng = max(1e-12, high - low)
-    return (rng / last) * 100.0
-
-def _adx_stub(_: Dict) -> float:
-    return 22.0  # replace with real ADX(14) once candle feed is ready
-
-def _fetch_ticker(symbol: str) -> Dict:
-    url = f'{os.getenv("RELAY_URL").rstrip("/")}/bybit/tickers'
-    headers = {"Authorization": f'Bearer {os.getenv("RELAY_TOKEN")}'}
-    r = requests.get(url, headers=headers, timeout=6)
-    r.raise_for_status()
-    data = r.json()
-    items = (data.get("result") or {}).get("list") or []
-    for it in items:
-        if it.get("symbol") == symbol:
-            return it
-    return {}
-
-class Gate:
+class Regime:
     def __init__(self):
-        self.min_adx = float(os.getenv("REGIME_MIN_ADX", "18"))
-        self.min_atr = float(os.getenv("REGIME_MIN_ATR_PCT", "0.6"))
-        self.max_atr = float(os.getenv("REGIME_MAX_ATR_PCT", "5.0"))
-        self.wins = _parse_windows(os.getenv("TRADING_WINDOWS", ""))
-        self.whitelist = [x.strip().upper() for x in os.getenv("SYMBOL_WHITELIST", "").split(",") if x.strip()]
+        self.mid: Deque[float] = deque(maxlen=WINDOW)
+        self.vol: Deque[float] = deque(maxlen=WINDOW)
+        self.volumes: Deque[float] = deque(maxlen=WINDOW)
 
-    def ok(self, symbol: str) -> Tuple[bool, str, Dict]:
-        now = _now_local()
-        symu = symbol.upper()
+    def update(self, mid: float, vol: float) -> Dict:
+        if mid > 0:
+            self.mid.append(mid)
+        self.volumes.append(max(0.0, vol))
 
-        if self.whitelist and symu not in self.whitelist:
-            return False, f"symbol {symu} not in whitelist", {}
+        if len(self.mid) >= 3:
+            # realized vol (log-returns)
+            r = []
+            for i in range(1, len(self.mid)):
+                a, b = self.mid[i-1], self.mid[i]
+                r.append(math.log(max(b,1e-9)/max(a,1e-9)))
+            rv = (sum(x*x for x in r) / max(1,len(r)))**0.5 * 10000  # bps
 
-        if self.wins and not _in_windows(now, self.wins):
-            return False, "outside trading windows", {}
+            # simple trend proxy: slope over last N
+            n = min(40, len(self.mid))
+            xs = list(range(n))
+            ys = list(self.mid)[-n:]
+            xbar = sum(xs)/n; ybar = sum(ys)/n
+            num = sum((x-xbar)*(y-ybar) for x,y in zip(xs,ys))
+            den = sum((x-xbar)**2 for x in xs) or 1.0
+            slope = (num/den) / max(1e-6, ybar)
 
-        t = _fetch_ticker(symu)
-        if not t:
-            return False, "no ticker data", {}
+            # volume z
+            vols = list(self.volumes)
+            mu = sum(vols)/max(1,len(vols))
+            sig = (sum((v-mu)**2 for v in vols)/max(1,len(vols)))**0.5
+            vz = 0.0 if sig == 0 else (vols[-1]-mu)/sig
 
-        atr_pct = _atr_pct_from_ohlc(t)
-        adx = _adx_stub(t)
+            st = {
+                "realized_vol_bps": rv,
+                "trend_slope": slope,
+                "vol_z": vz,
+                "ts": int(time.time()*1000),
+            }
+        else:
+            st = {"realized_vol_bps": 0.0, "trend_slope": 0.0, "vol_z": 0.0, "ts": int(time.time()*1000)}
 
-        if adx < self.min_adx:
-            return False, f"ADX {adx:.1f} < {self.min_adx}", {"atr_pct": atr_pct, "adx": adx}
-        if not (self.min_atr <= atr_pct <= self.max_atr):
-            return False, f"ATR% {atr_pct:.2f} outside [{self.min_atr},{self.max_atr}]", {"atr_pct": atr_pct, "adx": adx}
-
-        return True, "ok", {"atr_pct": atr_pct, "adx": adx}
-
-gate = Gate()
+        OUT.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            old = json.loads(OUT.read_text(encoding="utf-8"))
+        except Exception:
+            old = {}
+        old.update(st)
+        OUT.write_text(json.dumps(old, separators=(",",":"), ensure_ascii=False), encoding="utf-8")
+        return st

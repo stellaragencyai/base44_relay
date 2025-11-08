@@ -54,12 +54,16 @@ except Exception:
 
 # DB hooks (optional; fall back cleanly if Core/ vs core/ casing differs or DB not present)
 try:
-    from Core.db import insert_order, set_order_state, insert_execution  # pragma: no cover
-except Exception:
+    import importlib
     try:
-        from core.db import insert_order, set_order_state, insert_execution  # pragma: no cover
+        _db_mod = importlib.import_module("Core.db")
     except Exception:
-        insert_order = set_order_state = insert_execution = None  # type: ignore
+        _db_mod = importlib.import_module("core.db")
+    insert_order = getattr(_db_mod, "insert_order", None)
+    set_order_state = getattr(_db_mod, "set_order_state", None)
+    insert_execution = getattr(_db_mod, "insert_execution", None)
+except Exception:
+    insert_order = set_order_state = insert_execution = None
 
 log = bind_context(get_logger("bots.auto_executor"), comp="executor")
 

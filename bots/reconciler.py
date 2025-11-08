@@ -1,33 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-bots.reconciler — Keep DB and exchange in sync; maintain 5-rung ladders.
-
-Loop (every RECON_INTERVAL_SEC):
-  1) Pull open orders, recent executions, and positions from Bybit via core.bybit_client.
-  2) Update DB:
-     - Mark orders FILLED/CANCELED/REJECTED properly
-     - Insert executions (fills)
-     - Upsert positions snapshot
-  3) For each open bot-managed position, call your bots.reconcile_ladder to ensure:
-     - exactly 5 reduce-only TP rungs exist (per policy)
-     - SL policy present
-     - foreign/stray orders are canceled (configurable)
-
-Safeties:
-  - Won’t touch untagged/manual orders unless RECON_TOUCH_MANUAL=true
-  - Respects RECON_SYMBOL_WHITELIST if set
+bots.reconciler — DB⇄Exchange sync + ladder maintenance + MFE ratchet.
 """
-
 from __future__ import annotations
-import os, time
+import os, time, math
 from typing import Optional, Dict, Any, List
 
-# logger
 from core.logger import get_logger, bind_context
 log = bind_context(get_logger("bots.reconciler"), comp="reconciler")
 
-# config via env
 RECON_INTERVAL_SEC   = int(os.getenv("RECON_INTERVAL_SEC", "5"))
 RECON_DRY_RUN        = os.getenv("RECON_DRY_RUN","true").lower() in ("1","true","yes","on")
 RECON_SAFE_MODE      = os.getenv("RECON_SAFE_MODE","true").lower() in ("1","true","yes","on")
@@ -38,17 +20,14 @@ RECON_INCLUDE_LONGS  = os.getenv("RECON_INCLUDE_LONGS","true").lower() in ("1","
 RECON_INCLUDE_SHORTS = os.getenv("RECON_INCLUDE_SHORTS","true").lower() in ("1","true","yes","on")
 RECON_SYMBOL_WHITELIST = [s.strip().upper() for s in (os.getenv("RECON_SYMBOL_WHITELIST","") or "").split(",") if s.strip()]
 
-# DB
 from core.db import migrate, get_open_orders, insert_execution, set_order_state, upsert_position
-
-# Exchange client
 from core.bybit_client import Bybit
+from bots.tp_sl_policy import ratchet_remaining
 
-# Ladder reconciler (your existing file)
-# We'll try a couple of common entrypoint names to avoid busywork renaming.
+# ladder reconcile import (your existing function)
 _recon_func = None
 try:
-    from bots.reconcile_ladder import reconcile_ladder_for_symbol as _recon_func  # preferred
+    from bots.reconcile_ladder import reconcile_ladder_for_symbol as _recon_func
 except Exception:
     try:
         from bots.reconcile_ladder import reconcile_for_symbol as _recon_func
@@ -58,25 +37,16 @@ except Exception:
         except Exception:
             _recon_func = None
 
-# Notifier optional
 try:
     from core.notifier_bot import tg_send
 except Exception:
     def tg_send(*a, **k): pass
 
-def _is_bot_order(order: Dict[str, Any]) -> bool:
-    link = order.get("orderLinkId") or order.get("order_link_id") or ""
-    return link.startswith(RECON_TAG_PREFIX)
-
 def _allowed_symbol(sym: str) -> bool:
-    if not RECON_SYMBOL_WHITELIST:
-        return True
-    return sym.upper() in RECON_SYMBOL_WHITELIST
+    return not RECON_SYMBOL_WHITELIST or sym.upper() in RECON_SYMBOL_WHITELIST
 
-def _side_from_qty(qty: float) -> str:
-    if qty > 0: return "Long"
-    if qty < 0: return "Short"
-    return "Flat"
+def _is_bot_order(link: str | None) -> bool:
+    return bool(link and link.startswith(RECON_TAG_PREFIX))
 
 def _mark_orders_from_exchange(by: Bybit) -> None:
     ok, exch, err = by.get_open_orders(category="linear")
@@ -89,15 +59,11 @@ def _mark_orders_from_exchange(by: Bybit) -> None:
     rows = get_open_orders()
     for r in rows:
         oid, sym, state, tag = r["id"], r["symbol"], r["state"], (r["tag"] or "")
-        if not _allowed_symbol(sym):
-            continue
-        if not RECON_TOUCH_MANUAL and not str(tag).startswith(RECON_TAG_PREFIX):
-            continue
-        exch_row = open_bybit.get(oid)
-        if exch_row is None:
-            if state in ("NEW","SENT","ACKED","PARTIAL"):
-                set_order_state(oid, "CANCELED")
-                log.info("marked CANCELED (missing on exchange) id=%s sym=%s", oid, sym)
+        if not _allowed_symbol(sym): continue
+        if not RECON_TOUCH_MANUAL and not str(tag).startswith(RECON_TAG_PREFIX): continue
+        if open_bybit.get(oid) is None and state in ("NEW","SENT","ACKED","PARTIAL"):
+            set_order_state(oid, "CANCELED")
+            log.info("marked CANCELED (missing on exchange) id=%s sym=%s", oid, sym)
 
 def _apply_fills(by: Bybit) -> None:
     ok, data, err = by.get_executions(category="linear")
@@ -109,8 +75,7 @@ def _apply_fills(by: Bybit) -> None:
             px    = float(tr.get("execPrice"))
             qty   = float(tr.get("execQty"))
             fee   = float(tr.get("execFee", 0.0))
-            if not oid or qty <= 0 or px <= 0:
-                continue
+            if not oid or qty <= 0 or px <= 0: continue
             insert_execution(oid, qty, px, fee=fee)
             set_order_state(oid, "FILLED")
         except Exception as e:
@@ -134,39 +99,56 @@ def _sync_positions(by: Bybit) -> List[Dict[str, Any]]:
             log.warning("skip position err=%s row=%s", e, p)
     return out
 
+def _mfe_bps(current_px: float, avg_px: float, side: str) -> float:
+    if current_px <= 0 or avg_px <= 0: return 0.0
+    if side == "Long":
+        return (current_px/avg_px - 1.0) * 10000.0
+    else:
+        return (avg_px/current_px - 1.0) * 10000.0
+
 def _rebuild_ladders(positions: List[Dict[str, Any]], by: Bybit) -> None:
     if _recon_func is None:
-        log.warning("bots.reconcile_ladder entrypoint not found; ladder maintenance skipped.")
+        log.warning("reconcile_ladder entrypoint not found; ladder maintenance skipped.")
         return
+    # best-effort current price snapshot
+    px_cache: Dict[str, float] = {}
     for pos in positions:
         sym, side, qty = pos["symbol"], pos["side"], float(pos["qty"])
-        if not _allowed_symbol(sym):
-            continue
-        if side == "Flat" or qty <= 0:
-            continue
-        if (side == "Long" and not RECON_INCLUDE_LONGS) or (side == "Short" and not RECON_INCLUDE_SHORTS):
-            continue
+        if not _allowed_symbol(sym) or side=="Flat" or qty<=0: continue
+        if side=="Long" and not RECON_INCLUDE_LONGS: continue
+        if side=="Short" and not RECON_INCLUDE_SHORTS: continue
+        # current mid
+        if sym not in px_cache:
+            ok, tk, _ = by.get_tickers(category="linear", symbol=sym)
+            if ok:
+                lst = (tk.get("result",{}) or {}).get("list",[]) or []
+                if lst:
+                    bid = float(lst[0].get("bid1Price", 0.0)); ask = float(lst[0].get("ask1Price", 0.0))
+                    px_cache[sym] = (bid+ask)/2.0 if bid>0 and ask>0 else 0.0
+                else:
+                    px_cache[sym] = 0.0
+            else:
+                px_cache[sym] = 0.0
+        mid = px_cache.get(sym, 0.0)
+        mfe = _mfe_bps(mid, pos["avg_price"], side)
+        # Let the ladder code handle exact placement; we only hint a ratchet
         try:
-            _recon_func(
-                symbol=sym,
-                side=side,
-                qty=qty,
-                dry_run=RECON_DRY_RUN,
-                safe_mode=RECON_SAFE_MODE,
-                tag_prefix=RECON_TAG_PREFIX,
-                cancel_strays=RECON_CANCEL_STRAYS,
-                bybit=by
-            )
+            _recon_func(symbol=sym, side=side, qty=qty, dry_run=RECON_DRY_RUN,
+                        safe_mode=RECON_SAFE_MODE, tag_prefix=RECON_TAG_PREFIX,
+                        cancel_strays=RECON_CANCEL_STRAYS, bybit=by, mfe_hint_bps=mfe)
+        except TypeError:
+            # older reconcile function without mfe_hint_bps
+            _recon_func(symbol=sym, side=side, qty=qty, dry_run=RECON_DRY_RUN,
+                        safe_mode=RECON_SAFE_MODE, tag_prefix=RECON_TAG_PREFIX,
+                        cancel_strays=RECON_CANCEL_STRAYS, bybit=by)
         except Exception as e:
             log.warning("ladder reconcile failed for %s: %s", sym, e)
 
 def main():
     migrate()
     by = Bybit()
-    try:
-        by.sync_time()
-    except Exception:
-        pass
+    try: by.sync_time()
+    except Exception: pass
 
     tg_send("🟢 Reconciler online • interval={}s • tag={}".format(RECON_INTERVAL_SEC, RECON_TAG_PREFIX), priority="success")
     log.info("online • interval=%ss tag=%s dry=%s safe=%s touch_manual=%s",
