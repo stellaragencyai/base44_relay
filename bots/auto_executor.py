@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Base44 — Auto Executor (consume signals/observed.jsonl, maker-first entries)
-FINALIZED / unified with core stack (v2025-11-07)
+FINALIZED / unified with core stack (v2025-11-07, enhanced)
 
 What this does
 - Tails signals/observed.jsonl emitted by bots/signal_engine.py.
@@ -11,18 +11,21 @@ What this does
   • Optional allow-list by symbol (EXEC_SYMBOLS).
   • Idempotent de-dupe via orderLinkId registry in .state/executor_seen.json.
   • Validates orderbook spread vs params.spread_max_bps or SIG_SPREAD_MAX_BPS.
-  • Computes qty from either EXEC_QTY_BASE, or notional (EXEC_QTY_USDT/px), or
-    risk-based if params.stop_dist is provided (uses core.portfolio_guard.guard.current_risk_value()).
+  • Risk-aware qty: EXEC_QTY_BASE, else risk_capped (if stop_dist + guard), else notional.
+  • Bayesian size nudge using prior/evidence probs when present.
   • Places maker-first PostOnly limit at best bid/ask when maker_only=true,
     or uses Market when maker_only=false (respecting EXEC_POST_ONLY).
 - DRY_RUN path prints & notifies only; no exchange calls.
 - Exits (TP/SL) are handled by TP/SL Manager; executor only opens.
 
 New in this revision
+- Feature store logging (pre-trade features with regime context).
+- Trade classifier tag (“trend”/“breakout”/“meanrev”) added to features.
+- Cross-symbol correlation gate (can block low-quality environments).
+- Risk-capped sizing + Bayesian size adjuster.
 - DB persistence: orders and (dry-run) executions recorded for restart safety.
 - Explicit order state transitions: NEW → SENT → ACKED (FILLED simulated in dry-run).
 - Robust error states: REJECTED / ERROR with retCode/retMsg captured.
-- Fixed env typo (SIG_TANGLED → SIG_TAG fallback).
 """
 
 from __future__ import annotations
@@ -36,6 +39,13 @@ from core.config import settings
 from core.logger import get_logger, bind_context
 from core.bybit_client import Bybit
 from core.notifier_bot import tg_send
+
+# Enhancements (feature memory, classifier, corr gate, sizing helpers)
+from core.feature_store import log_features
+from core.trade_classifier import classify as classify_trade
+from core.corr_gate import allow as corr_allow
+from core.sizing import bayesian_size, risk_capped_qty
+
 try:
     from core.portfolio_guard import guard
 except Exception:
@@ -120,7 +130,7 @@ TAG             = (getattr(settings, "SIG_TAG", None) or os.getenv("SIG_TAG") or
 SIG_DRY_DEFAULT = _get_env_bool("SIG_DRY_RUN", True)
 
 # Executor-specific
-EXEC_DRY_RUN         = _get_env_bool("EXEC_REALLY_DRY_RUN", SIG_DRY_DEFAULT)  # keeps old var if present
+EXEC_DRY_RUN         = _get_env_bool("EXEC_REALLY_DRY_RUN", SIG_DRY_DEFAULT)  # legacy var support
 if os.getenv("EXEC_DRY_RUN") is not None:  # prefer explicit EXEC_DRY_RUN when set
     EXEC_DRY_RUN = _get_env_bool("EXEC_DRY_RUN", SIG_DRY_DEFAULT)
 
@@ -131,6 +141,11 @@ EXEC_POLL_SEC        = _get_env_int("EXEC_POLL_SEC", 2)
 EXEC_MAX_SIGNAL_AGE  = _get_env_int("EXEC_MAX_SIGNAL_AGE_SEC", 120)
 EXEC_ACCOUNT_UID     = (os.getenv("EXEC_ACCOUNT_UID") or "").strip() or None
 
+# Bayesian defaults if no estimates provided by features
+PRIOR_WIN_P          = _get_env_float("EXEC_PRIOR_WIN_P", 0.55)
+EVIDENCE_WIN_P_FALLB = _get_env_float("EXEC_EVIDENCE_WIN_P", 0.55)
+BAYES_K              = _get_env_float("EXEC_BAYES_GAIN", 0.8)
+
 # Optional symbol allowlist
 _raw_allow = (os.getenv("EXEC_SYMBOL_LIST") or getattr(settings, "EXEC_SYMBOLS", "") or "").strip()
 EXEC_SYMBOLS: Optional[List[str]] = [s.strip().upper() for s in _raw_allow.split(",") if s.strip()] or None
@@ -138,6 +153,7 @@ EXEC_SYMBOLS: Optional[List[str]] = [s.strip().upper() for s in _raw_allow.split
 # persistent registries
 SEEN_FILE   = STATE_DIR / "executor_seen.json"      # orderLinkId registry
 OFFSET_FILE = STATE_DIR / "executor_offset.json"    # queue offset, for resilience
+REGIME_FILE = STATE_DIR / "regime_state.json"       # shared regime context
 
 # Bybit client
 by = Bybit()
@@ -216,29 +232,25 @@ def _spread_bps(bid: float, ask: float) -> float:
         return 1e9
     return (ask - bid) / mid * 10000.0
 
-def _qty_from_signal(price: float, params: Dict) -> float:
+def _qty_core(price: float, params: Dict) -> float:
     """
     Sizing precedence:
       1) EXEC_QTY_BASE (>0) → fixed base qty
-      2) If params.stop_dist present AND guard available → risk_value / stop_dist
+      2) If params.stop_dist present AND guard available → risk_capped sizing
       3) Fallback to notional: EXEC_QTY_USDT / price
-    Returns a numeric float; formatting to string happens at request time.
+    Returns numeric float; formatting to string happens at request time.
     """
     if EXEC_QTY_BASE > 0:
-        qty = EXEC_QTY_BASE
-    elif params.get("stop_dist") and hasattr(guard, "current_risk_value"):
+        return EXEC_QTY_BASE
+    if params.get("stop_dist") and guard is not None and hasattr(guard, "current_risk_value"):
         try:
-            risk_val = float(guard.current_risk_value())
+            risk_val = float(guard.current_risk_value())  # USD budget remaining
             px_delta = float(params["stop_dist"])
-            if px_delta > 0:
-                qty = max(0.0, risk_val / max(px_delta, 1e-9))
-            else:
-                qty = max(0.0, EXEC_QTY_USDT / max(price, 1e-9))
+            return max(0.0, risk_capped_qty(remaining_risk_usd=risk_val, stop_dist_px=max(px_delta, 1e-9),
+                                            px=max(price, 1e-9), min_qty=0.0))
         except Exception:
-            qty = max(0.0, EXEC_QTY_USDT / max(price, 1e-9))
-    else:
-        qty = max(0.0, EXEC_QTY_USDT / max(price, 1e-9))
-    return qty
+            pass
+    return max(0.0, EXEC_QTY_USDT / max(price, 1e-9))
 
 def _format_qty(qty: float) -> str:
     txt = f"{qty:.10f}".rstrip("0").rstrip(".")
@@ -285,6 +297,12 @@ def _tail_queue(path: Path, start_pos: int) -> Tuple[int, List[str]]:
         new_pos = fh.tell()
     return new_pos, lines
 
+def _load_regime_snapshot() -> Dict:
+    try:
+        return json.loads(REGIME_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
 # ------------------------
 # Core execution
 # ------------------------
@@ -292,9 +310,7 @@ def _tail_queue(path: Path, start_pos: int) -> Tuple[int, List[str]]:
 def _record_order_state(link_id: str, symbol: str, side: str, qty_val: float, px: Optional[float],
                         state: str, exchange_id: Optional[str] = None,
                         err_code: Optional[str] = None, err_msg: Optional[str] = None) -> None:
-    """
-    Write order state to DB if DB module is available; otherwise no-op.
-    """
+    """Write order state to DB if DB module is available; otherwise no-op."""
     if insert_order is None or set_order_state is None:
         return
     try:
@@ -313,7 +329,8 @@ def _record_execution(link_id: str, qty_val: float, px: float, fee: float = 0.0)
     except Exception as e:
         log.warning("DB exec write failed (%s): %s", link_id, e)
 
-def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint: Optional[float]) -> Tuple[bool, str]:
+def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint: Optional[float],
+                 features: Dict) -> Tuple[bool, str]:
     """
     Place a maker-first limit at the edge of the book (PostOnly) when maker_only, or Market otherwise.
     Enforces spread ceiling (bps). Respects DRY mode.
@@ -328,7 +345,7 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
     if spr_bps > max_bps:
         return False, f"spread {spr_bps:.2f} bps > max {max_bps}"
 
-    maker_only = bool(params.get("maker_only", MAKER_ONLY))
+    maker_only = bool(params.get("maker_only", MA"KER_ONLY"))  # keep default maker behavior
     # Choose price: if hint provided and maker_only, nudge to edge that will post
     if maker_only:
         px = bid if side == "Buy" else ask
@@ -340,7 +357,12 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
     else:
         px = None  # we’ll use Market
 
-    qty_val = _qty_from_signal(price=px or mid, params=params)
+    # Base qty then Bayesian nudge
+    base_qty = _qty_core(price=px or mid, params=params)
+    prior_p  = float(features.get("prior_win_p", PRIOR_WIN_P))
+    edge_p   = float(features.get("edge_prob", EVIDENCE_WIN_P_FALLB))
+    qty_val  = bayesian_size(base_qty, prior_win_p=prior_p, evidence_win_p=edge_p, k=BAYES_K)
+
     qty_txt = _format_qty(qty_val)
     tif = "PostOnly" if (EXEC_POST_ONLY and maker_only and px is not None) else ("ImmediateOrCancel" if px is None else "GoodTillCancel")
 
@@ -350,7 +372,8 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
     if EXEC_DRY_RUN:
         msg = f"🟡 DRY • {symbol} • {side} qty≈{qty_txt} @ {px if px else 'MKT'} • spr {spr_bps:.2f}bps • tif={tif} • link={link_id}"
         tg_send(msg, priority="info")
-        log_event("executor", "entry_dry", symbol, "MAIN", {"side": side, "qty": qty_txt, "px": px, "spr_bps": spr_bps, "tif": tif, "link": link_id})
+        log_event("executor", "entry_dry", symbol, EXEC_ACCOUNT_UID or "MAIN",
+                  {"side": side, "qty": qty_txt, "px": px, "spr_bps": spr_bps, "tif": tif, "link": link_id, "features": features})
         # Simulate filled in DB for analytics continuity
         _record_order_state(link_id, symbol, side, qty_val, px, state="FILLED", exchange_id="DRY-RUN")
         _record_execution(link_id, qty_val, float(px or mid), fee=0.0)
@@ -397,7 +420,7 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
 
 def main() -> None:
     tg_send(f"🟢 Executor online • maker={MAKER_ONLY} • postOnly={EXEC_POST_ONLY} • dry={EXEC_DRY_RUN} • queue={QUEUE_PATH.name}", priority="success")
-    log.info("online • maker=%s postOnly=%s dry=%s queue=%s", MAKER_ONLY, EXEC_POST_ONLY, EXEC_DRY_RUN, QUEUE_PATH)
+    log.info("online • maker=%s postOnly=%s dry=%s queue=%s", MA"KER_ONLY, EXEC_POST_ONLY, EXEC_DRY_RUN, QUEUE_PATH)
 
     seen = _load_seen()
     pos = _read_offset()
@@ -445,6 +468,27 @@ def main() -> None:
                         log.info("stale signal %s dropped (age=%ds)", symbol, int((now_ms - ts_ms)/1000))
                         continue
 
+                # regime snapshot (best-effort)
+                regime = _load_regime_snapshot()
+                if regime:
+                    for k in ("realized_vol_bps","trend_slope","vol_z"):
+                        if k in regime:
+                            features.setdefault(k, regime[k])
+
+                # trade class
+                features["class"] = features.get("class") or classify_trade(features)
+
+                # optional prior/evidence for Bayesian sizing
+                features.setdefault("prior_win_p", PRIOR_WIN_P)
+                features.setdefault("edge_prob",   EVIDENCE_WIN_P_FALLB)
+
+                # cross-symbol correlation gate
+                if not corr_allow(symbol):
+                    msg = f"⏸️ Corr gate block • {symbol}"
+                    tg_send(msg, priority="warn")
+                    log_event("executor", "block_corr", symbol, EXEC_ACCOUNT_UID or "MAIN", {"features": features})
+                    continue
+
                 # override tag if provided
                 tag = str(params.get("tag", TAG) or "B44")
                 link_id = _mk_link_id(symbol, ts_ms or now_ms, ("LONG" if "LONG" in signal else "SHORT"), tag)
@@ -458,7 +502,7 @@ def main() -> None:
                 if breaker_active():
                     msg = f"⛔ Breaker ON • skip open • {symbol} {signal}"
                     tg_send(msg, priority="warn")
-                    log_event("executor", "block_breaker", symbol, "MAIN", {"signal": signal})
+                    log_event("executor", "block_breaker", symbol, EXEC_ACCOUNT_UID or "MAIN", {"signal": signal})
                     continue
 
                 # portfolio guard gates (optional)
@@ -466,26 +510,31 @@ def main() -> None:
                     try:
                         if not guard.allow_new_trade(symbol):
                             tg_send(f"⏸️ Guard block • {symbol} • max concurrency/symbol or daily cap hit", priority="warn")
-                            log_event("executor", "block_guard", symbol, "MAIN")
+                            log_event("executor", "block_guard", symbol, EXEC_ACCOUNT_UID or "MAIN")
                             continue
-                        # risk-based sizing reads guard.current_risk_value() in _qty_from_signal
+                        # risk-based sizing reads guard.current_risk_value() inside _qty_core
                     except Exception as e:
                         log.warning("guard check error: %s", e)
 
+                # Log features before placing
+                try:
+                    log_features(link_id, symbol, EXEC_ACCOUNT_UID or "MAIN", dict(features))
+                except Exception as e:
+                    log.warning("feature_store log failed: %s", e)
+
                 side = "Buy" if "LONG" in signal else "Sell"
 
-                ok, msg = _place_entry(symbol, side, link_id, params, hint_px)
+                ok, msg = _place_entry(symbol, side, link_id, params, hint_px, features)
                 seen[link_id] = int(time.time())
                 _save_seen(seen)
 
                 if ok:
                     tg_send(f"✅ ENTRY • {symbol} • {side} • link={link_id}", priority="success")
-                    log_event("executor", "entry_ok", symbol, "MAIN", {"side": side, "link": link_id})
+                    log_event("executor", "entry_ok", symbol, EXEC_ACCOUNT_UID or "MAIN", {"side": side, "link": link_id, "features": features})
                     log.info("entry ok %s %s link=%s", symbol, side, link_id)
-                    # NOTE: TP/SL Manager will observe position and create exits
                 else:
                     tg_send(f"⚠️ ENTRY FAIL • {symbol} • {side} • {msg}", priority="warn")
-                    log_event("executor", "entry_fail", symbol, "MAIN", {"side": side, "error": msg})
+                    log_event("executor", "entry_fail", symbol, EXEC_ACCOUNT_UID or "MAIN", {"side": side, "error": msg})
                     log.warning("entry fail %s %s: %s", symbol, side, msg)
 
             # commit offset after processing batch

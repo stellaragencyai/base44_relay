@@ -2,9 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 bots.reconciler — DB⇄Exchange sync + ladder maintenance + MFE ratchet.
+- Marks missing-on-exchange orders canceled in DB
+- Applies fills into DB
+- Syncs live positions into DB
+- Rebuilds TP ladder for live positions; stretches remaining TPs when MFE large
 """
 from __future__ import annotations
-import os, time, math
+import os, time
 from typing import Optional, Dict, Any, List
 
 from core.logger import get_logger, bind_context
@@ -22,7 +26,6 @@ RECON_SYMBOL_WHITELIST = [s.strip().upper() for s in (os.getenv("RECON_SYMBOL_WH
 
 from core.db import migrate, get_open_orders, insert_execution, set_order_state, upsert_position
 from core.bybit_client import Bybit
-from bots.tp_sl_policy import ratchet_remaining
 
 # ladder reconcile import (your existing function)
 _recon_func = None
@@ -137,7 +140,6 @@ def _rebuild_ladders(positions: List[Dict[str, Any]], by: Bybit) -> None:
                         safe_mode=RECON_SAFE_MODE, tag_prefix=RECON_TAG_PREFIX,
                         cancel_strays=RECON_CANCEL_STRAYS, bybit=by, mfe_hint_bps=mfe)
         except TypeError:
-            # older reconcile function without mfe_hint_bps
             _recon_func(symbol=sym, side=side, qty=qty, dry_run=RECON_DRY_RUN,
                         safe_mode=RECON_SAFE_MODE, tag_prefix=RECON_TAG_PREFIX,
                         cancel_strays=RECON_CANCEL_STRAYS, bybit=by)
