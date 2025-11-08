@@ -34,16 +34,11 @@
       "strategy": "A0_manual",
       "risk": {
         "initial_risk_pct": 0.0015,
-        "daily_loss_cap_pct": 0.01,
+        "daily_loss_cap_pct": 0.010,
         "max_concurrent_initial_risk_pct": 0.06
       },
       "symbols": {
-        "whitelist": [
-          "PUMPFUNUSDT",
-          "HBARUSDT",
-          "ADAUSDT",
-          "SOLUSDT"
-        ],
+        "whitelist": ["PUMPFUNUSDT", "HBARUSDT", "ADAUSDT", "SOLUSDT"],
         "max_leverage": 75
       },
       "maker_only": true,
@@ -57,7 +52,7 @@
     },
     "SUB7": {
       "name": "Canary",
-      "uid": "260417078",
+      "uid": "",
       "uid_label": "sniper 42",
       "role": "canary",
       "enabled": true,
@@ -68,11 +63,7 @@
         "max_concurrent_initial_risk_pct": 0.02
       },
       "symbols": {
-        "whitelist": [
-          "PUMPFUNUSDT",
-          "HBARUSDT",
-          "DOGEUSDT"
-        ],
+        "whitelist": ["PUMPFUNUSDT", "HBARUSDT", "DOGEUSDT"],
         "max_leverage": 75
       },
       "maker_only": true,
@@ -86,7 +77,7 @@
     },
     "SUB2": {
       "name": "Breakout",
-      "uid": "152304954",
+      "uid": "",
       "uid_label": "AJ Account",
       "role": "breakout",
       "enabled": true,
@@ -97,12 +88,7 @@
         "max_concurrent_initial_risk_pct": 0.04
       },
       "symbols": {
-        "whitelist": [
-          "SOLUSDT",
-          "APTUSDT",
-          "LINKUSDT",
-          "PUMPFUNUSDT"
-        ],
+        "whitelist": ["SOLUSDT", "APTUSDT", "LINKUSDT", "PUMPFUNUSDT"],
         "max_leverage": 50
       },
       "maker_only": true,
@@ -116,7 +102,7 @@
     },
     "SUB1": {
       "name": "Trend",
-      "uid": "152499802",
+      "uid": "",
       "uid_label": "DJ Account",
       "role": "trend",
       "enabled": true,
@@ -127,12 +113,7 @@
         "max_concurrent_initial_risk_pct": 0.04
       },
       "symbols": {
-        "whitelist": [
-          "BTCUSDT",
-          "ETHUSDT",
-          "SOLUSDT",
-          "AVAXUSDT"
-        ],
+        "whitelist": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT"],
         "max_leverage": 25
       },
       "maker_only": true,
