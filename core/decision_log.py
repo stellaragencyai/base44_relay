@@ -1,141 +1,215 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-core/decision_log.py
-Structured decision/event logging for Base44.
+core/decision_log.py — low-latency structured decision/event logging (Base44)
 
 Writes:
-  - JSON Lines to {DECISION_LOG_DIR}/YYYY-MM-DD/decisions.jsonl
-  - Optional Parquet to {DECISION_LOG_DIR}/YYYY-MM-DD/decisions.parquet (if pyarrow/fastparquet installed)
+  • JSONL shards at {DECISION_LOG_DIR}/jsonl/YYYY/MM/DD.jsonl
+  • Optional Parquet shards at {DECISION_LOG_DIR}/parquet/y=YYYY/m=MM/d=DD/part-*.parquet
+    (requires pyarrow or fastparquet; no read-modify-write)
+
+Keeps your favorites:
+  • Async queue with backpressure (drop-oldest or drop-newest)
+  • Extra static context via set_context(...)
+  • RUN_ID, host, pid, stable event id hash
+  • Synchronous API for critical events
 
 Env:
   DECISION_LOG_DIR=./logs/decisions
   DECISION_LOG_FORMATS=jsonl,parquet
   DECISION_LOG_FLUSH_SEC=2
   DECISION_LOG_ROTATE_DAYS=7
-  DECISION_LOG_QUEUE_MAX=10000           # max queued events before backpressure policy kicks in
-  DECISION_LOG_DROP_OLDEST=true          # when queue is full, drop oldest (true) or newest (false)
-  RUN_ID=<any string>                    # stamped on every event for session correlation
+  DECISION_LOG_QUEUE_MAX=10000
+  DECISION_LOG_DROP_OLDEST=true
+  RUN_ID=<string>
+
+Public API:
+  - set_context(**kv), clear_context(keys=None)
+  - log_event(component, event, symbol, account_uid, payload=None, trade_id=None, level="info")
+  - log_event_sync(...)
+  - flush_now(), close()
 """
 
 from __future__ import annotations
-import os, time, json, threading, queue, hashlib, datetime as dt, shutil, socket, atexit, traceback
+import os, io, json, time, atexit, socket, hashlib, threading, queue, shutil
+import datetime as dt
 from typing import Dict, Any, Optional, List
 
-# Optional deps
-try:
-    import pandas as pd   # type: ignore
-    _HAVE_PANDAS = True
-except Exception:
-    _HAVE_PANDAS = False
+# ---------------- Env ----------------
+def _env_str(k: str, d: str) -> str:
+    v = os.getenv(k)
+    return d if v is None else str(v)
 
+def _env_int(k: str, d: int) -> int:
+    v = os.getenv(k)
+    try:
+        return int(v) if v is not None else d
+    except Exception:
+        return d
+
+LOG_DIR = _env_str("DECISION_LOG_DIR", "./logs/decisions")
+FORMATS = [s.strip().lower() for s in _env_str("DECISION_LOG_FORMATS", "jsonl,parquet").split(",") if s.strip()]
+FLUSH_SEC = max(1, _env_int("DECISION_LOG_FLUSH_SEC", 2))
+ROTATE_DAYS = max(1, _env_int("DECISION_LOG_ROTATE_DAYS", 7))
+QUEUE_MAX = max(1000, _env_int("DECISION_LOG_QUEUE_MAX", 10000))
+DROP_OLDEST = _env_str("DECISION_LOG_DROP_OLDEST", "true").lower() in {"1","true","yes","on"}
+RUN_ID = _env_str("RUN_ID", "")
+
+HOSTNAME = socket.gethostname()
+PID = os.getpid()
+
+# Optional parquet engines (no pandas requirement)
+_parquet_ok = False
+_parquet_engine = None
 try:
-    import pyarrow as pa  # type: ignore
-    import pyarrow.parquet as pq  # type: ignore
-    _HAVE_PARQUET = True
+    import pyarrow as _pa               # type: ignore
+    import pyarrow.parquet as _papq     # type: ignore
+    _parquet_ok = True
+    _parquet_engine = "pyarrow"
 except Exception:
     try:
-        import fastparquet  # type: ignore
-        _HAVE_PARQUET = True
+        import fastparquet as _fp       # type: ignore
+        import pandas as _pd            # fastparquet needs pandas
+        _parquet_ok = True
+        _parquet_engine = "fastparquet"
     except Exception:
-        _HAVE_PARQUET = False
+        _parquet_ok = False
 
-# ----------------- env/config -----------------
-_DIR = os.getenv("DECISION_LOG_DIR","./logs/decisions")
-_FORMATS = [x.strip().lower() for x in (os.getenv("DECISION_LOG_FORMATS","jsonl").split(","))]
-_FLUSH_SEC = max(1, int(os.getenv("DECISION_LOG_FLUSH_SEC","2")))
-_ROTATE_DAYS = max(1, int(os.getenv("DECISION_LOG_ROTATE_DAYS","7")))
-_QUEUE_MAX = max(1000, int(os.getenv("DECISION_LOG_QUEUE_MAX", "10000")))
-_DROP_OLDEST = (os.getenv("DECISION_LOG_DROP_OLDEST","true").strip().lower() in {"1","true","yes","on"})
-_RUN_ID = os.getenv("RUN_ID", "") or ""
-
-_HOSTNAME = socket.gethostname()
-_PID = os.getpid()
-
-_q: "queue.Queue[Dict[str,Any]]" = queue.Queue(maxsize=_QUEUE_MAX)
+# ---------------- Internals ----------------
+_q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=QUEUE_MAX)
 _stop = threading.Event()
 _worker_started = False
 _lock = threading.RLock()
-_context_lock = threading.RLock()
-
-# Optional extra context that can be attached to every event
+_ctx_lock = threading.RLock()
 _extra_ctx: Dict[str, Any] = {}
 
-# ----------------- paths/helpers -----------------
 def _ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
-def _day_path(day: dt.date) -> str:
-    return os.path.join(_DIR, day.strftime("%Y-%m-%d"))
+def _today_parts(ts: Optional[float] = None):
+    d = dt.datetime.fromtimestamp(ts or time.time())
+    return d.strftime("%Y"), d.strftime("%m"), d.strftime("%d")
 
-def _jsonl_path(day: dt.date) -> str:
-    return os.path.join(_day_path(day), "decisions.jsonl")
+def _jsonl_path(ts: Optional[float] = None) -> str:
+    y, m, d = _today_parts(ts)
+    base = os.path.join(LOG_DIR, "jsonl", y, m)
+    _ensure_dir(base)
+    return os.path.join(base, f"{d}.jsonl")
 
-def _parquet_path(day: dt.date) -> str:
-    return os.path.join(_day_path(day), "decisions.parquet")
+def _parquet_dir(ts: Optional[float] = None) -> str:
+    y, m, d = _today_parts(ts)
+    base = os.path.join(LOG_DIR, "parquet", f"y={y}", f"m={m}", f"d={d}")
+    _ensure_dir(base)
+    return base
 
-def _rotate():
-    try:
-        os.makedirs(_DIR, exist_ok=True)
-        for name in os.listdir(_DIR):
-            dpath = os.path.join(_DIR, name)
-            if not os.path.isdir(dpath):
-                continue
-            try:
-                d = dt.datetime.strptime(name, "%Y-%m-%d").date()
-            except Exception:
-                continue
-            if (dt.date.today() - d).days > _ROTATE_DAYS:
-                shutil.rmtree(dpath, ignore_errors=True)
-    except FileNotFoundError:
-        pass
-    except Exception:
-        # rotation failure is non-fatal
-        pass
-
-def _hash_event(e: Dict[str,Any]) -> str:
-    s = json.dumps(e, sort_keys=True, default=str)
+def _event_hash(e: Dict[str, Any]) -> str:
+    s = json.dumps(e, sort_keys=True, default=str, ensure_ascii=False)
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
-# ----------------- lifecycle -----------------
-def start_worker():
-    global _worker_started
-    with _lock:
-        if _worker_started:
+def _prune_old_parquet():
+    if not _parquet_ok:
+        return
+    try:
+        cutoff = dt.datetime.utcnow() - dt.timedelta(days=ROTATE_DAYS)
+        y_cut, m_cut, d_cut = int(cutoff.strftime("%Y")), int(cutoff.strftime("%m")), int(cutoff.strftime("%d"))
+        base = os.path.join(LOG_DIR, "parquet")
+        if not os.path.isdir(base):
             return
-        _worker_started = True
-        t = threading.Thread(target=_run, name="decision-log-writer", daemon=True)
-        t.start()
-        # Ensure clean shutdown even on abrupt exit
-        atexit.register(_atexit_flush)
-
-def stop_worker():
-    """Signal the writer to stop and flush any remaining events."""
-    _stop.set()
-    # Wake the thread if it's idle on .get(timeout=0.5)
-    try:
-        _q.put_nowait({"__ping__": True})
+        for ydir in list(os.scandir(base)):
+            if not (ydir.is_dir() and ydir.name.startswith("y=")): continue
+            try:
+                y = int(ydir.name.split("=",1)[-1])
+            except Exception:
+                continue
+            for mdir in list(os.scandir(ydir.path)):
+                if not (mdir.is_dir() and mdir.name.startswith("m=")): continue
+                try:
+                    m = int(mdir.name.split("=",1)[-1])
+                except Exception:
+                    continue
+                for ddir in list(os.scandir(mdir.path)):
+                    if not (ddir.is_dir() and ddir.name.startswith("d=")): continue
+                    try:
+                        d = int(ddir.name.split("=",1)[-1])
+                        if (dt.datetime(y, m, d) < cutoff):
+                            # delete all parts in this day partition
+                            for f in list(os.scandir(ddir.path)):
+                                try:
+                                    os.remove(f.path)
+                                except Exception:
+                                    pass
+                            try:
+                                os.rmdir(ddir.path)
+                            except Exception:
+                                pass
+                    except Exception:
+                        continue
     except Exception:
-        pass
-    # Give it a moment to flush synchronously
-    _final_drain_and_flush(timeout_sec=2.5)
+        pass  # pruning is best-effort
 
-def _atexit_flush():
-    # Best-effort flush at process exit
+# ---------------- Flush backends ----------------
+def _flush_jsonl(rows: List[Dict[str, Any]], ts: Optional[float] = None):
+    if not rows:
+        return
+    path = _jsonl_path(ts)
     try:
-        stop_worker()
+        with open(path, "a", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False, default=str))
+                f.write("\n")
     except Exception:
+        # last-ditch fallback
+        try:
+            fb = os.path.join(LOG_DIR, "jsonl_fallback.log")
+            with open(fb, "a", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(json.dumps(r, ensure_ascii=False, default=str))
+                    f.write("\n")
+        except Exception:
+            pass
+
+def _flush_parquet(rows: List[Dict[str, Any]], ts: Optional[float] = None):
+    if not (_parquet_ok and rows):
+        return
+    d = _parquet_dir(ts)
+    fname = f"part-{int(time.time()*1e6)}.parquet"
+    path = os.path.join(d, fname)
+    try:
+        if _parquet_engine == "pyarrow":
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            tbl = pa.Table.from_pylist(rows)        # schema inferred
+            pq.write_table(tbl, path)
+        else:
+            # fastparquet path needs pandas
+            import pandas as pd  # type: ignore
+            df = pd.DataFrame(rows)
+            _fp.write(path, df)  # type: ignore
+    except Exception:
+        # parquet is optional; ignore
         pass
 
-# ----------------- writer thread -----------------
-def _run():
-    buf: List[Dict[str,Any]] = []
-    last_flush = time.time()
+def _flush_batch(rows: List[Dict[str, Any]], force_ts: Optional[float] = None):
+    if not rows:
+        return
+    ts = force_ts or time.time()
+    if "jsonl" in FORMATS or not FORMATS:
+        _flush_jsonl(rows, ts)
+    if "parquet" in FORMATS:
+        _flush_parquet(rows, ts)
+    # hourly-ish pruning
+    if int(ts) % 3600 < FLUSH_SEC:
+        _prune_old_parquet()
+
+# ---------------- Worker ----------------
+def _writer():
+    buf: List[Dict[str, Any]] = []
+    last = time.time()
     while not _stop.is_set():
         try:
             try:
                 item = _q.get(timeout=0.5)
-                # Ignore internal ping
+                # ignore internal ping
                 if isinstance(item, dict) and item.get("__ping__"):
                     pass
                 else:
@@ -144,27 +218,43 @@ def _run():
                 pass
 
             now = time.time()
-            if buf and (now - last_flush >= _FLUSH_SEC):
-                _flush(buf)
+            if buf and (now - last >= FLUSH_SEC):
+                _flush_batch(buf, now)
                 buf.clear()
-                last_flush = now
+                last = now
         except Exception:
-            # Swallow log errors; never crash trading loop
+            # Never crash the writer
             buf.clear()
-            last_flush = time.time()
+            last = time.time()
 
-    # Final flush on stop
+    # final flush
     try:
         if buf:
-            _flush(buf)
+            _flush_batch(buf, time.time())
     except Exception:
         pass
 
-def _final_drain_and_flush(timeout_sec: float = 2.5):
-    """Drain queue for a short window and flush synchronously."""
+def start_worker():
+    global _worker_started
+    with _lock:
+        if _worker_started:
+            return
+        _worker_started = True
+        t = threading.Thread(target=_writer, name="decision-log-writer", daemon=True)
+        t.start()
+        atexit.register(close)
+
+def close():
+    _stop.set()
+    # nudge the queue
+    try:
+        _q.put_nowait({"__ping__": True})
+    except Exception:
+        pass
+    # drain a bit
     t0 = time.time()
-    batch: List[Dict[str,Any]] = []
-    while (time.time() - t0) < timeout_sec:
+    batch: List[Dict[str, Any]] = []
+    while time.time() - t0 < 2.5:
         try:
             item = _q.get_nowait()
             if isinstance(item, dict) and item.get("__ping__"):
@@ -174,153 +264,140 @@ def _final_drain_and_flush(timeout_sec: float = 2.5):
             break
     if batch:
         try:
-            _flush(batch)
+            _flush_batch(batch, time.time())
         except Exception:
             pass
 
-# ----------------- flush backends -----------------
-def _flush(batch: List[Dict[str,Any]]):
-    day = dt.date.today()
-    base = _day_path(day)
-    _ensure_dir(base)
-
-    if "jsonl" in _FORMATS:
-        jp = _jsonl_path(day)
-        with open(jp, "a", encoding="utf-8") as f:
-            for e in batch:
-                f.write(json.dumps(e, ensure_ascii=False) + "\n")
-
-    if "parquet" in _FORMATS and _HAVE_PANDAS and _HAVE_PARQUET:
+def flush_now():
+    # opportunistic flush: drain queue quickly and flush
+    t0 = time.time()
+    drained: List[Dict[str, Any]] = []
+    while time.time() - t0 < 0.5:
         try:
-            pp = _parquet_path(day)
-            df = pd.DataFrame(batch)
-            if not df.empty:
-                if os.path.exists(pp):
-                    # naive append: read + concat; small daily files keep this acceptable
-                    old = pd.read_parquet(pp)
-                    df = pd.concat([old, df], ignore_index=True)
-                df.to_parquet(pp, index=False)
+            item = _q.get_nowait()
+            if isinstance(item, dict) and item.get("__ping__"):
+                continue
+            drained.append(item)
+        except queue.Empty:
+            break
+    if drained:
+        try:
+            _flush_batch(drained, time.time())
         except Exception:
-            # ignore parquet errors; jsonl is primary
             pass
 
-    _rotate()
-
-# ----------------- public API -----------------
+# ---------------- Context ----------------
 def set_context(**kwargs):
-    """
-    Attach extra static context to every subsequent event, e.g.:
-      set_context(strategy='TrendPullback', version='1.4.2', sub_label='SUB7')
-    """
-    with _context_lock:
-        _extra_ctx.update({k: v for k, v in kwargs.items() if v is not None})
+    """Attach static context to all future events (e.g., strategy, version, sub_label)."""
+    with _ctx_lock:
+        for k, v in kwargs.items():
+            if v is not None:
+                _extra_ctx[k] = v
 
 def clear_context(keys: Optional[List[str]] = None):
-    with _context_lock:
+    with _ctx_lock:
         if keys:
             for k in keys:
                 _extra_ctx.pop(k, None)
         else:
             _extra_ctx.clear()
 
+# ---------------- Public logging ----------------
+def _base_event(component: str,
+                event: str,
+                symbol: str,
+                account_uid: str,
+                payload: Optional[Dict[str, Any]],
+                trade_id: Optional[str],
+                level: str) -> Dict[str, Any]:
+    # ISO with ms + Z
+    ts = dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+    with _ctx_lock:
+        ctx = dict(_extra_ctx)
+    e = {
+        "ts": ts,
+        "level": level,
+        "component": component or "",
+        "event": event or "",
+        "symbol": (symbol or "").upper(),
+        "account_uid": str(account_uid or ""),
+        "trade_id": trade_id or "",
+        "payload": (payload or {}),
+        "run_id": RUN_ID,
+        "host": HOSTNAME,
+        "pid": PID,
+    }
+    if ctx:
+        # surface context both top-level (non-colliding) and inside payload._ctx
+        for k, v in ctx.items():
+            if k not in e:
+                e[k] = v
+        try:
+            if isinstance(e["payload"], dict):
+                e["payload"] = {**e["payload"], "_ctx": ctx}
+        except Exception:
+            pass
+    e["id"] = _event_hash(e)
+    return e
+
 def log_event(component: str,
               event: str,
               symbol: str,
               account_uid: str,
-              payload: Optional[Dict[str,Any]] = None,
+              payload: Optional[Dict[str, Any]] = None,
               trade_id: Optional[str] = None,
               level: str = "info") -> None:
-    """
-    component: 'signal' | 'executor' | 'reconciler' | 'guard' | 'tp_manager' | 'relay' | 'human'
-    event:     short string e.g. 'signal_ok', 'order_create', 'reprice', 'blocked', 'sl_placed'
-    payload:   dict with fields specific to event (prices, qty, reasons, thresholds, etc.)
-    """
     start_worker()
-    ts = dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
-    with _context_lock:
-        ctx = dict(_extra_ctx)  # shallow copy
-    e = {
-        "ts": ts,
-        "level": level,
-        "component": component,
-        "event": event,
-        "symbol": symbol.upper() if symbol else "",
-        "account_uid": str(account_uid),
-        "trade_id": trade_id or "",
-        "payload": payload or {},
-        "run_id": _RUN_ID,
-        "host": _HOSTNAME,
-        "pid": _PID,
-    }
-    # merge context under top-level and inside payload for convenience
-    if ctx:
-        e.update({k: v for k, v in ctx.items() if k not in e})
-        # also surface inside payload under _ctx to avoid key collisions
-        if isinstance(e["payload"], dict):
-            e["payload"] = {**e["payload"], "_ctx": ctx}
-    e["id"] = _hash_event(e)
-
+    e = _base_event(component, event, symbol, account_uid, payload, trade_id, level)
     try:
         _q.put_nowait(e)
     except queue.Full:
-        # Choose drop policy
-        if _DROP_OLDEST:
+        if DROP_OLDEST:
             try:
-                _ = _q.get_nowait()  # drop one oldest
+                _ = _q.get_nowait()  # evict one
                 _q.put_nowait(e)
             except Exception:
-                # if still full, drop newest to avoid blocking trade path
+                # still full: drop newest to avoid blocking trade path
                 pass
-        # else drop newest silently
+        # else: silently drop newest
 
 def log_event_sync(component: str,
                    event: str,
                    symbol: str,
                    account_uid: str,
-                   payload: Optional[Dict[str,Any]] = None,
+                   payload: Optional[Dict[str, Any]] = None,
                    trade_id: Optional[str] = None,
                    level: str = "info") -> None:
-    """
-    Synchronous write for critical events. Avoid spamming this; it blocks the caller.
-    """
-    ts = dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
-    with _context_lock:
-        ctx = dict(_extra_ctx)
-    e = {
-        "ts": ts,
-        "level": level,
-        "component": component,
-        "event": event,
-        "symbol": symbol.upper() if symbol else "",
-        "account_uid": str(account_uid),
-        "trade_id": trade_id or "",
-        "payload": (payload or {}) | {"_ctx": ctx} if ctx else (payload or {}),
-        "run_id": _RUN_ID,
-        "host": _HOSTNAME,
-        "pid": _PID,
-    }
-    e["id"] = _hash_event(e)
-    # write immediately
+    e = _base_event(component, event, symbol, account_uid, payload, trade_id, level)
     try:
-        _flush([e])
+        _flush_batch([e], time.time())
     except Exception:
-        # last-ditch: try jsonl-only direct append
+        # desperate direct JSONL append
         try:
-            day = dt.date.today()
-            base = _day_path(day)
-            _ensure_dir(base)
-            jp = _jsonl_path(day)
-            with open(jp, "a", encoding="utf-8") as f:
-                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+            p = _jsonl_path()
+            _ensure_dir(os.path.dirname(p))
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(json.dumps(e, ensure_ascii=False, default=str))
+                f.write("\n")
         except Exception:
-            # swallow; logging must never crash trading
             pass
 
 def log_kv(component: str, event: str, **kv):
-    """Convenience: log arbitrary key/value payload."""
-    log_event(component, event, symbol=str(kv.pop("symbol", "") or ""),
-              account_uid=str(kv.pop("account_uid", "")),
-              payload=kv)
+    """Convenience to log arbitrary key/values."""
+    symbol = str(kv.pop("symbol", "") or "")
+    account_uid = str(kv.pop("account_uid", "") or "")
+    log_event(component, event, symbol, account_uid, payload=kv)
 
-# Backwards-compat aliases
+# Back-compat alias
 log = log_event
+
+# ---------------- CLI self-test ----------------
+if __name__ == "__main__":
+    set_context(strategy="TrendPullback", version="1.5.0", sub_label="SUB7")
+    log_event("executor", "entry_ok", "BTCUSDT", "MAIN",
+              {"side": "Buy", "qty": 0.0123, "spr_bps": 3.1, "link": "B44-BTC-..."},
+              level="info")
+    log_event("tpsl", "ladder_sync", "ETHUSDT", "MAIN",
+              {"rungs": 5, "stop": 3350.12, "targets": [3400.1, 3420.5]}, level="info")
+    flush_now()
+    print("decision_log wrote to:", LOG_DIR)
