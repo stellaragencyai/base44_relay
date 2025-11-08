@@ -1,271 +1,276 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-core.db — SQLite backbone for Base44
+Base44 — Core DB (SQLite)
 Purpose:
-- Be the *single source of truth* for automation state so restarts are safe.
-- Persist:
-  • jobs (durable queue; visibility timeouts; idempotency)
-  • orders (client lifecycle NEW→SENT→ACKED→PARTIAL→FILLED|CANCELED|REJECTED|ERROR)
-  • executions (fills)
-  • positions (canonical per symbol|sub_uid)
-  • approvals (security daemon audit)
-  • metrics (equity, drawdown, notes)
+- Durable storage for order lifecycle and executions.
+- Simple API used by bots: insert_order, set_order_state, insert_execution.
+- Minimal, battle-hardened defaults; safe on Windows and Linux.
 
-No external deps. Works on Windows. Safe to import before tables exist.
+Tables:
+  orders(
+      link_id TEXT PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      side   TEXT NOT NULL,         -- 'Buy' | 'Sell'
+      qty    REAL NOT NULL,
+      price  REAL,                  -- entry price if known at placement
+      tag    TEXT,                  -- 'B44' etc.
+      state  TEXT NOT NULL,         -- NEW|SENT|ACKED|FILLED|REJECTED|CANCELLED|ERROR
+      exchange_id TEXT,             -- Bybit orderId once known
+      err_code TEXT,
+      err_msg  TEXT,
+      created_ts INTEGER NOT NULL,  -- epoch ms
+      updated_ts INTEGER NOT NULL
+  )
 
-Tables created on first run via migrate().
+  executions(
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      link_id   TEXT NOT NULL,
+      qty       REAL NOT NULL,
+      price     REAL NOT NULL,
+      fee       REAL DEFAULT 0.0,
+      ts_ms     INTEGER NOT NULL,
+      FOREIGN KEY(link_id) REFERENCES orders(link_id) ON DELETE CASCADE
+  )
+
+Notes:
+- We trust link_id uniqueness at the strategy layer (<=36 chars for Bybit).
+- All timestamps are epoch milliseconds.
 """
 
 from __future__ import annotations
 import os
 import sqlite3
-import threading
-from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Iterable, Optional
+import time
+from pathlib import Path
+from typing import Optional, Tuple, Any, Dict
 
-# ------------------------
-# Logger shim (Core vs core)
-# ------------------------
+# Settings import with tolerant casing
 try:
-    from Core.logger import get_logger  # in case someone used capitalized package
-except Exception:  # pragma: no cover
-    try:
-        from core.logger import get_logger
-    except Exception:
-        def get_logger(name: str):  # ultra-minimal fallback
-            class _L:
-                def info(self, *a, **k):  pass
-                def warning(self, *a, **k):  pass
-                def error(self, *a, **k):  pass
-            return _L()
+    from core.config import settings
+except Exception:
+    # Fallback if project casing differs somewhere
+    from Core.config import settings  # type: ignore
 
-log = get_logger("core.db")
+ROOT: Path = settings.ROOT
+STATE_DIR: Path = ROOT / "state"
+STATE_DIR.mkdir(exist_ok=True, parents=True)
 
-# ------------------------
-# Config
-# ------------------------
-DB_PATH = os.getenv("DB_PATH", "./state/base44.db")
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+# Use settings.DB_PATH if present, else default to state/base44.db
+DB_PATH = Path(getattr(settings, "DB_PATH", STATE_DIR / "base44.db"))
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# Single process, multi-thread safe connection
-_lock = threading.RLock()
+# ---------- connection helpers ----------
 
-@contextmanager
-def conn_rw():
-    """Read/write connection with sane pragmas and Row factory."""
-    with _lock:
-        con = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
-        con.row_factory = sqlite3.Row
-        try:
-            con.execute("PRAGMA journal_mode=WAL;")
-            con.execute("PRAGMA synchronous=NORMAL;")
-            con.execute("PRAGMA foreign_keys=ON;")
-            yield con
-        finally:
-            con.close()
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), isolation_level=None, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+_CONN: Optional[sqlite3.Connection] = None
 
-# ------------------------
-# Migration
-# ------------------------
+def _get_conn() -> sqlite3.Connection:
+    global _CONN
+    if _CONN is None:
+        _CONN = _connect()
+    return _CONN
+
+# ---------- migrations ----------
+
+SCHEMA_ORDERS = """
+CREATE TABLE IF NOT EXISTS orders (
+  link_id      TEXT PRIMARY KEY,
+  symbol       TEXT NOT NULL,
+  side         TEXT NOT NULL,
+  qty          REAL NOT NULL,
+  price        REAL,
+  tag          TEXT,
+  state        TEXT NOT NULL,
+  exchange_id  TEXT,
+  err_code     TEXT,
+  err_msg      TEXT,
+  created_ts   INTEGER NOT NULL,
+  updated_ts   INTEGER NOT NULL
+);
+"""
+
+SCHEMA_EXECUTIONS = """
+CREATE TABLE IF NOT EXISTS executions (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  link_id   TEXT NOT NULL,
+  qty       REAL NOT NULL,
+  price     REAL NOT NULL,
+  fee       REAL DEFAULT 0.0,
+  ts_ms     INTEGER NOT NULL,
+  FOREIGN KEY(link_id) REFERENCES orders(link_id) ON DELETE CASCADE
+);
+"""
+
+SCHEMA_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders(symbol);",
+    "CREATE INDEX IF NOT EXISTS idx_orders_state  ON orders(state);",
+    "CREATE INDEX IF NOT EXISTS idx_orders_exid   ON orders(exchange_id);",
+    "CREATE INDEX IF NOT EXISTS idx_exec_link     ON executions(link_id);",
+    "CREATE INDEX IF NOT EXISTS idx_exec_ts       ON executions(ts_ms);",
+]
+
 def migrate() -> None:
-    """Create tables and indexes if they don't exist."""
-    ddl: Iterable[str] = (
-        # Durable jobs queue
-        """
-        CREATE TABLE IF NOT EXISTS jobs (
-          id            TEXT PRIMARY KEY,
-          job_key       TEXT UNIQUE,               -- idempotency key
-          type          TEXT NOT NULL,             -- e.g., 'order.create'
-          payload       TEXT NOT NULL,             -- JSON string
-          status        TEXT NOT NULL DEFAULT 'queued', -- queued|claimed|done|failed
-          visible_at    REAL NOT NULL,             -- unix epoch when claimable
-          attempts      INTEGER NOT NULL DEFAULT 0,
-          max_attempts  INTEGER NOT NULL DEFAULT 5,
-          vt_seconds    INTEGER NOT NULL DEFAULT 30,
-          created_at    TEXT NOT NULL,
-          updated_at    TEXT NOT NULL
-        );
-        """,
-        "CREATE INDEX IF NOT EXISTS idx_jobs_visible ON jobs(status, visible_at);",
-        "CREATE INDEX IF NOT EXISTS idx_jobs_key ON jobs(job_key);",
+    conn = _get_conn()
+    with conn:
+        conn.execute(SCHEMA_ORDERS)
+        conn.execute(SCHEMA_EXECUTIONS)
+        for ddl in SCHEMA_INDEXES:
+            conn.execute(ddl)
 
-        # Orders lifecycle
-        """
-        CREATE TABLE IF NOT EXISTS orders (
-          id              TEXT PRIMARY KEY,        -- our client order id (orderLinkId)
-          symbol          TEXT NOT NULL,
-          side            TEXT NOT NULL,           -- Buy|Sell
-          qty             REAL NOT NULL,
-          price           REAL,
-          tag             TEXT,                    -- AUTO_*, B44, MANUAL, etc.
-          state           TEXT NOT NULL,           -- NEW|SENT|ACKED|PARTIAL|FILLED|CANCELED|REJECTED|ERROR
-          exchange_id     TEXT,                    -- Bybit orderId
-          error_code      TEXT,
-          error_msg       TEXT,
-          created_at      TEXT NOT NULL,
-          updated_at      TEXT NOT NULL
-        );
-        """,
-        "CREATE INDEX IF NOT EXISTS idx_orders_state ON orders(state);",
-        "CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders(symbol);",
+# ---------- time helper ----------
 
-        # Executions (fills)
-        """
-        CREATE TABLE IF NOT EXISTS executions (
-          id            INTEGER PRIMARY KEY AUTOINCREMENT,
-          order_id      TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-          fill_qty      REAL NOT NULL,
-          fill_price    REAL NOT NULL,
-          fee           REAL DEFAULT 0,
-          ts            TEXT NOT NULL
-        );
-        """,
-        "CREATE INDEX IF NOT EXISTS idx_exec_order ON executions(order_id);",
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
-        # Positions (canonical snapshot)
-        """
-        CREATE TABLE IF NOT EXISTS positions (
-          key           TEXT PRIMARY KEY,          -- symbol|sub_uid
-          symbol        TEXT NOT NULL,
-          sub_uid       TEXT NOT NULL,
-          qty           REAL NOT NULL,
-          avg_price     REAL NOT NULL,
-          side          TEXT NOT NULL,             -- Long|Short|Flat
-          updated_at    TEXT NOT NULL
-        );
-        """,
-        "CREATE INDEX IF NOT EXISTS idx_pos_symbol ON positions(symbol);",
+# ---------- public API (used by bots) ----------
 
-        # Security approvals audit
-        """
-        CREATE TABLE IF NOT EXISTS approvals (
-          id            INTEGER PRIMARY KEY AUTOINCREMENT,
-          action        TEXT NOT NULL,             -- withdraw|transfer|breaker_clear
-          amount        REAL,
-          sub_uid       TEXT,
-          ok            INTEGER NOT NULL,          -- 0/1
-          token         TEXT,
-          ts            TEXT NOT NULL
-        );
-        """,
+def insert_order(
+    link_id: str,
+    symbol: str,
+    side: str,
+    qty: float,
+    price: Optional[float],
+    tag: str,
+    state: str = "NEW",
+) -> None:
+    """
+    Insert a new order row if absent; if present, do not clobber historical state.
+    Safe to call repeatedly for idempotency.
+    """
+    ts = _now_ms()
+    conn = _get_conn()
+    with conn:
+        # insert or ignore
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO orders(link_id, symbol, side, qty, price, tag, state, exchange_id, err_code, err_msg, created_ts, updated_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+            """,
+            (link_id, symbol, side, float(qty), float(price) if price is not None else None, tag, state, ts, ts),
+        )
+        # if row existed, only update updated_ts if you really want; we skip to preserve first state
+        conn.execute("UPDATE orders SET updated_ts=? WHERE link_id=?", (ts, link_id))
 
-        # Metrics (equity, drawdown, notes)
-        """
-        CREATE TABLE IF NOT EXISTS metrics (
-          ts            TEXT PRIMARY KEY,
-          equity_usd    REAL,
-          green_days    INTEGER,
-          dd_pct        REAL,
-          notes         TEXT
-        );
-        """
-    )
-    with conn_rw() as con:
-        for sql in ddl:
-            con.execute(sql)
-    log.info("DB migrated at %s", DB_PATH)
-
-# ------------------------
-# Orders API (used by auto_executor)
-# ------------------------
-def insert_order(order_id: str, symbol: str, side: str, qty: float, price: Optional[float],
-                 tag: Optional[str], state: str = "NEW") -> None:
-    """Create order row with initial state."""
-    with conn_rw() as con:
-        con.execute("""
-            INSERT OR REPLACE INTO orders(id, symbol, side, qty, price, tag, state, created_at, updated_at)
-            VALUES(?,?,?,?,?,?,?, ?, ?)
-        """, (order_id, symbol, side, float(qty), price, tag, state, _now_iso(), _now_iso()))
-
-def set_order_state(order_id: str, state: str, exchange_id: Optional[str] = None,
-                    err_code: Optional[str] = None, err_msg: Optional[str] = None) -> None:
-    """Move order to a new state, optionally annotate with exchange id or error."""
-    with conn_rw() as con:
-        con.execute("""
+def set_order_state(
+    link_id: str,
+    state: str,
+    *,
+    exchange_id: Optional[str] = None,
+    err_code: Optional[str] = None,
+    err_msg: Optional[str] = None,
+) -> None:
+    """
+    Update state for an existing order. If the row doesn't exist yet, create a stub row.
+    """
+    ts = _now_ms()
+    conn = _get_conn()
+    with conn:
+        # ensure presence
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO orders(link_id, symbol, side, qty, price, tag, state, exchange_id, err_code, err_msg, created_ts, updated_ts)
+            VALUES (?, 'UNKNOWN', 'UNKNOWN', 0.0, NULL, NULL, 'NEW', NULL, NULL, NULL, ?, ?)
+            """,
+            (link_id, ts, ts),
+        )
+        # update state
+        conn.execute(
+            """
             UPDATE orders
                SET state=?,
                    exchange_id=COALESCE(?, exchange_id),
-                   error_code=?,
-                   error_msg=?,
-                   updated_at=?
-             WHERE id=?
-        """, (state, exchange_id, err_code, err_msg, _now_iso(), order_id))
+                   err_code=?,
+                   err_msg=?,
+                   updated_ts=?
+             WHERE link_id=?
+            """,
+            (state, exchange_id, err_code, err_msg, ts, link_id),
+        )
 
-def insert_execution(order_id: str, fill_qty: float, fill_price: float, fee: float = 0.0) -> None:
-    """Append a fill to executions."""
-    with conn_rw() as con:
-        con.execute("""
-            INSERT INTO executions(order_id, fill_qty, fill_price, fee, ts)
-            VALUES(?,?,?,?,?)
-        """, (order_id, float(fill_qty), float(fill_price), float(fee), _now_iso()))
+def insert_execution(
+    link_id: str,
+    qty: float,
+    price: float,
+    *,
+    fee: float = 0.0,
+    ts_ms: Optional[int] = None,
+) -> None:
+    """
+    Record an execution fill tied to the order link_id.
+    Does NOT change order.state; your reconciler can mark FILLED based on totals.
+    """
+    ts = ts_ms if ts_ms is not None else _now_ms()
+    conn = _get_conn()
+    with conn:
+        # ensure parent order exists
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO orders(link_id, symbol, side, qty, price, tag, state, exchange_id, err_code, err_msg, created_ts, updated_ts)
+            VALUES (?, 'UNKNOWN', 'UNKNOWN', 0.0, NULL, NULL, 'NEW', NULL, NULL, NULL, ?, ?)
+            """,
+            (link_id, ts, ts),
+        )
+        conn.execute(
+            "INSERT INTO executions(link_id, qty, price, fee, ts_ms) VALUES (?, ?, ?, ?, ?)",
+            (link_id, float(qty), float(price), float(fee), ts),
+        )
 
-# ------------------------
-# Positions API (for reconciler)
-# ------------------------
-def upsert_position(symbol: str, sub_uid: str, qty: float, avg_price: float, side: str) -> None:
-    """Create or update a canonical position snapshot."""
-    key = f"{symbol}|{sub_uid}"
-    with conn_rw() as con:
-        con.execute("""
-            INSERT INTO positions(key, symbol, sub_uid, qty, avg_price, side, updated_at)
-            VALUES(?,?,?,?,?,?,?)
-            ON CONFLICT(key) DO UPDATE SET
-                qty=excluded.qty,
-                avg_price=excluded.avg_price,
-                side=excluded.side,
-                updated_at=excluded.updated_at
-        """, (key, symbol, str(sub_uid), float(qty), float(avg_price), side, _now_iso()))
+# ---------- convenience queries (optional) ----------
 
-# ------------------------
-# Approvals & Metrics (security + reporting)
-# ------------------------
-def add_approval(action: str, amount: float | None, sub_uid: str | None, ok: bool, token: str | None) -> None:
-    with conn_rw() as con:
-        con.execute("""
-            INSERT INTO approvals(action, amount, sub_uid, ok, token, ts)
-            VALUES(?,?,?,?,?,?)
-        """, (action, amount, sub_uid, 1 if ok else 0, token, _now_iso()))
+def get_order(link_id: str) -> Optional[Dict[str, Any]]:
+    conn = _get_conn()
+    cur = conn.execute("SELECT * FROM orders WHERE link_id=?", (link_id,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    cols = [d[0] for d in cur.description]
+    return {k: row[i] for i, k in enumerate(cols)}
 
-def put_metric(ts_iso: str, equity_usd: float | None = None, green_days: int | None = None,
-               dd_pct: float | None = None, notes: str | None = None) -> None:
-    """Upsert a metrics row keyed by timestamp (ISO)."""
-    with conn_rw() as con:
-        con.execute("""
-            INSERT INTO metrics(ts, equity_usd, green_days, dd_pct, notes)
-            VALUES(?,?,?,?,?)
-            ON CONFLICT(ts) DO UPDATE SET
-              equity_usd=COALESCE(excluded.equity_usd, metrics.equity_usd),
-              green_days=COALESCE(excluded.green_days, metrics.green_days),
-              dd_pct=COALESCE(excluded.dd_pct, metrics.dd_pct),
-              notes=COALESCE(excluded.notes, metrics.notes)
-        """, (ts_iso, equity_usd, green_days, dd_pct, notes))
+def list_orders(state: Optional[str] = None, limit: int = 100) -> list[Dict[str, Any]]:
+    conn = _get_conn()
+    if state:
+        cur = conn.execute(
+            "SELECT * FROM orders WHERE state=? ORDER BY updated_ts DESC LIMIT ?",
+            (state, int(limit)),
+        )
+    else:
+        cur = conn.execute("SELECT * FROM orders ORDER BY updated_ts DESC LIMIT ?", (int(limit),))
+    cols = [d[0] for d in cur.description]
+    return [{k: row[i] for i, k in enumerate(cols)} for row in cur.fetchall()]
 
-# ------------------------
-# Lightweight selectors (handy for dashboard/reconciler)
-# ------------------------
-def get_open_orders(symbol: Optional[str] = None) -> list[sqlite3.Row]:
-    q = "SELECT * FROM orders WHERE state IN ('NEW','SENT','ACKED','PARTIAL')"
-    args: list = []
-    if symbol:
-        q += " AND symbol=?"
-        args.append(symbol)
-    with conn_rw() as con:
-        return con.execute(q + " ORDER BY created_at ASC", args).fetchall()
+def counts() -> Dict[str, int]:
+    conn = _get_conn()
+    cur = conn.execute("SELECT COUNT(*) FROM orders"); c_orders = cur.fetchone()[0]
+    cur = conn.execute("SELECT COUNT(*) FROM executions"); c_execs = cur.fetchone()[0]
+    return {"orders": int(c_orders), "executions": int(c_execs)}
 
-def get_orders_by_tag(tag_prefix: str) -> list[sqlite3.Row]:
-    with conn_rw() as con:
-        return con.execute("SELECT * FROM orders WHERE tag LIKE ? ORDER BY created_at DESC", (f"{tag_prefix}%",)).fetchall()
+# ---------- CLI ----------
 
-def get_last_executions(limit: int = 50) -> list[sqlite3.Row]:
-    with conn_rw() as con:
-        return con.execute("""
-            SELECT e.*, o.symbol, o.side, o.tag
-            FROM executions e
-            JOIN orders o ON o.id=e.order_id
-            ORDER BY e.id DESC LIMIT ?
-        """, (limit,)).fetchall()
+def _cmd_migrate() -> None:
+    migrate()
+    c = counts()
+    print(f"[DB] migrated at {DB_PATH} • {c['orders']} orders • {c['executions']} executions")
+
+def _cmd_inspect() -> None:
+    migrate()
+    c = counts()
+    print(f"[DB] {DB_PATH} • counts={c}")
+    for row in list_orders(limit=10):
+        print(" -", row.get("link_id"), row.get("symbol"), row.get("state"), row.get("exchange_id"))
+
+if __name__ == "__main__":
+    import sys
+    cmd = (sys.argv[1] if len(sys.argv) > 1 else "migrate").lower()
+    if cmd in ("migrate", "init"):
+        _cmd_migrate()
+    elif cmd in ("inspect", "ls"):
+        _cmd_inspect()
+    else:
+        print("Usage: python -m core.db [migrate|inspect]")

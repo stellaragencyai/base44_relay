@@ -37,6 +37,9 @@ Env (via core.config.settings; add in .env to override)
   TP_MAX_MAKER_OFFSET_TICKS=5
   TP_FALLBACK_OFFSET_TICKS=2
 
+  # Optional symbol control
+  TP_SYMBOL_WHITELIST=BTCUSDT,ETHUSDT
+
 Files
   .state/risk_state.json        # breaker flag file ({"breach": true})
 """
@@ -44,7 +47,6 @@ Files
 from __future__ import annotations
 import json
 import time
-import math
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, getcontext
 from pathlib import Path
@@ -69,33 +71,45 @@ TP_ADOPT_EXISTING = str(getattr(settings, "TP_ADOPT_EXISTING", "true")).lower() 
 TP_CANCEL_NON_B44 = str(getattr(settings, "TP_CANCEL_NON_B44", "false")).lower() in ("1","true","yes","on")
 TP_DRY_RUN        = str(getattr(settings, "TP_DRY_RUN", "true")).lower() in ("1","true","yes","on")
 TP_GRACE_SEC      = int(getattr(settings, "TP_STARTUP_GRACE_SEC", 20))
-TP_TAG            = str(getattr(settings, "TP_MANAGED_TAG", "B44")).strip() or "B44"
+TP_TAG            = (str(getattr(settings, "TP_MANAGED_TAG", "B44")).strip() or "B44")[:12]  # keep linkIds short
 SWEEP_SEC         = int(getattr(settings, "TP_PERIODIC_SWEEP_SEC", 12))
 
-RUNGS             = int(getattr(settings, "TP_RUNGS", 5))
+RUNGS             = max(1, int(getattr(settings, "TP_RUNGS", 5)))
 R_START           = Decimal(str(getattr(settings, "TP_EQUAL_R_START", 0.5)))
 R_STEP            = Decimal(str(getattr(settings, "TP_EQUAL_R_STEP", 0.5)))
 
 POST_ONLY         = str(getattr(settings, "TP_POST_ONLY", "true")).lower() in ("1","true","yes","on")
 SPREAD_RATIO      = float(getattr(settings, "TP_SPREAD_OFFSET_RATIO", 0.35))
-MAX_OFFSET_TICKS  = int(getattr(settings, "TP_MAX_MAKER_OFFSET_TICKS", 5))
-FALLBACK_OFFSET   = int(getattr(settings, "TP_FALLBACK_OFFSET_TICKS", 2))
+MAX_OFFSET_TICKS  = max(1, int(getattr(settings, "TP_MAX_MAKER_OFFSET_TICKS", 5)))
+FALLBACK_OFFSET   = max(1, int(getattr(settings, "TP_FALLBACK_OFFSET_TICKS", 2)))
 
 SL_ATR_MULT_FB    = float(getattr(settings, "TP_SL_ATR_MULT_FALLBACK", 0.45))
 SL_ATR_BUF        = float(getattr(settings, "TP_SL_ATR_BUFFER", 0.08))
 SL_TF             = str(getattr(settings, "TP_SL_TF", 5))
-SL_LOOKBACK       = int(getattr(settings, "TP_SL_LOOKBACK", 120))
-SL_SWING_WIN      = int(getattr(settings, "TP_SL_SWING_WIN", 20))
+SL_LOOKBACK       = max(30, int(getattr(settings, "TP_SL_LOOKBACK", 120)))
+SL_SWING_WIN      = max(5, int(getattr(settings, "TP_SL_SWING_WIN", 20)))
+
+HTTP_TIMEOUT_S    = int(getattr(settings, "HTTP_TIMEOUT_S", 10))
+BYBIT_PUBLIC      = (getattr(settings, "BYBIT_BASE_URL", "https://api.bybit.com").rstrip("/"))
+
+SYMBOL_WHITELIST  = [s.strip().upper() for s in str(getattr(settings, "TP_SYMBOL_WHITELIST", "") or "").split(",") if s.strip()]
 
 # ---------- clients ----------
 by = Bybit()
-by.sync_time()
+try:
+    by.sync_time()
+except Exception as e:
+    log.warning("time sync failed: %s", e)
 
 # ---------- notifier compat ----------
 class _CompatTG:
     @staticmethod
     def send(text: str):
-        tg.safe_text(text, quiet=True)
+        try:
+            tg.safe_text(text, quiet=True)
+        except Exception:
+            pass
+
 def tg_send(msg: str, priority: str = "info", **kwargs):
     _CompatTG.send(msg)
 
@@ -113,9 +127,7 @@ def breaker_active() -> bool:
 # ---------- public HTTP helpers (no auth) ----------
 import urllib.request, urllib.parse
 
-BYBIT_PUBLIC = settings.BYBIT_BASE_URL.rstrip("/")
-
-def _http_get(url: str, timeout: int = 15) -> Tuple[bool, Dict, str]:
+def _http_get(url: str, timeout: int = HTTP_TIMEOUT_S) -> Tuple[bool, Dict, str]:
     req = urllib.request.Request(url=url, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -134,32 +146,32 @@ def _q(params: Dict[str, str]) -> str:
     return urllib.parse.urlencode(params)
 
 def get_instruments_info(symbol: str) -> Dict:
-    ok, data, err = _http_get(f"{BYBIT_PUBLIC}/v5/market/instruments-info?{_q({'category':'linear','symbol':symbol})}", settings.HTTP_TIMEOUT_S)
-    if not ok: 
+    ok, data, err = _http_get(f"{BYBIT_PUBLIC}/v5/market/instruments-info?{_q({'category':'linear','symbol':symbol})}")
+    if not ok:
         raise RuntimeError(err)
     arr = (data.get("result") or {}).get("list") or []
     return arr[0] if arr else {}
 
 def get_orderbook_top(symbol: str) -> Optional[Tuple[Decimal, Decimal]]:
-    ok, data, err = _http_get(f"{BYBIT_PUBLIC}/v5/market/orderbook?{_q({'category':'linear','symbol':symbol,'limit':'1'})}", settings.HTTP_TIMEOUT_S)
+    ok, data, err = _http_get(f"{BYBIT_PUBLIC}/v5/market/orderbook?{_q({'category':'linear','symbol':symbol,'limit':'1'})}")
     if not ok:
         log.warning("orderbook err %s: %s", symbol, err)
         return None
     r = (data.get("result") or {})
-    bids = r.get("b", []) or r.get("bids") or []
-    asks = r.get("a", []) or r.get("asks") or []
+    bids = r.get("b") or r.get("bids") or []
+    asks = r.get("a") or r.get("asks") or []
     if not bids or not asks:
         return None
     return Decimal(str(bids[0][0])), Decimal(str(asks[0][0]))
 
 def get_kline(symbol: str, interval: str, limit: int) -> List[List[str]]:
-    ok, data, err = _http_get(f"{BYBIT_PUBLIC}/v5/market/kline?{_q({'category':'linear','symbol':symbol,'interval':str(interval),'limit':str(limit)})}", settings.HTTP_TIMEOUT_S)
+    ok, data, err = _http_get(f"{BYBIT_PUBLIC}/v5/market/kline?{_q({'category':'linear','symbol':symbol,'interval':str(interval),'limit':str(limit)})}")
     if not ok:
         log.warning("kline err %s: %s", symbol, err)
         return []
     return (data.get("result") or {}).get("list") or []
 
-# ---------- instrument filters ----------
+# ---------- symbol filters ----------
 @dataclass
 class SymbolFilters:
     tick: Decimal
@@ -187,13 +199,13 @@ def _structure_stop(symbol: str, side_word: str, entry: Decimal, tick: Decimal) 
     if not rows:
         return None
     lows, highs, trs = [], [], []
-    prev_close = None
+    prev_close: Optional[Decimal] = None
     for it in rows:
-        o,h,l,c = map(Decimal, [it[1],it[2],it[3],it[4]])
-        lows.append(l); highs.append(h)
+        _open,_high,_low,_close = map(Decimal, [it[1], it[2], it[3], it[4]])
+        lows.append(_low); highs.append(_high)
         if prev_close is not None:
-            trs.append(max(h-l, abs(h-prev_close), abs(l-prev_close)))
-        prev_close = c
+            trs.append(max(_high-_low, abs(_high-prev_close), abs(_low-prev_close)))
+        prev_close = _close
     atr = (sum(trs[-14:]) / Decimal(14)) if len(trs) >= 14 else Decimal(0)
     atr_buf = atr * Decimal(str(SL_ATR_BUF))
     if side_word == "long":
@@ -206,13 +218,13 @@ def _atr_fallback_stop(symbol: str, side_word: str, entry: Decimal, tick: Decima
     rows = get_kline(symbol, SL_TF, SL_LOOKBACK)
     if not rows:
         return None
-    prev_close = None
-    trs = []
+    prev_close: Optional[Decimal] = None
+    trs: List[Decimal] = []
     for it in rows:
-        o,h,l,c = map(Decimal, [it[1],it[2],it[3],it[4]])
+        _open,_high,_low,_close = map(Decimal, [it[1], it[2], it[3], it[4]])
         if prev_close is not None:
-            trs.append(max(h-l, abs(h-prev_close), abs(l-prev_close)))
-        prev_close = c
+            trs.append(max(_high-_low, abs(_high-prev_close), abs(_low-prev_close)))
+        prev_close = _close
     if len(trs) < 14:
         return None
     atr = sum(trs[-14:]) / Decimal(14)
@@ -230,14 +242,16 @@ def _pick_closer(entry: Decimal, a: Optional[Decimal], b: Optional[Decimal], sid
 def ensure_stop(symbol: str, side_word: str, entry: Decimal, pos_idx: int, tick: Decimal) -> Decimal:
     # If a stopLoss already exists on position, keep it
     try:
-        ok, data, err = by.get_positions(category="linear", symbol=symbol)
+        ok, data, _ = by.get_positions(category="linear", symbol=symbol)
         if ok:
             lst = (data.get("result") or {}).get("list") or []
             for p in lst:
-                if p.get("positionIdx") == pos_idx and p.get("stopLoss"):
-                    cur = Decimal(str(p["stopLoss"]))
-                    if cur > 0:
-                        return cur
+                if int(p.get("positionIdx") or 0) == int(pos_idx):
+                    cur = p.get("stopLoss")
+                    if cur:
+                        cur_d = Decimal(str(cur))
+                        if cur_d > 0:
+                            return round_to_tick(cur_d, tick)
     except Exception:
         pass
 
@@ -268,7 +282,7 @@ def adaptive_offset_ticks(symbol: str, tick: Decimal) -> int:
     if spread <= 0:
         return 1
     spread_ticks = int((spread / tick).to_integral_value(rounding=ROUND_DOWN))
-    base = max(1, round(spread_ticks * SPREAD_RATIO))
+    base = max(1, int(spread_ticks * SPREAD_RATIO))
     return int(min(max(base, 1), MAX_OFFSET_TICKS))
 
 # ---------- helpers ----------
@@ -285,6 +299,9 @@ def make_link(base: str = "tp") -> str:
 _t0 = time.monotonic()
 def in_grace() -> bool:
     return (time.monotonic() - _t0) < max(0, TP_GRACE_SEC)
+
+def _allowed_symbol(sym: str) -> bool:
+    return not SYMBOL_WHITELIST or sym.upper() in SYMBOL_WHITELIST
 
 # ---------- order ops ----------
 def fetch_open_tp_orders(symbol: str, close_side: str) -> List[dict]:
@@ -312,8 +329,11 @@ def place_limit_reduce(symbol: str, side: str, price: Decimal, qty: Decimal, tic
     off = adaptive_offset_ticks(symbol, tick)
     px = price + tick*off if side == "Sell" else price - tick*off
 
+    qtxt = f"{qty.normalize()}"
+    ptxt = f"{px.normalize()}"
+
     if TP_DRY_RUN:
-        tg_send(f"🧪 DRY_RUN: {side} {symbol} qty={qty} @ {px}")
+        tg_send(f"🧪 DRY_RUN: {side} {symbol} qty={qtxt} @ {ptxt}")
         return None
 
     ok, data, err = by.place_order(
@@ -321,8 +341,8 @@ def place_limit_reduce(symbol: str, side: str, price: Decimal, qty: Decimal, tic
         symbol=symbol,
         side=side,
         orderType="Limit",
-        qty=f"{qty.normalize()}",
-        price=f"{px.normalize()}",
+        qty=qtxt,
+        price=ptxt,
         timeInForce="PostOnly" if POST_ONLY else "GoodTillCancel",
         reduceOnly=True,
         orderLinkId=make_link("tp"),
@@ -350,6 +370,8 @@ def split_even(total: Decimal, step: Decimal, minq: Decimal, n: int) -> List[Dec
         return [Decimal("0")] * max(0, n)
     ideal = total / Decimal(n)
     chunks = [round_to_step(ideal, step) for _ in range(n)]
+
+    # redistribute rounding diff
     diff = total - sum(chunks)
     if diff != 0:
         sgn = 1 if diff > 0 else -1
@@ -364,7 +386,8 @@ def split_even(total: Decimal, step: Decimal, minq: Decimal, n: int) -> List[Dec
                     diff_abs -= step
             if diff_abs < step:
                 break
-    # enforce min rung qty by redistributing
+
+    # enforce min rung qty by pulling from larger rungs
     for i in range(n):
         if chunks[i] == 0:
             continue
@@ -380,14 +403,21 @@ def split_even(total: Decimal, step: Decimal, minq: Decimal, n: int) -> List[Dec
                     need -= give
                 if need <= 0:
                     break
+    # zero-out sub-min rungs if still impossible
+    for i in range(n):
+        if 0 < chunks[i] < minq:
+            chunks[i] = Decimal("0")
     return chunks
 
 def build_equal_r_targets(entry: Decimal, stop: Decimal, side_word: str, tick: Decimal) -> List[Decimal]:
     targets: List[Decimal] = []
     r_value = abs(entry - stop)
+    # guard against zero-distance stops
+    if r_value <= 0:
+        r_value = tick * Decimal(3)
     for i in range(RUNGS):
         dist_R = R_START + Decimal(i) * R_STEP
-        offset = (dist_R * r_value) if r_value > 0 else (dist_R * tick)
+        offset = dist_R * r_value
         raw_px = entry + offset if side_word == "long" else entry - offset
         targets.append(round_to_tick(raw_px, tick))
     return targets
@@ -452,34 +482,64 @@ def place_or_sync_ladder(symbol: str, side_word: str, entry: Decimal, qty: Decim
             continue
 
         # If we own it and qty is too far off, simple policy: cancel and replace
-        cur_px = Decimal(str(ex.get("price")))
-        cur_qty = Decimal(str(ex.get("qty")))
-        if abs(cur_px - tpx) > tick or abs(cur_qty - tq) >= step:
+        try:
+            cur_px = Decimal(str(ex.get("price")))
+            cur_qty = Decimal(str(ex.get("qty")))
+        except Exception:
+            cur_px, cur_qty = tpx, tq
+
+        # Replace if price drifted beyond tol, or qty deviates by >= 1 step
+        if abs(cur_px - tpx) > tol or abs(cur_qty - tq) >= step:
             cancel_order(symbol, ex_id, ex_link)
             place_limit_reduce(symbol, close_side, tpx, tq, tick)
 
     tg_send(f"✅ {symbol} ladder sync • qty={qty} • entry={entry} • stop={stop}\nTPs: {', '.join(str(x) for x in targets)}")
 
 # ---------- sweep loop ----------
+def _side_word_from_row(p: dict) -> Optional[str]:
+    try:
+        side_raw = (p.get("side") or "").lower()
+        if side_raw.startswith("b"):
+            return "long"
+        if side_raw.startswith("s"):
+            return "short"
+    except Exception:
+        pass
+    # fallback using size sign if present
+    try:
+        sz = Decimal(p.get("size") or "0")
+        if sz > 0:
+            return "long"
+        if sz < 0:
+            return "short"
+    except Exception:
+        pass
+    return None
+
 def sweep_once() -> None:
     ok, data, err = by.get_positions(category="linear")
     if not ok:
         log.warning("positions err: %s", err)
         return
     rows = (data.get("result") or {}).get("list") or []
-    # Map positions by symbol (long/short separate if exchange does)
     for p in rows:
         try:
-            symbol = p.get("symbol") or ""
-            size = Decimal(p.get("size") or "0")
-            if not symbol or size <= 0:
+            symbol = (p.get("symbol") or "").upper()
+            if not symbol or not _allowed_symbol(symbol):
                 continue
-            side_word = "long" if (p.get("side","").lower().startswith("b")) else "short"
-            entry = Decimal(p.get("avgPrice") or "0")
+            size = Decimal(str(p.get("size") or "0"))
+            if size <= 0:
+                continue
+            side_word = _side_word_from_row(p)
+            if not side_word:
+                continue
+            entry = Decimal(str(p.get("avgPrice") or "0"))
+            if entry <= 0:
+                continue
             pos_idx = int(p.get("positionIdx") or 0)
-            place_or_sync_ladder(symbol, side_word, entry, size, pos_idx)
+            place_or_sync_ladder(symbol, side_word, entry, abs(size), pos_idx)
         except Exception as e:
-            log.warning("sweep row error: %s", e)
+            log.warning("sweep row error: %s row=%s", e, p)
 
 def main() -> None:
     tg_send(f"🟢 TP/SL Manager online • dry={TP_DRY_RUN} grace={TP_GRACE_SEC}s adopt={TP_ADOPT_EXISTING} tag={TP_TAG} sweep={SWEEP_SEC}s")
