@@ -14,6 +14,9 @@ What it does
   • When breaker ON: keep/ensure SL protection, pause TP ladder, cancel entry-type non-RO orders,
     and flip working orders to reduce-only where possible.
   • When breaker OFF: full TP ladder maintenance.
+- **Ownership-aware**: only manages positions tagged as Base44-owned.
+  • Startup warmup: SL-only, no new TP placement.
+  • Untagged positions are skipped entirely unless MANAGE_UNTAGGED=true.
 
 Env (via core.config.settings; add in .env to override)
   TP_ADOPT_EXISTING=true
@@ -22,6 +25,13 @@ Env (via core.config.settings; add in .env to override)
   TP_STARTUP_GRACE_SEC=20
   TP_MANAGED_TAG=B44
   TP_PERIODIC_SWEEP_SEC=12
+
+  # Ownership
+  OWNERSHIP_ENFORCED=true
+  MANAGE_UNTAGGED=false
+  OWNERSHIP_SUB_UID=260417078
+  OWNERSHIP_STRATEGY=A2
+  STARTUP_WARMUP_SEC=20   # SL-only window at boot
 
   # Grid and SL
   TP_RUNGS=5
@@ -78,6 +88,13 @@ TP_GRACE_SEC      = int(getattr(settings, "TP_STARTUP_GRACE_SEC", 20))
 TP_TAG            = (str(getattr(settings, "TP_MANAGED_TAG", "B44")).strip() or "B44")[:12]  # keep linkIds short
 SWEEP_SEC         = int(getattr(settings, "TP_PERIODIC_SWEEP_SEC", 12))
 
+# Ownership controls
+OWNERSHIP_ENFORCED = str(getattr(settings, "OWNERSHIP_ENFORCED", "true")).lower() in ("1","true","yes","on")
+MANAGE_UNTAGGED    = str(getattr(settings, "MANAGE_UNTAGGED", "false")).lower() in ("1","true","yes","on")
+OWNERSHIP_SUB_UID  = str(getattr(settings, "OWNERSHIP_SUB_UID", "")).strip()
+OWNERSHIP_STRAT    = str(getattr(settings, "OWNERSHIP_STRATEGY", "")).strip()
+WARMUP_SEC         = int(getattr(settings, "STARTUP_WARMUP_SEC", TP_GRACE_SEC))
+
 RUNGS             = max(1, int(getattr(settings, "TP_RUNGS", 5)))
 R_START           = Decimal(str(getattr(settings, "TP_EQUAL_R_START", 0.5)))
 R_STEP            = Decimal(str(getattr(settings, "TP_EQUAL_R_STEP", 0.5)))
@@ -116,6 +133,47 @@ class _CompatTG:
 
 def tg_send(msg: str, priority: str = "info", **kwargs):
     _CompatTG.send(msg)
+
+# ---------- tag utilities (use core.order_tag if present) ----------
+def _session_id() -> str:
+    try:
+        import os
+        return os.environ.get("B44_SESSION_ID") or time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    except Exception:
+        return time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+
+def _build_owner_tag() -> str:
+    # Preferred: core.order_tag
+    try:
+        from core.order_tag import build_tag
+        return build_tag(OWNERSHIP_SUB_UID or "sub", OWNERSHIP_STRAT or "strat", _session_id())
+    except Exception:
+        pass
+    # Fallback local format
+    base = TP_TAG if TP_TAG else "B44"
+    sub  = OWNERSHIP_SUB_UID or "sub"
+    st   = OWNERSHIP_STRAT or "strat"
+    return f"{base}:{sub}:{st}:{_session_id()}"
+
+OWNER_TAG = _build_owner_tag()
+
+def _attach_link_id(base: str) -> str:
+    # Preferred: core.order_tag.attach_to_client_order_id
+    try:
+        from core.order_tag import attach_to_client_order_id
+        return attach_to_client_order_id(base, OWNER_TAG)
+    except Exception:
+        base_clean = (base or "B44").replace(" ", "")[:24]
+        tail = OWNER_TAG.replace(":", "-")
+        cid  = f"{base_clean}|{tail}"
+        return cid[:64]
+
+def _link_is_ours(link: Optional[str]) -> bool:
+    if not link:
+        return False
+    s = str(link)
+    # Accept either TP_TAG presence or full OWNER_TAG fragments
+    return (TP_TAG in s) or (OWNER_TAG.split(":")[0] in s)
 
 # ---------- public HTTP helpers (no auth) ----------
 import urllib.request, urllib.parse
@@ -184,7 +242,7 @@ def round_to_step(x: Decimal, step: Decimal) -> Decimal:
 
 def round_to_tick(x: Decimal, tick: Decimal) -> Decimal:
     steps = (x / tick).to_integral_value(rounding=ROUND_DOWN)
-    return steps * tick
+    return steps * step
 
 # ---------- SL computation ----------
 def _structure_stop(symbol: str, side_word: str, entry: Decimal, tick: Decimal) -> Optional[Decimal]:
@@ -283,18 +341,50 @@ def side_to_close(side_word: str) -> str:
     return "Sell" if side_word.lower().startswith("l") else "Buy"
 
 def managed_link(link: Optional[str]) -> bool:
-    return bool(link and (TP_TAG in str(link)))
+    return _link_is_ours(link)
 
 def make_link(base: str = "tp") -> str:
-    s = base if base.startswith(TP_TAG) else f"{TP_TAG}-{base}"
-    return s[:36]
+    base = base if base.startswith(TP_TAG) else f"{TP_TAG}-{base}"
+    # Attach full owner/session tail
+    return _attach_link_id(base)[:64]
 
 _t0 = time.monotonic()
 def in_grace() -> bool:
     return (time.monotonic() - _t0) < max(0, TP_GRACE_SEC)
 
+def in_warmup() -> bool:
+    return (time.monotonic() - _t0) < max(0, WARMUP_SEC)
+
 def _allowed_symbol(sym: str) -> bool:
     return not SYMBOL_WHITELIST or sym.upper() in SYMBOL_WHITELIST
+
+# ---------- ownership detection ----------
+def _position_owned(symbol: str, pos_row: dict) -> bool:
+    """
+    Heuristic ownership:
+      - If any open reduce-only order for this symbol carries our tag, we own it.
+      - If position row has comment/positionTag/last*LinkId with our tag, we own it.
+      - Otherwise obey MANAGE_UNTAGGED.
+    """
+    # direct fields if venue echoes anything
+    for k in ("positionTag", "comment", "lastOrderLinkId", "last_exec_link_id"):
+        v = pos_row.get(k)
+        if v and _link_is_ours(str(v)):
+            return True
+
+    # fall back to open orders scan
+    try:
+        ok, data, err = by.get_open_orders(category="linear", symbol=symbol, openOnly=True)
+        if ok:
+            for it in (data.get("result") or {}).get("list") or []:
+                if str(it.get("reduceOnly","")).lower() not in ("true","1"):
+                    continue
+                if _link_is_ours(it.get("orderLinkId")):
+                    return True
+    except Exception:
+        pass
+
+    return MANAGE_UNTAGGED
 
 # ---------- order ops ----------
 def fetch_open_tp_orders(symbol: str, close_side: str) -> List[dict]:
@@ -440,7 +530,6 @@ def enforce_reduce_only_and_cancel_entries(symbol: str) -> None:
             reduce_only = str(o.get("reduceOnly", "0")).lower() in {"1", "true"}
             side = str(o.get("side", "")).upper()
             ord_type = str(o.get("orderType", "")).upper()
-            link = o.get("orderLinkId")
             oid  = o.get("orderId")
             qty  = Decimal(str(o.get("qty", "0") or "0"))
 
@@ -480,6 +569,11 @@ def place_or_sync_ladder(symbol: str, side_word: str, entry: Decimal, qty: Decim
         # Under breaker: enforce reduce-only on any stray orders and pause TPs.
         enforce_reduce_only_and_cancel_entries(symbol)
         tg_send(f"⛔ Breaker ON • {symbol} • SL ensured at {stop} • TPs paused ({why})")
+        return
+
+    # Startup warmup: SL-only, no new TPs
+    if in_warmup():
+        tg_send(f"🧷 Warmup • {symbol} • SL ensured at {stop} • TPs paused")
         return
 
     # Build ladder targets and chunks
@@ -584,12 +678,22 @@ def sweep_once() -> None:
             if entry <= 0:
                 continue
             pos_idx = int(p.get("positionIdx") or 0)
+
+            # Ownership gate
+            if OWNERSHIP_ENFORCED and not _position_owned(symbol, p):
+                tg_send(f"🔎 SKIP untagged {symbol} (ownership enforced)")
+                continue
+
             place_or_sync_ladder(symbol, side_word, entry, abs(size), pos_idx)
         except Exception as e:
             log.warning("sweep row error: %s row=%s", e, p)
 
 def main() -> None:
-    tg_send(f"🟢 TP/SL Manager online • dry={TP_DRY_RUN} grace={TP_GRACE_SEC}s adopt={TP_ADOPT_EXISTING} tag={TP_TAG} sweep={SWEEP_SEC}s")
+    tg_send(
+        f"🟢 TP/SL Manager online • dry={TP_DRY_RUN} grace={TP_GRACE_SEC}s warmup={WARMUP_SEC}s "
+        f"adopt={TP_ADOPT_EXISTING} tag={TP_TAG} owner={OWNER_TAG} sweep={SWEEP_SEC}s "
+        f"enforce_own={OWNERSHIP_ENFORCED} manage_untagged={MANAGE_UNTAGGED}"
+    )
     # Bootstrap once
     sweep_once()
     # Loop
