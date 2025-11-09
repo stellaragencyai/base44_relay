@@ -813,7 +813,7 @@ async function fetchStatus() {{
     `<div>Env: <b>${{js.env}}</b> → <code>${{js.bybit_base}}</code></div>
      <div>Breaker: <b style="color:${{js.breaker?'#c00':'#090'}}">${{js.breaker?'ON':'OFF'}}</b></div>
      <div>Equity: <b>${{js.equity.toFixed(2)}}</b></div>
-     <div>Gross: <b>${{js.gross_exposure.toFixed(2)}}</b> (${pct}% of equity)</div>`;
+     <div>Gross: <b>${{js.gross_exposure.toFixed(2)}}</b> (${{pct}}% of equity)</div>`;
   const gross = js.gross_by_symbol || {{}};
   const gtbl = Object.entries(gross).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<tr><td>${{k}}</td><td style="text-align:right">${{v.toFixed(2)}}</td></tr>`).join('');
   document.getElementById('gross').innerHTML = '<tr><th>Symbol</th><th>Gross</th></tr>'+gtbl;

@@ -2,11 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Base44 — Signal Engine (observe-first, automation-ready + heartbeat)
-Refactored to core stack:
-- Uses core.config.settings for envs/paths
-- Uses core.logger for logging
-- Uses tools.notifier_telegram.tg for notifications
-- Talks to Bybit v5 directly (no pybit/dotenv)
+Refactored to core stack + executor compatibility add-ons
 
 What it does:
 - Scans SIG_SYMBOLS on SIG_TIMEFRAMES with a higher-timeframe bias (SIG_BIAS_TF).
@@ -16,6 +12,11 @@ What it does:
 - Rate-limits per (symbol, timeframe, direction) and dedupes once per bar.
 - Sends startup ping and periodic heartbeats.
 - Obeys global breaker: still heartbeats, but does NOT scan or emit signals when breaker is ON.
+
+Added (critical-path for executor):
+- Injects params.entry_price from Bybit public ticker (fallback to bar close).
+- Adds features.spr_bps computed from bid/ask for downstream checks.
+- Keeps maker_only and spread_max_bps in params so executor can enforce book sanity.
 """
 
 from __future__ import annotations
@@ -81,8 +82,8 @@ SIG_MIN_ATR_PCT  = _getfloat("SIG_MIN_ATR_PCT", 0.25)
 SIG_CD_SEC       = _getint("SIG_NOTIFY_COOLDOWN_SEC", 300)
 
 # Emit options for the executor
-SIG_TAG          = getattr(settings, "SIG_TAG", "B44")
-SIG_MAKER_ONLY   = bool(getattr(settings, "SIG_MAKER_ONLY", True))
+SIG_TAG            = getattr(settings, "SIG_TAG", "B44")
+SIG_MAKER_ONLY     = bool(getattr(settings, "SIG_MAKER_ONLY", True))
 SIG_SPREAD_MAX_BPS = float(getattr(settings, "SIG_SPREAD_MAX_BPS", 8.0))
 
 STOP_MODE        = str(getattr(settings, "SIG_STOP_DIST_MODE", "auto")).strip().lower()  # auto|atr_mult|pct
@@ -101,7 +102,7 @@ TZ_STR: str = settings.TZ or "Europe/London"
 BYBIT_BASE_URL = settings.BYBIT_BASE_URL.rstrip("/")
 
 # =========================
-# HTTP: Bybit public kline
+# HTTP: Bybit public APIs
 # =========================
 
 def _http_get(url: str, timeout: int = 15) -> Tuple[bool, Dict, str]:
@@ -144,6 +145,27 @@ def get_kline(symbol: str, tf_min: int, limit: int = 400) -> List[Tuple[float, f
     out = [(float(x[0]) / 1000.0, float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])) for x in arr]
     out.reverse()  # newest-first -> oldest-first
     return out
+
+def get_ticker(symbol: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Return (bid1, ask1, last). None if unavailable.
+    """
+    qs = urllib.parse.urlencode({"category": "linear", "symbol": symbol})
+    url = f"{BYBIT_BASE_URL}/v5/market/tickers?{qs}"
+    ok, data, err = _http_get(url, timeout=settings.HTTP_TIMEOUT_S)
+    if not ok:
+        return None, None, None
+    lst = (data.get("result") or {}).get("list") or []
+    if not lst:
+        return None, None, None
+    it = lst[0]
+    try:
+        bid = float(it.get("bid1Price") or 0) or None
+        ask = float(it.get("ask1Price") or 0) or None
+        last = float(it.get("lastPrice") or 0) or None
+        return bid, ask, last
+    except Exception:
+        return None, None, None
 
 # =========================
 # Technicals
@@ -369,17 +391,46 @@ def maybe_emit(symbol: str, tf: int, direction: str, why: str, bias: Dict, f: Di
     _last_bar_emit[key] = bar_ts
 
     last = float(f["close"])
-    stop_dist = compute_stop_dist(last, f)
+
+    # Compute entry_price from public ticker; fallback to bar close
+    bid, ask, lpx = get_ticker(symbol)
+    entry_px = lpx or last
+    spr_bps = None
+    try:
+        if bid and ask:
+            mid = (bid + ask) / 2.0
+            if mid > 0:
+                spr_bps = (ask - bid) / mid * 10000.0
+    except Exception:
+        spr_bps = None
+
+    stop_dist = compute_stop_dist(entry_px, f)
 
     params = {
         "maker_only": bool(SIG_MAKER_ONLY),
         "spread_max_bps": float(SIG_SPREAD_MAX_BPS),
         "tag": SIG_TAG,
+        "entry_price": float(entry_px),
     }
     if stop_dist > 0:
         params["stop_dist"] = float(stop_dist)
 
     signal_type = "LONG_BREAKOUT" if direction == "long" else "SHORT_BREAKDOWN"
+
+    features_out = {
+        "bias_adx": round(float(bias["adx"]), 4),
+        "bias_trend_up": bool(bias["trend_up"]),
+        "bias_trend_dn": bool(bias["trend_dn"]),
+        "intra_adx": round(float(f["adx"]), 4),
+        "intra_atrp": round(float(f["atrp"]), 6),
+        "intra_vz": round(float(f["vz"]), 6),
+        "ema20": round(float(f["ema20"]), 10),
+        "ema50": round(float(f["ema50"]), 10),
+        "ema200": round(float(f["ema200"]), 10),
+        "close": round(float(last), 10),
+    }
+    if spr_bps is not None:
+        features_out["spr_bps"] = round(float(spr_bps), 3)
 
     payload = {
         "ts": int(now * 1000),
@@ -389,18 +440,7 @@ def maybe_emit(symbol: str, tf: int, direction: str, why: str, bias: Dict, f: Di
         "why": why,
         "confidence": round(conf, 4),
         "params": params,
-        "features": {
-            "bias_adx": round(float(bias["adx"]), 4),
-            "bias_trend_up": bool(bias["trend_up"]),
-            "bias_trend_dn": bool(bias["trend_dn"]),
-            "intra_adx": round(float(f["adx"]), 4),
-            "intra_atrp": round(float(f["atrp"]), 6),
-            "intra_vz": round(float(f["vz"]), 6),
-            "ema20": round(float(f["ema20"]), 10),
-            "ema50": round(float(f["ema50"]), 10),
-            "ema200": round(float(f["ema200"]), 10),
-            "close": round(float(f["close"]), 10),
-        },
+        "features": features_out,
     }
 
     line = json.dumps(payload, separators=(",", ":"))
