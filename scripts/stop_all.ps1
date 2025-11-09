@@ -1,32 +1,43 @@
-$names = @("python", "python.exe")  # cheap but effective
+param(
+  [string]$BaseDir = "C:\Users\nolan\Desktop\Base 44"
+)
 
-$targets = @("base44_relay.py", "bots.executor_v1", "bots.tp_sl_manager")
-$procs = Get-Process | Where-Object {
-  $_.ProcessName -in $names -and ($_.Path -and (Get-Process -Id $_.Id -IncludeUserName -ErrorAction SilentlyContinue))
-}
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 
-foreach ($p in $procs) {
-  try {
-    $cmdline = (Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)").CommandLine
-    if ($targets | Where-Object { $cmdline -match $_ }) {
-      Write-Host "Stopping PID $($p.Id): $cmdline"
-      Stop-Process -Id $p.Id -ErrorAction SilentlyContinue
+# Kill python modules we launched (match by -m)
+$patterns = @(
+  "-m relay.base44_relay",
+  "-m core.risk_daemon",
+  "-m bots.tp_sl_manager",
+  "-m bots.executor_v1",
+  "-m bots.trade_executor",
+  "-m bots.pnl_daily",
+  "ngrok http http://127.0.0.1:5000"
+)
+
+# Kill python child shells we started
+function Stop-ByPattern {
+  param([string]$pat)
+  Get-CimInstance Win32_Process |
+    Where-Object {
+      ($_.Name -match "python\.exe" -or $_.Name -match "ngrok\.exe" -or $_.Name -match "powershell\.exe") -and
+      ($_.CommandLine -like "*$pat*")
+    } |
+    ForEach-Object {
+      try {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+        Write-Host ("Stopped PID {0}  [{1}]" -f $_.ProcessId, $pat)
+      } catch {}
     }
-  } catch { }
 }
 
-Start-Sleep -Seconds 2
+$patterns | ForEach-Object { Stop-ByPattern $_ }
 
-# Nuke survivors
-$survivors = Get-Process | Where-Object {
-  $_.ProcessName -in $names -and (
-    $targets | Where-Object { ((Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine) -match $_ }
-  )
+# As a courtesy, kill any orphaned python from our venv in BaseDir
+$venv = Join-Path $BaseDir ".venv\Scripts\python.exe"
+Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $venv } | ForEach-Object {
+  try { Stop-Process -Id $_.ProcessId -Force; Write-Host "Stopped orphaned venv python PID $($_.ProcessId)" } catch {}
 }
-foreach ($s in $survivors) {
-  try {
-    Write-Warning "Killing stubborn PID $($s.Id)"
-    Stop-Process -Id $s.Id -Force -ErrorAction SilentlyContinue
-  } catch { }
-}
-Write-Host "Stopped."
+
+Write-Host "All targets stopped (as much as Windows allows)."

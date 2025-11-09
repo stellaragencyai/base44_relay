@@ -1,6 +1,8 @@
 param(
   [string]$BaseDir = "C:\Users\nolan\Desktop\Base 44",
-  [int]$RestartDelaySec = 5
+  [int]$RestartDelaySec = 5,
+  [int]$MaxCrashStreak = 6,
+  [switch]$SkipNgrok
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,22 +19,47 @@ if (-not (Test-Path $VenvPy)) {
   exit 1
 }
 
+# Ensure child pythons flush logs
+$env:PYTHONUNBUFFERED = "1"
+
+function Add-LogHeader {
+  param([string]$File)
+  "==== $(Get-Date -Format s) START ====" | Add-Content -Path $File
+}
+
 # Helper: persistent tab that restarts the target on exit and tees to a log
 function New-TabWatch {
   param(
-    [Parameter(Mandatory)] [string]$Title,
+    [Parameter(Mandatory)] [string]$Title,     # window title
     [Parameter(Mandatory)] [string]$Cmd,       # e.g. "-m bots.executor_v1"
     [Parameter(Mandatory)] [string]$LogFile    # full path to log
   )
+  Add-LogHeader -File $LogFile
   $escapedLog = $LogFile.Replace("'", "''")
   $psCmd = @"
-`$Host.UI.RawUI.WindowTitle = '$Title'
-cd '$BaseDir'
+`$Host.UI.RawUI.WindowTitle = "$Title"
+cd "$BaseDir"
+`$crashStreak = 0
 while (`$true) {
-  Write-Host ('== {0} @ {1} ==' -f '$Title', (Get-Date -Format o)) -ForegroundColor Yellow
-  & '$VenvPy' $Cmd *>&1 | Tee-Object -FilePath '$escapedLog' -Append
-  Write-Warning 'Process exited. Restarting in $RestartDelaySec seconds...'
-  Start-Sleep -Seconds $RestartDelaySec
+  Write-Host ("== {0} @ {1} ==" -f "$Title", (Get-Date -Format o)) -ForegroundColor Yellow
+  try {
+    & "$VenvPy" $Cmd *>&1 | Tee-Object -FilePath "$escapedLog" -Append
+    `$exitCode = `$LASTEXITCODE
+  } catch {
+    `$exitCode = -1
+  }
+  if (`$exitCode -eq 0) {
+    Write-Host "$Title exited normally." -ForegroundColor Green
+    break
+  }
+  `$crashStreak++
+  if (`$crashStreak -ge $MaxCrashStreak) {
+    Write-Warning "$Title crashed `$crashStreak times; giving up."
+    break
+  }
+  `$delay = [Math]::Min($RestartDelaySec * [Math]::Pow(2, [Math]::Max(0, `$crashStreak - 1)), 60)
+  Write-Warning ("$Title exited (code {0}). Restarting in {1}s..." -f `$exitCode, [int]`$delay)
+  Start-Sleep -Seconds [int]`$delay
 }
 "@
   Start-Process powershell -ArgumentList @("-NoExit","-NoLogo","-Command", $psCmd) -WindowStyle Normal | Out-Null
@@ -45,12 +72,13 @@ function New-TabOnce {
     [Parameter(Mandatory)] [string]$Cmd,
     [Parameter(Mandatory)] [string]$LogFile
   )
+  Add-LogHeader -File $LogFile
   $escapedLog = $LogFile.Replace("'", "''")
   $psCmd = @"
-`$Host.UI.RawUI.WindowTitle = '$Title'
-cd '$BaseDir'
-Write-Host ('== {0} @ {1} ==' -f '$Title', (Get-Date -Format o)) -ForegroundColor Yellow
-& '$VenvPy' $Cmd *>&1 | Tee-Object -FilePath '$escapedLog' -Append
+`$Host.UI.RawUI.WindowTitle = "$Title"
+cd "$BaseDir"
+Write-Host ("== {0} @ {1} ==" -f "$Title", (Get-Date -Format o)) -ForegroundColor Yellow
+& "$VenvPy" $Cmd *>&1 | Tee-Object -FilePath "$escapedLog" -Append
 "@
   Start-Process powershell -ArgumentList @("-NoExit","-NoLogo","-Command", $psCmd) -WindowStyle Normal | Out-Null
 }
@@ -62,11 +90,13 @@ $ExecutorModule = if (Test-Path (Join-Path $BaseDir "bots\executor_v1.py")) { "-
 New-TabWatch -Title "relay" -Cmd "-m relay.base44_relay" -LogFile (Join-Path $Logs "relay.log")
 
 # 2) ngrok (optional, no restart loop)
-if (Get-Command ngrok -ErrorAction SilentlyContinue) {
+if (-not $SkipNgrok -and (Get-Command ngrok -ErrorAction SilentlyContinue)) {
+  $ngrokLog = Join-Path $Logs "ngrok.log"
+  Add-LogHeader -File $ngrokLog
   $ngrokCmd = @"
-`$Host.UI.RawUI.WindowTitle = 'ngrok'
-cd '$BaseDir'
-ngrok http http://127.0.0.1:5000  *>&1 | Tee-Object -FilePath '$(Join-Path $Logs "ngrok.log")' -Append
+`$Host.UI.RawUI.WindowTitle = "ngrok"
+cd "$BaseDir"
+ngrok http http://127.0.0.1:5000 *>&1 | Tee-Object -FilePath "$ngrokLog" -Append
 "@
   Start-Process powershell -ArgumentList @("-NoExit","-NoLogo","-Command", $ngrokCmd) -WindowStyle Normal | Out-Null
 }

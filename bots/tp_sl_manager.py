@@ -242,7 +242,7 @@ def round_to_step(x: Decimal, step: Decimal) -> Decimal:
 
 def round_to_tick(x: Decimal, tick: Decimal) -> Decimal:
     steps = (x / tick).to_integral_value(rounding=ROUND_DOWN)
-    return steps * step
+    return steps * tick
 
 # ---------- SL computation ----------
 def _structure_stop(symbol: str, side_word: str, entry: Decimal, tick: Decimal) -> Optional[Decimal]:
