@@ -9,8 +9,10 @@ Now with:
 - guard_state (daily session anchors and running PnL)
 
 API used by bots:
-- insert_order, set_order_state, insert_execution
-- upsert_position, get_positions
+- migrate()
+- insert_order(), set_order_state(), insert_execution()
+- upsert_position(), get_positions()
+- get_open_orders()
 - guard_load(), guard_update_pnl(delta_usd), guard_reset_day()
 
 All timestamps are epoch milliseconds. File path defaults to state/base44.db
@@ -21,7 +23,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from pathlib import Path
-from typing import Optional, Tuple, Any, Dict, List
+from typing import Optional, Dict, List, Any
 
 # Settings import with tolerant casing
 try:
@@ -53,17 +55,22 @@ def _get_conn() -> sqlite3.Connection:
         _CONN = _connect()
     return _CONN
 
+# ---------- time ----------
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
 # ---------- schema ----------
 
 SCHEMA_ORDERS = """
 CREATE TABLE IF NOT EXISTS orders (
-  link_id      TEXT PRIMARY KEY,
+  link_id      TEXT PRIMARY KEY,           -- our orderLinkId
   symbol       TEXT NOT NULL,
-  side         TEXT NOT NULL,
+  side         TEXT NOT NULL,              -- Buy|Sell
   qty          REAL NOT NULL,
-  price        REAL,
+  price        REAL,                       -- may be NULL for market
   tag          TEXT,
-  state        TEXT NOT NULL,
+  state        TEXT NOT NULL,              -- NEW|SENT|ACKED|PARTIAL|FILLED|CANCELED|REJECTED|ERROR
   exchange_id  TEXT,
   err_code     TEXT,
   err_msg      TEXT,
@@ -75,7 +82,7 @@ CREATE TABLE IF NOT EXISTS orders (
 SCHEMA_EXECUTIONS = """
 CREATE TABLE IF NOT EXISTS executions (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
-  link_id   TEXT NOT NULL,
+  link_id   TEXT NOT NULL,                 -- FK to orders.link_id
   qty       REAL NOT NULL,
   price     REAL NOT NULL,
   fee       REAL DEFAULT 0.0,
@@ -90,19 +97,20 @@ CREATE TABLE IF NOT EXISTS positions (
   symbol     TEXT NOT NULL,
   qty        REAL NOT NULL,
   avg_price  REAL NOT NULL,
-  side       TEXT NOT NULL,        -- Long|Short|Flat
+  side       TEXT NOT NULL,                -- Long|Short|Flat
   updated_ts INTEGER NOT NULL,
   PRIMARY KEY(sub_uid, symbol)
 );
 """
 
+# Guard table had a missing 'updated_ts' in older drafts; we add it idempotently.
 SCHEMA_GUARD = """
 CREATE TABLE IF NOT EXISTS guard_state (
-  id            INTEGER PRIMARY KEY CHECK (id = 1),
-  session_start_ms INTEGER NOT NULL,
-  start_equity_usd REAL NOT NULL DEFAULT 0.0,
-  realized_pnl_usd REAL NOT NULL DEFAULT 0.0,
-  breach         INTEGER NOT NULL DEFAULT 0  -- 0/1
+  id                INTEGER PRIMARY KEY CHECK (id = 1),
+  session_start_ms  INTEGER NOT NULL,
+  start_equity_usd  REAL NOT NULL DEFAULT 0.0,
+  realized_pnl_usd  REAL NOT NULL DEFAULT 0.0,
+  breach            INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -115,6 +123,11 @@ SCHEMA_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_pos_sym       ON positions(symbol);",
 ]
 
+def _column_exists(table: str, col: str) -> bool:
+    c = _get_conn()
+    cur = c.execute(f"PRAGMA table_info({table})")
+    return any(str(r[1]).lower() == col.lower() for r in cur.fetchall())
+
 def migrate() -> None:
     c = _get_conn()
     with c:
@@ -122,6 +135,12 @@ def migrate() -> None:
         c.execute(SCHEMA_EXECUTIONS)
         c.execute(SCHEMA_POSITIONS)
         c.execute(SCHEMA_GUARD)
+        # add guard_state.updated_ts if missing
+        if not _column_exists("guard_state", "updated_ts"):
+            try:
+                c.execute("ALTER TABLE guard_state ADD COLUMN updated_ts INTEGER DEFAULT (CAST(strftime('%s','now') AS INTEGER)*1000)")
+            except Exception:
+                pass
         for ddl in SCHEMA_INDEXES:
             c.execute(ddl)
         # seed guard row if absent
@@ -129,14 +148,9 @@ def migrate() -> None:
         if (cur.fetchone() or [0])[0] == 0:
             now = _now_ms()
             c.execute(
-                "INSERT INTO guard_state(id, session_start_ms, start_equity_usd, realized_pnl_usd, breach) VALUES (1, ?, 0.0, 0.0, 0)",
-                (now,),
+                "INSERT INTO guard_state(id, session_start_ms, start_equity_usd, realized_pnl_usd, breach, updated_ts) VALUES (1, ?, 0.0, 0.0, 0, ?)",
+                (now, now),
             )
-
-# ---------- time ----------
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 
 # ---------- orders / executions ----------
 
@@ -153,10 +167,12 @@ def insert_order(link_id: str, symbol: str, side: str, qty: float, price: Option
         )
         c.execute("UPDATE orders SET updated_ts=? WHERE link_id=?", (ts, link_id))
 
-def set_order_state(link_id: str, state: str, *, exchange_id: Optional[str] = None, err_code: Optional[str] = None, err_msg: Optional[str] = None) -> None:
+def set_order_state(link_id: str, state: str, *, exchange_id: Optional[str] = None,
+                    err_code: Optional[str] = None, err_msg: Optional[str] = None) -> None:
     ts = _now_ms()
     c = _get_conn()
     with c:
+        # ensure order row exists
         c.execute(
             """
             INSERT OR IGNORE INTO orders(link_id, symbol, side, qty, price, tag, state, exchange_id, err_code, err_msg, created_ts, updated_ts)
@@ -181,6 +197,7 @@ def insert_execution(link_id: str, qty: float, price: float, *, fee: float = 0.0
     ts = ts_ms if ts_ms is not None else _now_ms()
     c = _get_conn()
     with c:
+        # ensure order row exists
         c.execute(
             """
             INSERT OR IGNORE INTO orders(link_id, symbol, side, qty, price, tag, state, exchange_id, err_code, err_msg, created_ts, updated_ts)
@@ -192,6 +209,8 @@ def insert_execution(link_id: str, qty: float, price: float, *, fee: float = 0.0
             "INSERT INTO executions(link_id, qty, price, fee, ts_ms) VALUES (?, ?, ?, ?, ?)",
             (link_id, float(qty), float(price), float(fee), ts),
         )
+        # best-effort mark order filled if qty>0 (reconciler may overwrite)
+        c.execute("UPDATE orders SET state='FILLED', updated_ts=? WHERE link_id=? AND state NOT IN ('FILLED','CANCELED')", (ts, link_id))
 
 def list_orders(state: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
     c = _get_conn()
@@ -201,6 +220,32 @@ def list_orders(state: Optional[str] = None, limit: int = 100) -> List[Dict[str,
         cur = c.execute("SELECT * FROM orders ORDER BY updated_ts DESC LIMIT ?", (int(limit),))
     cols = [d[0] for d in cur.description]
     return [{k: row[i] for i, k in enumerate(cols)} for row in cur.fetchall()]
+
+def get_open_orders() -> List[Dict[str, Any]]:
+    """
+    Compatibility helper for bots.reconciler expecting fields:
+      id (alias of link_id), symbol, state, tag
+    Only returns rows considered 'open' on our side.
+    """
+    c = _get_conn()
+    cur = c.execute(
+        """
+        SELECT link_id, symbol, state, tag
+          FROM orders
+         WHERE state IN ('NEW','SENT','ACKED','PARTIAL')
+         ORDER BY updated_ts DESC
+        """
+    )
+    out: List[Dict[str, Any]] = []
+    for link_id, symbol, state, tag in cur.fetchall():
+        out.append({
+            "id": link_id,          # alias for compat with older code
+            "link_id": link_id,
+            "symbol": symbol,
+            "state": state,
+            "tag": tag,
+        })
+    return out
 
 def counts() -> Dict[str, int]:
     c = _get_conn()
@@ -241,30 +286,33 @@ def get_positions(sub_uid: Optional[str] = None) -> List[Dict[str, Any]]:
 
 def guard_load() -> Dict[str, Any]:
     c = _get_conn()
-    cur = c.execute("SELECT session_start_ms, start_equity_usd, realized_pnl_usd, breach FROM guard_state WHERE id=1")
+    cur = c.execute("SELECT session_start_ms, start_equity_usd, realized_pnl_usd, breach, updated_ts FROM guard_state WHERE id=1")
     row = cur.fetchone()
     if not row:
         migrate()
         return guard_load()
     return {
-        "session_start_ms": row[0],
+        "session_start_ms": int(row[0]),
         "start_equity_usd": float(row[1]),
         "realized_pnl_usd": float(row[2]),
         "breach": bool(row[3]),
+        "updated_ts": int(row[4]) if row[4] is not None else 0,
     }
 
 def guard_update_pnl(delta_usd: float) -> None:
+    ts = _now_ms()
     c = _get_conn()
     with c:
         c.execute(
             "UPDATE guard_state SET realized_pnl_usd = realized_pnl_usd + ?, updated_ts=? WHERE id=1",
-            (float(delta_usd), _now_ms()),
+            (float(delta_usd), ts),
         )
 
 def guard_reset_day(start_equity_usd: float = 0.0) -> None:
+    ts = _now_ms()
     c = _get_conn()
     with c:
         c.execute(
-            "UPDATE guard_state SET session_start_ms=?, start_equity_usd=?, realized_pnl_usd=0.0, breach=0",
-            (_now_ms(), float(start_equity_usd)),
+            "UPDATE guard_state SET session_start_ms=?, start_equity_usd=?, realized_pnl_usd=0.0, breach=0, updated_ts=? WHERE id=1",
+            (ts, float(start_equity_usd), ts),
         )
