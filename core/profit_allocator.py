@@ -29,7 +29,7 @@ from core.decision_log import log_event
 from tools.notifier_telegram import tg
 from core.config import settings
 from core import relay_client as rc
-from core.withdraw import request_withdraw, AllowlistError, WindowError, CapError
+from core.withdrawls import request_withdraw, AllowlistError, WindowError, CapError
 
 log = get_logger("core.profit_allocator")
 
