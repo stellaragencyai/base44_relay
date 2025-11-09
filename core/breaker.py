@@ -1,40 +1,52 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-core/breaker.py — file-backed global breaker with TTL, atomic writes, helpers, CLI,
-and optional friend-approval enforcement for CLEAR/OFF.
+core/breaker.py — global breaker with TTL, approval-gated CLEAR, auto-trip helpers, and CLI.
 
 State file: .state/risk_state.json
 Schema:
 {
   "breach": true|false,
   "reason": "string",
-  "ts": 1730820000,          # set/last change (unix seconds)
+  "ts": 1730820000,          # last change (unix seconds)
   "ttl": 0,                  # seconds, 0 = no expiry
-  "source": "human|bot|...", # optional provenance tag
-  "version": 1               # schema version (future-proofing)
+  "source": "human|bot|...", # provenance
+  "version": 1
 }
 
 Env (optional):
   BREAKER_DEFAULT_TTL_SEC=0
   BREAKER_NOTIFY_COOLDOWN_SEC=8
 
-Approval integration (optional):
-  APPROVAL_REQUIRE_CLEAR=1            # if 1, any set_off() requires friend approval
-  APPROVAL_ACCOUNT_KEY=main           # label shown in approval (e.g., main, sub:<uid>)
-  APPROVAL_SERVICE_URL=http://127.0.0.1:5055
-  APPROVAL_SHARED_SECRET=...          # must match approval_service
-  APPROVAL_TIMEOUT_SEC=180            # how long to wait for approval
+  # Auto-trip inputs (used by auto_tick or direct helpers)
+  BREAKER_HEALTH_PATH=.state/health.json
+  BREAKER_AUTO_ENABLE=true
+  NEWS_LOCKOUT=false               # if true, news flag in health trips breaker
+  FUNDING_LOCKOUT_MIN=0            # if >0 and funding window active in health, trip for N minutes
+  CONNECTIVITY_LOCKOUT_SEC=0       # if >0 and relay/exchange unhealthy, trip for N seconds
+  DD_LOCKOUT_PCT=0                 # if >0 and health.drawdown_pct >= value, trip
+  HEARTBEAT_STALE_SEC=0            # if >0 and any critical heartbeat stale > value, trip
 
-Notes:
-- set_on / breach still do NOT require approval (safety first).
-- set_off requires approval if APPROVAL_REQUIRE_CLEAR=1; otherwise behaves as before.
+Approval integration (optional):
+  APPROVAL_REQUIRE_CLEAR=1
+  APPROVAL_ACCOUNT_KEY=portfolio
+  APPROVAL_SERVICE_URL=http://127.0.0.1:5055
+  APPROVAL_SHARED_SECRET=...
+  APPROVAL_TIMEOUT_SEC=180
+
+CLI:
+  python -m core.breaker --status
+  python -m core.breaker --on --reason "manual" --for-min 15
+  python -m core.breaker --off --reason "ok_to_trade"
+  python -m core.breaker --extend 600
+  python -m core.breaker --auto-tick
 """
 
 from __future__ import annotations
 import os, json, time, pathlib, argparse, contextlib, functools
 from typing import Optional, Dict, Any, Callable, TypeVar
 
+# ---------- paths/state ----------
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 STATE_DIR = ROOT / ".state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -46,26 +58,34 @@ NOTIFY_COOLDOWN = int(os.getenv("BREAKER_NOTIFY_COOLDOWN_SEC", "8") or "8")
 
 SCHEMA_VERSION = 1
 
-# --- approval knobs ---
+# ---------- optional auto inputs ----------
+HEALTH_PATH = (os.getenv("BREAKER_HEALTH_PATH") or (STATE_DIR / "health.json")).__str__()
+AUTO_ENABLE = (os.getenv("BREAKER_AUTO_ENABLE", "true").strip().lower() in {"1","true","yes","on"})
+NEWS_LOCKOUT = (os.getenv("NEWS_LOCKOUT", "false").strip().lower() in {"1","true","yes","on"})
+FUNDING_LOCKOUT_MIN = int(os.getenv("FUNDING_LOCKOUT_MIN", "0") or "0")
+CONNECTIVITY_LOCKOUT_SEC = int(os.getenv("CONNECTIVITY_LOCKOUT_SEC", "0") or "0")
+DD_LOCKOUT_PCT = float(os.getenv("DD_LOCKOUT_PCT", "0") or "0")
+HEARTBEAT_STALE_SEC = int(os.getenv("HEARTBEAT_STALE_SEC", "0") or "0")
+
+# ---------- approval knobs ----------
 APPROVAL_REQUIRE_CLEAR = (os.getenv("APPROVAL_REQUIRE_CLEAR", "0") or "0").strip() in {"1","true","yes","on"}
-APPROVAL_ACCOUNT_KEY = (os.getenv("APPROVAL_ACCOUNT_KEY", "main") or "main").strip()
+APPROVAL_ACCOUNT_KEY = (os.getenv("APPROVAL_ACCOUNT_KEY", "portfolio") or "portfolio").strip()
 APPROVAL_TIMEOUT_SEC = int(os.getenv("APPROVAL_TIMEOUT_SEC", "180") or "180")
 
-# optional notifier
+# ---------- notifier / decision log ----------
 try:
     from core.notifier_bot import tg_send  # type: ignore
 except Exception:
     def tg_send(msg: str, priority: str = "info", **_):  # type: ignore
         print(f"[notify/{priority}] {msg}")
 
-# optional structured decision log
 try:
     from core.decision_log import log_event  # type: ignore
 except Exception:
     def log_event(*_, **__):  # type: ignore
         pass
 
-# optional approval client
+# ---------- approval client detection ----------
 def _approval_available() -> bool:
     try:
         from core.approval_client import require_approval  # noqa
@@ -74,10 +94,6 @@ def _approval_available() -> bool:
         return False
 
 def _require_clear_approval(reason: str) -> None:
-    """
-    Call friend-approval before clearing breaker, if enabled.
-    Raises on denial/timeout to prevent unsafe clear.
-    """
     if not APPROVAL_REQUIRE_CLEAR:
         return
     if not _approval_available():
@@ -88,13 +104,13 @@ def _require_clear_approval(reason: str) -> None:
         action="breaker_clear",
         account_key=APPROVAL_ACCOUNT_KEY,
         reason=reason or "manual_clear",
-        ttl_sec=max(60, APPROVAL_TIMEOUT_SEC),         # request validity
-        timeout_sec=APPROVAL_TIMEOUT_SEC,              # how long we wait here
+        ttl_sec=max(60, APPROVAL_TIMEOUT_SEC),
+        timeout_sec=APPROVAL_TIMEOUT_SEC,
         poll_sec=2.5
     )
     tg_send(f"🔐 Approval OK • breaker_clear • req={rid}", priority="success")
 
-# ---- low-level IO (atomic) ----------------------------------------------------
+# ---------- low-level IO (atomic) ----------
 def _atomic_write_json(path: pathlib.Path, data: Dict[str, Any]) -> None:
     data.setdefault("version", SCHEMA_VERSION)
     _TMP_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -109,8 +125,11 @@ def _load_raw() -> Dict[str, Any]:
     try:
         d = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         d.setdefault("version", SCHEMA_VERSION)
-        for k in ("breach","reason","ts","ttl","source"):
-            d.setdefault(k, {"breach": False, "reason": "", "ts": 0, "ttl": 0, "source": ""}[k if k in ("reason","source") else k])
+        d.setdefault("breach", bool(d.get("breach", False)))
+        d.setdefault("reason", d.get("reason", "") or "")
+        d.setdefault("ts", int(d.get("ts", 0) or 0))
+        d.setdefault("ttl", int(d.get("ttl", 0) or 0))
+        d.setdefault("source", d.get("source", "") or "")
         return d
     except Exception:
         return {"breach": False, "reason": "", "ts": 0, "ttl": 0, "source": "", "version": SCHEMA_VERSION}
@@ -123,7 +142,7 @@ def _save_raw(d: Dict[str, Any]) -> None:
     d.setdefault("version", SCHEMA_VERSION)
     _atomic_write_json(STATE_FILE, d)
 
-# ---- semantics ----------------------------------------------------------------
+# ---------- semantics ----------
 def _expired(d: Dict[str, Any]) -> bool:
     ttl = int(d.get("ttl") or 0)
     if ttl <= 0:
@@ -132,7 +151,6 @@ def _expired(d: Dict[str, Any]) -> bool:
     return (_now() - ts) >= ttl
 
 def _normalize(d: Dict[str, Any]) -> Dict[str, Any]:
-    # Auto-clear expired breach
     if d.get("breach") and _expired(d):
         d = dict(d)
         d["breach"] = False
@@ -143,29 +161,21 @@ def _normalize(d: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 def status() -> Dict[str, Any]:
-    """Return current breaker state (auto-expiring if necessary)."""
     return _normalize(_load_raw())
 
 def is_active() -> bool:
     return bool(status().get("breach"))
 
 def remaining_ttl() -> int:
-    """Return remaining TTL in seconds (0 if none or inactive)."""
     d = status()
     ttl = int(d.get("ttl") or 0)
     if ttl <= 0 or not d.get("breach"):
         return 0
     elapsed = max(0, _now() - int(d.get("ts") or 0))
-    rem = max(0, ttl - elapsed)
-    return rem
+    return max(0, ttl - elapsed)
 
-# alias
-time_left = remaining_ttl
-
+# ---------- block helpers ----------
 def should_block(component: str = "", why: str = "") -> bool:
-    """
-    Cheap gate other modules can call. If active, logs a decision-log event once per call site.
-    """
     if not is_active():
         return False
     log_event("guard", "breaker_block", symbol="", account_uid="", payload={
@@ -173,9 +183,8 @@ def should_block(component: str = "", why: str = "") -> bool:
     })
     return True
 
-# ---- toggles ------------------------------------------------------------------
 _last_notify = {"on": 0, "off": 0}
-_last_announced: Dict[str, Any] = {"breach": None, "reason": None, "ttl": None}  # for de-dupe spam control
+_last_sig: Dict[str, Any] = {"breach": None, "reason": None, "ttl": None}
 
 def _can_notify(kind: str) -> bool:
     now = _now()
@@ -185,10 +194,6 @@ def _can_notify(kind: str) -> bool:
     return False
 
 def set_on(reason: str = "manual", ttl_sec: Optional[int] = None, source: str = "human") -> None:
-    """
-    Turn breaker ON. Optional ttl_sec overrides env default; 0 disables expiry.
-    Approval is NOT required to enable safety.
-    """
     ttl = int(ttl_sec if ttl_sec is not None else DEFAULT_TTL)
     cur = status()
     new_state = {"breach": True, "reason": reason, "ts": _now(), "ttl": max(0, ttl), "source": source, "version": SCHEMA_VERSION}
@@ -198,10 +203,10 @@ def set_on(reason: str = "manual", ttl_sec: Optional[int] = None, source: str = 
 
     changed = (not cur.get("breach")) or (int(cur.get("ttl") or 0) != ttl) or (cur.get("reason") != reason)
     sig = {"breach": True, "reason": reason, "ttl": ttl}
-    if changed and (_last_announced != sig) and _can_notify("on"):
+    if changed and (_last_sig != sig) and _can_notify("on"):
         extra = f" • ttl={ttl}s" if ttl > 0 else ""
         tg_send(f"🛑 Breaker ON • reason: {reason}{extra}", priority="error")
-        _last_announced.update(sig)
+        _last_sig.update(sig)
 
 def set_on_for(minutes: float, reason: str = "manual", source: str = "human") -> None:
     ttl = max(0, int(minutes * 60))
@@ -212,10 +217,6 @@ def set_on_until(reason: str, until_epoch_sec: int, source: str = "human") -> No
     set_on(reason=reason, ttl_sec=ttl, source=source)
 
 def extend(ttl_delta_sec: int) -> None:
-    """
-    If active, sets NEW ttl from NOW to ttl_delta_sec.
-    If inactive, no-op.
-    """
     d = status()
     if not d.get("breach"):
         return
@@ -227,10 +228,6 @@ def extend(ttl_delta_sec: int) -> None:
         tg_send(f"⏩ Breaker TTL set • ttl={new_ttl}s", priority="info")
 
 def set_off(reason: str = "manual_clear", source: str = "human") -> None:
-    """
-    Turn breaker OFF. If APPROVAL_REQUIRE_CLEAR=1, demands friend approval.
-    """
-    # Approval gate (raises on denial/timeout/misconfig)
     try:
         _require_clear_approval(reason)
     except Exception as e:
@@ -247,21 +244,15 @@ def set_off(reason: str = "manual_clear", source: str = "human") -> None:
     if cur_active and _can_notify("off"):
         tg_send("✅ Breaker OFF • entries re-enabled", priority="success")
 
-# convenient alias
+# Alias
 def breach(reason: str = "manual", ttl_sec: Optional[int] = None, source: str = "human") -> None:
     set_on(reason=reason, ttl_sec=ttl_sec, source=source)
 
-# ---- blocking helpers ---------------------------------------------------------
+# ---------- guarded contexts / decorators ----------
 T = TypeVar("T")
 
 @contextlib.contextmanager
 def breaker_guard(component: str = "", block_reason: str = "breaker_active"):
-    """
-    Usage:
-        with breaker_guard("tp_manager"):
-            ... do risky things ...
-    If active, raises RuntimeError to let caller unwind cleanly.
-    """
     if is_active():
         log_event("guard", "breaker_block_enter", symbol="", account_uid="", payload={
             "component": component, "reason": block_reason, "state": status()
@@ -270,11 +261,6 @@ def breaker_guard(component: str = "", block_reason: str = "breaker_active"):
     yield
 
 def wait_until_clear(timeout_sec: int = 120, poll_sec: float = 1.0) -> bool:
-    """
-    Block until breaker clears or auto-expires.
-    Returns True if cleared, False on timeout.
-    Safe to use in bots that want to pause entries briefly.
-    """
     deadline = _now() + int(timeout_sec)
     while _now() < deadline:
         if not is_active():
@@ -283,9 +269,6 @@ def wait_until_clear(timeout_sec: int = 120, poll_sec: float = 1.0) -> bool:
     return not is_active()
 
 def require_clear(component: str = "", block_reason: str = "breaker_active") -> Callable[[Callable[..., T]], Callable[..., T]]:
-    """
-    Decorator to guard a function. Raises RuntimeError if breaker is ON.
-    """
     def deco(fn: Callable[..., T]) -> Callable[..., T]:
         @functools.wraps(fn)
         def wrapper(*args, **kwargs) -> T:
@@ -300,14 +283,6 @@ def require_clear(component: str = "", block_reason: str = "breaker_active") -> 
 
 @contextlib.contextmanager
 def breaker_blocking(component: str = "", why: str = "breaker_active"):
-    """
-    Context that converts active breaker into a no-op block (yields False) instead of raising.
-    Usage:
-        with breaker_blocking("signal_engine") as allowed:
-            if not allowed:
-                return
-            ... continue ...
-    """
     if is_active():
         log_event("guard", "breaker_block_silent", symbol="", account_uid="", payload={
             "component": component, "why": why, "state": status()
@@ -316,13 +291,92 @@ def breaker_blocking(component: str = "", why: str = "breaker_active"):
     else:
         yield True
 
-# ---- CLI ----------------------------------------------------------------------
+# ---------- auto-trip helpers ----------
+def _read_health() -> Dict[str, Any]:
+    try:
+        p = pathlib.Path(HEALTH_PATH)
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+def trip_for_news(ttl_min: int = 10, detail: str = "") -> None:
+    if not NEWS_LOCKOUT:
+        return
+    set_on_for(ttl_min, reason=f"news_lockout{(':'+detail) if detail else ''}", source="auto")
+
+def trip_for_funding(ttl_min: int) -> None:
+    if ttl_min > 0:
+        set_on_for(ttl_min, reason="funding_lockout", source="auto")
+
+def trip_for_connectivity(ttl_sec: int) -> None:
+    if ttl_sec > 0:
+        set_on(reason="connectivity", ttl_sec=ttl_sec, source="auto")
+
+def trip_for_drawdown(dd_pct: float, now_dd: float) -> None:
+    if dd_pct > 0 and now_dd >= dd_pct:
+        set_on(reason=f"drawdown_{now_dd:.2f}_pct", ttl_sec=0, source="auto")
+
+def trip_for_heartbeat(stale_sec: int) -> None:
+    if stale_sec <= 0:
+        return
+    h = _read_health()
+    # expecting format: {"bots": {"name": {"last": epoch_sec, "critical": true}, ...}}
+    try:
+        bots = (h.get("bots") or {})
+        now = _now()
+        for name, meta in bots.items():
+            last = int(meta.get("last", 0) or 0)
+            critical = bool(meta.get("critical", False))
+            if not critical:
+                continue
+            if last <= 0 or (now - last) > stale_sec:
+                set_on(reason=f"heartbeat:{name}", ttl_sec=stale_sec, source="auto")
+                break
+    except Exception:
+        pass
+
+def auto_tick() -> None:
+    """
+    Single evaluation step; call periodically from a watchdog.
+    Reads health file and env knobs, then trips/extends breaker as needed.
+    Never auto-clears; clearing is explicit or via TTL expiry.
+    """
+    if not AUTO_ENABLE:
+        return
+    h = _read_health()
+
+    # news
+    if NEWS_LOCKOUT and bool(h.get("news_active", False)):
+        trip_for_news(ttl_min=max(1, FUNDING_LOCKOUT_MIN or 10))
+
+    # funding window
+    if FUNDING_LOCKOUT_MIN > 0 and bool(h.get("funding_window", False)):
+        trip_for_funding(ttl_min=FUNDING_LOCKOUT_MIN)
+
+    # connectivity
+    unhealthy = bool(h.get("relay_unhealthy", False) or h.get("exchange_unhealthy", False))
+    if unhealthy and CONNECTIVITY_LOCKOUT_SEC > 0:
+        trip_for_connectivity(ttl_sec=CONNECTIVITY_LOCKOUT_SEC)
+
+    # drawdown
+    dd = float(h.get("drawdown_pct", 0.0) or 0.0)
+    if DD_LOCKOUT_PCT > 0:
+        trip_for_drawdown(DD_LOCKOUT_PCT, dd)
+
+    # heartbeat stale
+    if HEARTBEAT_STALE_SEC > 0:
+        trip_for_heartbeat(HEARTBEAT_STALE_SEC)
+
+# ---------- CLI ----------
 def _cli():
     ap = argparse.ArgumentParser(description="Global breaker control")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--on", action="store_true", help="Turn breaker ON")
     g.add_argument("--off", action="store_true", help="Turn breaker OFF")
     g.add_argument("--status", action="store_true", help="Print breaker status JSON")
+    g.add_argument("--auto-tick", action="store_true", help="Run one auto evaluation step")
 
     ap.add_argument("--reason", type=str, default=None, help="Reason for ON/OFF")
     ap.add_argument("--on-ttl", type=int, default=None, help="With --on, set TTL seconds (0 = no expiry)")
@@ -337,6 +391,9 @@ def _cli():
     if args.time_left:
         print(remaining_ttl()); return
     if args.status:
+        print(json.dumps(status(), indent=2)); return
+    if args.auto_tick:
+        auto_tick()
         print(json.dumps(status(), indent=2)); return
     if args.on:
         if args.for_min is not None:
