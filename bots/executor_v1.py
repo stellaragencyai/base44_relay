@@ -13,12 +13,14 @@ Highlights vs your previous version
 - Optional gross exposure cap (% of equity) to avoid over-levering during chaos.
 - Fixed maker-only default bug and a log format crash.
 - Safer env getters; unified booleans.
+- NEW: per-strategy risk buckets and per-symbol session windows (no news locks).
 """
 
 from __future__ import annotations
 import json
 import os
 import time
+import datetime as _dt
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 
@@ -170,6 +172,10 @@ SEEN_FILE   = STATE_DIR / "executor_seen.json"      # orderLinkId registry
 OFFSET_FILE = STATE_DIR / "executor_offset.json"    # queue offset, for resilience
 REGIME_FILE = STATE_DIR / "regime_state.json"       # shared regime context
 
+# Risk buckets + session windows config (new)
+EX_BUCKETS_JSON = os.getenv("EX_BUCKETS_JSON", "cfg/risk_buckets.json")
+EX_SESSIONS_JSON = os.getenv("EX_SESSIONS_JSON", "cfg/sessions.json")
+
 # Bybit client
 by = Bybit()
 try:
@@ -283,20 +289,70 @@ def _gross_exposure_usdt() -> float:
             continue
     return gross
 
+# ---- risk buckets + sessions (no news) ----
+
+def _load_json_safe(path_str: str, default):
+    p = Path(path_str)
+    if not p.exists():
+        return default
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+_BUCKETS = _load_json_safe(EX_BUCKETS_JSON, {"default_risk_pct": 0.003, "by_class": {}})
+_SESS    = _load_json_safe(EX_SESSIONS_JSON, {})
+
+def _risk_pct_for_class(cls: str) -> float:
+    dflt = float(_BUCKETS.get("default_risk_pct", 0.003))
+    return float((_BUCKETS.get("by_class") or {}).get((cls or "default"), dflt))
+
+def _now_hhmm_local() -> str:
+    return _dt.datetime.now().strftime("%H:%M")
+
+def _in_ranges(hhmm: str, ranges: List[str]) -> bool:
+    try:
+        h, m = map(int, hhmm.split(":"))
+        cur = h * 60 + m
+        for r in ranges:
+            a, b = r.split("-")
+            ha, ma = map(int, a.split(":"))
+            hb, mb = map(int, b.split(":"))
+            start = ha * 60 + ma
+            end = hb * 60 + mb
+            # same-day or wrap past midnight
+            if (start <= end and start <= cur <= end) or (start > end and (cur >= start or cur <= end)):
+                return True
+    except Exception:
+        return True  # fail open rather than crash
+    return False
+
+def can_trade_now(sym: str, cls: str) -> bool:
+    cfg = _SESS.get(sym) or {}
+    ranges = cfg.get(cls) or cfg.get("default") or ["00:00-23:59"]
+    return _in_ranges(_now_hhmm_local(), ranges)
+
+# ------------------------
+# Sizing
+# ------------------------
+
 def _qty_core(price: float, params: Dict) -> float:
     """
     Sizing precedence:
       1) EXEC_QTY_BASE (>0) → fixed base qty
-      2) If params.stop_dist present and guard.current_risk_value exists → risk_capped sizing
+      2) If params.stop_dist present → risk_capped sizing (uses remaining_risk_usd if available)
       3) Fallback to notional: EXEC_QTY_USDT / price
+    Then scale by per-class risk_pct if provided (default 0.003).
     """
+    risk_pct = float(params.get("risk_pct") or 0.003)
+    # normalize EXEC_QTY_USDT vs default risk 0.003 so buckets scale up/down linearly
+    base_qty_usd = max(0.0, EXEC_QTY_USDT * (risk_pct / 0.003))
+
     if EXEC_QTY_BASE > 0:
-        return EXEC_QTY_BASE
-    if params.get("stop_dist"):
+        qty = EXEC_QTY_BASE
+    elif params.get("stop_dist"):
         try:
-            # Use Portfolio Guard style budget if exposed through core.sizing helper usage
             px_delta = float(params["stop_dist"])
-            # remaining_risk_usd: we assume sizing helper handles None gracefully; try guard.current_risk_value() if exposed
             remaining_risk_usd = None
             try:
                 from core.portfolio_guard import guard as pg_guard  # type: ignore
@@ -304,15 +360,18 @@ def _qty_core(price: float, params: Dict) -> float:
                     remaining_risk_usd = float(pg_guard.current_risk_value())  # type: ignore
             except Exception:
                 pass
-            return max(0.0, risk_capped_qty(
-                remaining_risk_usd=(remaining_risk_usd if remaining_risk_usd is not None else EXEC_QTY_USDT),
+            qty = risk_capped_qty(
+                remaining_risk_usd=(remaining_risk_usd if remaining_risk_usd is not None else base_qty_usd),
                 stop_dist_px=max(px_delta, 1e-9),
                 px=max(price, 1e-9),
                 min_qty=0.0
-            ))
+            )
         except Exception:
-            pass
-    return max(0.0, EXEC_QTY_USDT / max(price, 1e-9))
+            qty = base_qty_usd / max(price, 1e-9)
+    else:
+        qty = base_qty_usd / max(price, 1e-9)
+
+    return max(0.0, qty)
 
 def _format_qty(qty: float) -> str:
     txt = f"{qty:.10f}".rstrip("0").rstrip(".")
@@ -581,6 +640,16 @@ def main() -> None:
                         continue
                 except Exception as e:
                     log.warning("exposure check failed: %s", e)
+
+                # session window gate (new)
+                cls = features.get("class") or "default"
+                if not can_trade_now(symbol, cls):
+                    tg_send(f"⏸️ Session closed • {symbol} • {cls}", priority="warn")
+                    log_event("executor", "block_session", symbol, EXEC_ACCOUNT_UID or "MAIN", {"class": cls})
+                    continue
+
+                # per-class risk bucket (new)
+                params["risk_pct"] = _risk_pct_for_class(cls)
 
                 # Log features before placing
                 try:

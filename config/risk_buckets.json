@@ -1,0 +1,8 @@
+{
+  "default_risk_pct": 0.003,
+  "by_class": {
+    "trend":   0.0035,
+    "breakout":0.0025,
+    "meanrev": 0.0015
+  }
+}
