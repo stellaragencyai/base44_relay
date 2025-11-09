@@ -2,42 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 trade_executor.py — risk-based entries via relay (DRY by default), maker-first, window-gated, cooldowned,
-with symbol whitelist/blacklist guards.
+with symbol whitelist/blacklist guards, guard-aware, idempotent links, and DB journaling.
 
-Now with:
-- Account policy compliance (who may open, per-account risk multiplier, symbol allow-list)
-- Decision logging (every decision/event is recorded to logs/decisions for ML + audit)
-- Optional Portfolio Guard check (halts new trades if daily DD cap/concurrency blocked)
-
-ENV (existing + new knobs):
-  EXECUTOR_RELAY_BASE=http://127.0.0.1:5000
-  EXECUTOR_RELAY_TOKEN=...
-  LIVE=false
-  LOG_LEVEL=INFO|DEBUG
-  SIGNAL_DIR=signals
-
-  # Safety/behavior knobs
-  EXEC_RISK_PCT=0.15                          # % equity risk per trade (0.15 = 0.15%)
-  EXEC_MAX_LEVERAGE=50                        # hard cap on notional/equity
-  EXEC_MAKER_TICKS=2                          # price shading in ticks for PostOnly
-  EXEC_COOLDOWN_SEC=300                       # per-symbol cooldown
-  EXEC_TRADING_START=00:00                    # local window start (TZ from .env’s TZ)
-  EXEC_TRADING_END=23:59                      # local window end
-  EXEC_ALLOW_SHORTS=true                      # enable short entries
-  EQUITY_COIN=USDT                            # wallet coin to read for equity
-  TZ=America/Phoenix
-
-  # Lists
-  EXEC_SYMBOL_WHITELIST=BTCUSDT,ETHUSDT
-  EXEC_SYMBOL_BLACKLIST=PUMPFUNUSDT
-
-  # NEW (multi-account + tagging)
-  EXEC_ACCOUNT_UID=MAIN                       # 'MAIN' or a numeric sub UID string
-  ORDER_TAG_PREFIX=B44                        # prefix for orderLinkId
+Enhancements added:
+- Global breaker integration via core.guard.guard_blocking_reason() to block new entries while allowing other systems to manage exits elsewhere.
+- Deterministic orderLinkId (hash-based) for idempotent replays/restarts.
+- DB journaling into core.db (orders/state) on submit/ack/fail for audit and metrics.
+- Keeps existing account policy, portfolio guard (soft), decision log, and relay client flow.
 """
 
 from __future__ import annotations
-import os, json, time, logging, pathlib, math, datetime
+import os, json, time, logging, pathlib, math, datetime, hashlib
 from collections import defaultdict
 from dotenv import load_dotenv
 
@@ -61,10 +36,18 @@ except Exception:
         # Fallback: keep stdout noisy if decision logger isn't present
         print(f"[DECLOG/{component}/{event}] {symbol} @{account_uid} {payload or {}}")
 
+# Portfolio guard remains soft
 try:
     from core.portfolio_guard import guard as _guard
 except Exception:
     _guard = None
+
+# Global breaker / guard (HARD gate for entries)
+try:
+    from core.guard import guard_blocking_reason
+except Exception:
+    def guard_blocking_reason():
+        return (False, "")
 
 # Optional Telegram notifier
 try:
@@ -72,6 +55,15 @@ try:
 except Exception:
     def tg_send(msg: str, priority: str = "info", **_):
         print(f"[notify/{priority}] {msg}")
+
+# Optional DB journaling
+try:
+    from core.db import insert_order, set_order_state
+except Exception:
+    def insert_order(link_id, symbol, side, qty, price, tag, state="NEW"):  # type: ignore
+        pass
+    def set_order_state(link_id, state, *, exchange_id=None, err_code=None, err_msg=None):  # type: ignore
+        pass
 
 # ------------- env helpers -------------
 load_dotenv()
@@ -169,7 +161,19 @@ def _leverage_ok(qty: float, price: float, equity: float, max_lev: int) -> bool:
 def _risk_cash(equity: float, risk_pct: float) -> float:
     return equity * (risk_pct / 100.0)
 
-def place_entry(symbol, side, qty, price=None, order_tag="B44"):
+def _link_id(sym: str, side: str, qty: float, price: float|None, tag: str, ts_ms: int) -> str:
+    """
+    Deterministic orderLinkId for idempotency on restarts.
+    Buckets price/qty to avoid trivial drift causing duplicates.
+    """
+    bucket_px = 0 if price is None else int(round(float(price), 6) * 1e6)
+    bucket_q  = int(round(float(qty), 6) * 1e6)
+    payload = f"{sym}|{side}|{bucket_q}|{bucket_px}|{tag}|{ts_ms//30000}"  # 30s bucket to dedupe bursts
+    h = hashlib.blake2s(payload.encode("utf-8"), digest_size=10).hexdigest()
+    base = (tag or ORDER_TAG_PREFIX)[:12]
+    return f"{base}-exe-{h}"[:36]
+
+def place_entry(symbol, side, qty, price=None, order_tag="B44", link_id: str|None=None):
     body = {
         "category": "linear",
         "symbol": symbol,
@@ -178,12 +182,12 @@ def place_entry(symbol, side, qty, price=None, order_tag="B44"):
         "qty": str(qty),
         **({"price": f"{price:.10f}".rstrip("0").rstrip(".")} if price else {}),
         "timeInForce": "PostOnly" if price else "IOC",
-        "orderLinkId": f"{order_tag}-{int(time.time()*1000)}"
+        "orderLinkId": link_id or f"{order_tag}-{int(time.time()*1000)}"
     }
     if not LIVE:
         log.info(f"[DRY] /v5/order/create {json.dumps(body, separators=(',',':'))}")
-        tg_send(f"🧪 EXEC DRY • {symbol} {side} {qty} @ {body.get('price','MKT')}", priority="info")
-        return {"ok": True, "dry": True}
+        tg_send(f"🧪 EXEC DRY • {symbol} {side} {qty} @ {body.get('price','MKT')} • {body['orderLinkId']}", priority="info")
+        return {"ok": True, "dry": True, "orderLinkId": body["orderLinkId"]}
     return rc.proxy("POST", "/v5/order/create", body=body)
 
 # ------------- main -------------
@@ -241,6 +245,14 @@ def run():
         log_event("executor","no_signals_after_filters","",ACCOUNT_UID)
         return
 
+    # HARD guard gate: block new entries if breaker ON
+    blocked, why = guard_blocking_reason()
+    if blocked:
+        log.info(f"guard breaker active: block new entries • {why}")
+        log_event("executor","guard_block_all","",ACCOUNT_UID,{"reason":why})
+        tg_send(f"⛔ Executor block: breaker ON • {why}", priority="warn")
+        return
+
     # instruments + equity
     instr = load_or_fetch(sorted(list(syms)))
     try:
@@ -266,7 +278,7 @@ def run():
         spread_max_bps = float(params.get("spread_max_bps", 8))
         tag = str(params.get("tag") or ORDER_TAG_PREFIX)
 
-        if not sym: 
+        if not sym:
             continue
 
         # account-level symbol allow-list
@@ -285,11 +297,11 @@ def run():
         if not (want_buy or want_sell):
             continue
 
-        # guard rail: concurrency / dd cap (soft)
+        # portfolio guard (soft concurrency/drawdown gate)
         if _guard is not None and not _guard.allow_new_trade(sym):
             hb = _guard.heartbeat()
-            log.info(f"{sym}: blocked by guard (halted={hb.get('halted')}, open={len(hb.get('open_trades',{}))})")
-            log_event("executor","guard_block",sym,ACCOUNT_UID,{"halted":hb.get("halted"),"open":len(hb.get("open_trades",{}))})
+            log.info(f"{sym}: blocked by portfolio guard (halted={hb.get('halted')}, open={len(hb.get('open_trades',{}))})")
+            log_event("executor","guard_block_soft",sym,ACCOUNT_UID,{"halted":hb.get("halted"),"open":len(hb.get("open_trades",{}))})
             continue
 
         meta = instr.get(sym)
@@ -297,7 +309,8 @@ def run():
             log.warning(f"{sym}: no instrument meta; skipping")
             log_event("executor","no_instrument_meta",sym,ACCOUNT_UID)
             continue
-        tick = meta["tickSize"]; step = meta["lotStep"]; minq = meta["minQty"]
+        tick = meta["tickSize"]; step = meta["lotStep"] if "lotStep" in meta else meta.get("qtyStep", meta.get("stepSize", 0))
+        minq = meta.get("minQty", 0)
 
         tk = rc.ticker(sym)
         if not tk:
@@ -341,7 +354,7 @@ def run():
         if notional > max_notional:
             raw_qty = max_notional / max(last, 1e-9)
 
-        qty = round_qty(raw_qty, step, minq)
+        qty = round_qty(raw_qty, tick_step := step, min_qty := minq)
         if qty <= 0:
             log.info(f"{sym}: qty {raw_qty:.8f} -> {qty} after rounding; skip")
             log_event("executor","qty_round_block",sym,ACCOUNT_UID,{"raw_qty":raw_qty,"step":step,"minQty":minq})
@@ -361,35 +374,60 @@ def run():
             log_event("executor","leverage_block",sym,ACCOUNT_UID,{"qty":qty,"px":price or last,"equity":equity,"maxLev":EXEC_MAX_LEVERAGE})
             continue
 
+        # deterministic link id
+        ts_ms = int(s.get("ts") or int(now*1000))
+        link_id = _link_id(sym, side, qty, price, tag, ts_ms)
+
+        # DB: record intent
+        try:
+            insert_order(link_id, sym, side, float(qty), float(price) if price else None, tag, state="NEW")
+        except Exception:
+            pass
+
         # submit
         log_event("executor","order_submit",sym,ACCOUNT_UID,{
             "side": side, "qty": qty, "price": price or "MKT",
             "risk_pct": eff_risk_pct, "spr_bps": spr_bps,
-            "maker_only": maker_only, "tag": tag
+            "maker_only": maker_only, "tag": tag, "link": link_id
         })
 
-        res = place_entry(sym, side, qty, price=price if maker_only else None, order_tag=tag)
+        res = place_entry(sym, side, qty, price=price if maker_only else None, order_tag=tag, link_id=link_id)
         _LAST_TRADE_TS[sym] = now
 
         mode = "LIVE" if LIVE else "DRY"
-        msg = (
-            f"✅ EXEC {mode} • {sym} {side.upper()} "
-            f"{qty} @ {price if price else 'MKT'} • "
-            f"risk {eff_risk_pct:.3f}% of {EQUITY_COIN}≈{risk_cash_val:.4f} • "
-            f"spr {spr_bps:.1f}bps • lev≤{EXEC_MAX_LEVERAGE}x"
-        )
-
         if isinstance(res, dict) and res.get("ok") and res.get("dry"):
+            try:
+                set_order_state(link_id, "OPEN", exchange_id=None)
+            except Exception:
+                pass
+            msg = (
+                f"✅ EXEC {mode} • {sym} {side.upper()} {qty} @ {price if price else 'MKT'} "
+                f"• risk {eff_risk_pct:.3f}% of {EQUITY_COIN}≈{risk_cash_val:.4f} "
+                f"• spr {spr_bps:.1f}bps • lev≤{EXEC_MAX_LEVERAGE}x"
+            )
             tg_send(msg, priority="info")
-            log_event("executor","order_ack_dry",sym,ACCOUNT_UID,{"resp":"ok"})
-        elif isinstance(res, dict):
-            tg_send(msg + f" • resp={str(res)[:140]}", priority="success")
-            log_event("executor","order_ack_live",sym,ACCOUNT_UID,{"resp":res})
+            log_event("executor","order_ack_dry",sym,ACCOUNT_UID,{"resp":"ok","link":link_id})
+        elif isinstance(res, dict) and res.get("ok"):
+            exid = (res.get("result") or {}).get("orderId") if isinstance(res.get("result"), dict) else None
+            try:
+                set_order_state(link_id, "OPEN", exchange_id=exid)
+            except Exception:
+                pass
+            tg_send(
+                f"🟢 EXEC LIVE • {sym} {side.upper()} {qty} @ {price if price else 'MKT'} • link={link_id}",
+                priority="success"
+            )
+            log_event("executor","order_ack_live",sym,ACCOUNT_UID,{"resp":str(res)[:200],"link":link_id})
         else:
-            tg_send(f"❌ EXEC {mode} • {sym} place failed", priority="error")
-            log_event("executor","order_fail",sym,ACCOUNT_UID,{"resp":str(res)[:200]}, level="error")
+            errtxt = str(res)[:200]
+            try:
+                set_order_state(link_id, "REJECTED", err_code="API", err_msg=errtxt)
+            except Exception:
+                pass
+            tg_send(f"❌ EXEC {mode} • {sym} place failed • {errtxt}", priority="error")
+            log_event("executor","order_fail",sym,ACCOUNT_UID,{"resp":errtxt,"link":link_id}, level="error")
 
-        log.info(f"sym={sym} type={typ} maker={maker_only} qty={qty} bid={bid} ask={ask} spr={spr_bps:.1f}bps mode={'LIVE' if LIVE else 'DRY'} res={(str(res)[:200])}")
+        log.info(f"sym={sym} type={typ} maker={maker_only} qty={qty} bid={bid} ask={ask} spr={spr_bps:.1f}bps mode={'LIVE' if LIVE else 'DRY'}")
         processed += 1
 
     log.info(f"done processed={processed}, LIVE={LIVE}")
