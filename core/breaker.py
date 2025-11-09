@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-core/breaker.py — global breaker with TTL, approval-gated CLEAR, auto-trip helpers, and CLI.
+core/breaker.py — global breaker with TTL, approval-gated CLEAR, auto-trip helpers, DB mirror, and CLI.
 
-State file: .state/risk_state.json
-Schema:
+Primary state file: .state/risk_state.json
+DB mirror: core.db.guard_set_breaker / core.db.guard_load
+
+State file schema:
 {
   "breach": true|false,
   "reason": "string",
@@ -21,11 +23,11 @@ Env (optional):
   # Auto-trip inputs (used by auto_tick or direct helpers)
   BREAKER_HEALTH_PATH=.state/health.json
   BREAKER_AUTO_ENABLE=true
-  NEWS_LOCKOUT=false               # if true, news flag in health trips breaker
-  FUNDING_LOCKOUT_MIN=0            # if >0 and funding window active in health, trip for N minutes
-  CONNECTIVITY_LOCKOUT_SEC=0       # if >0 and relay/exchange unhealthy, trip for N seconds
-  DD_LOCKOUT_PCT=0                 # if >0 and health.drawdown_pct >= value, trip
-  HEARTBEAT_STALE_SEC=0            # if >0 and any critical heartbeat stale > value, trip
+  NEWS_LOCKOUT=false
+  FUNDING_LOCKOUT_MIN=0
+  CONNECTIVITY_LOCKOUT_SEC=0
+  DD_LOCKOUT_PCT=0
+  HEARTBEAT_STALE_SEC=0
 
 Approval integration (optional):
   APPROVAL_REQUIRE_CLEAR=1
@@ -44,7 +46,7 @@ CLI:
 
 from __future__ import annotations
 import os, json, time, pathlib, argparse, contextlib, functools
-from typing import Optional, Dict, Any, Callable, TypeVar
+from typing import Optional, Dict, Any, Callable, TypeVar, Tuple
 
 # ---------- paths/state ----------
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -85,30 +87,22 @@ except Exception:
     def log_event(*_, **__):  # type: ignore
         pass
 
-# ---------- approval client detection ----------
-def _approval_available() -> bool:
-    try:
-        from core.approval_client import require_approval  # noqa
-        return True
-    except Exception:
-        return False
-
-def _require_clear_approval(reason: str) -> None:
-    if not APPROVAL_REQUIRE_CLEAR:
-        return
-    if not _approval_available():
-        raise RuntimeError("Approval required to clear breaker, but approval_client not available.")
-
-    from core.approval_client import require_approval  # type: ignore
-    rid = require_approval(
-        action="breaker_clear",
-        account_key=APPROVAL_ACCOUNT_KEY,
-        reason=reason or "manual_clear",
-        ttl_sec=max(60, APPROVAL_TIMEOUT_SEC),
-        timeout_sec=APPROVAL_TIMEOUT_SEC,
-        poll_sec=2.5
-    )
-    tg_send(f"🔐 Approval OK • breaker_clear • req={rid}", priority="success")
+# ---------- DB mirror (optional; safe fallbacks) ----------
+try:
+    from core.db import guard_set_breaker, guard_load  # type: ignore
+except Exception:
+    def guard_set_breaker(active: bool, reason: str = "") -> None:  # type: ignore
+        pass
+    def guard_load() -> dict:  # type: ignore
+        return {
+            "breaker_on": False,
+            "breaker_reason": "",
+            "updated_ts": 0,
+            "session_start_ms": 0,
+            "start_equity_usd": 0.0,
+            "realized_pnl_usd": 0.0,
+            "breach": False,
+        }
 
 # ---------- low-level IO (atomic) ----------
 def _atomic_write_json(path: pathlib.Path, data: Dict[str, Any]) -> None:
@@ -142,6 +136,20 @@ def _save_raw(d: Dict[str, Any]) -> None:
     d.setdefault("version", SCHEMA_VERSION)
     _atomic_write_json(STATE_FILE, d)
 
+# ---------- DB mirror helpers ----------
+def _touch_db_mirror(active: bool, reason: str) -> None:
+    try:
+        guard_set_breaker(bool(active), str(reason or ""))
+    except Exception:
+        pass
+
+def _db_view() -> Tuple[bool, str]:
+    try:
+        gs = guard_load()
+        return bool(gs.get("breaker_on", gs.get("breach", False))), str(gs.get("breaker_reason", "") or "")
+    except Exception:
+        return (False, "")
+
 # ---------- semantics ----------
 def _expired(d: Dict[str, Any]) -> bool:
     ttl = int(d.get("ttl") or 0)
@@ -151,6 +159,7 @@ def _expired(d: Dict[str, Any]) -> bool:
     return (_now() - ts) >= ttl
 
 def _normalize(d: Dict[str, Any]) -> Dict[str, Any]:
+    # respect TTL expiration
     if d.get("breach") and _expired(d):
         d = dict(d)
         d["breach"] = False
@@ -158,16 +167,39 @@ def _normalize(d: Dict[str, Any]) -> Dict[str, Any]:
         d["ts"] = _now()
         d["ttl"] = 0
         _save_raw(d)
+        _touch_db_mirror(False, d["reason"])
     return d
 
 def status() -> Dict[str, Any]:
-    return _normalize(_load_raw())
+    """
+    Returns a rich status dict that preserves legacy keys and adds DB + derived fields:
+      legacy: breach, reason, ts, ttl, source, version
+      derived: remaining_ttl
+      local_*: perspective from file
+      db_*: mirror observed in DB (if available)
+    """
+    local = _normalize(_load_raw())
+    remaining = remaining_ttl()  # uses normalized
+    db_active, db_reason = _db_view()
+    # Derived local flags
+    local_active = bool(local.get("breach"))
+    local_reason = str(local.get("reason") or "")
+    out = dict(local)  # legacy fields preserved
+    out.update({
+        "remaining_ttl": int(remaining),
+        "local_active": local_active,
+        "local_reason": local_reason,
+        "db_active": bool(db_active),
+        "db_reason": db_reason,
+        "now": _now(),
+    })
+    return out
 
 def is_active() -> bool:
     return bool(status().get("breach"))
 
 def remaining_ttl() -> int:
-    d = status()
+    d = _normalize(_load_raw())
     ttl = int(d.get("ttl") or 0)
     if ttl <= 0 or not d.get("breach"):
         return 0
@@ -193,20 +225,29 @@ def _can_notify(kind: str) -> bool:
         return True
     return False
 
+def _emit_on(reason: str, ttl: int) -> None:
+    if _can_notify("on"):
+        extra = f" • ttl={ttl}s" if ttl > 0 else ""
+        tg_send(f"🛑 Breaker ON • reason: {reason}{extra}", priority="error")
+
+def _emit_off() -> None:
+    if _can_notify("off"):
+        tg_send("✅ Breaker OFF • entries re-enabled", priority="success")
+
 def set_on(reason: str = "manual", ttl_sec: Optional[int] = None, source: str = "human") -> None:
     ttl = int(ttl_sec if ttl_sec is not None else DEFAULT_TTL)
-    cur = status()
+    cur = _normalize(_load_raw())
     new_state = {"breach": True, "reason": reason, "ts": _now(), "ttl": max(0, ttl), "source": source, "version": SCHEMA_VERSION}
     _save_raw(new_state)
+    _touch_db_mirror(True, reason)
 
     log_event("guard", "breaker_on", symbol="", account_uid="", payload={"reason": reason, "ttl": ttl, "source": source})
 
     changed = (not cur.get("breach")) or (int(cur.get("ttl") or 0) != ttl) or (cur.get("reason") != reason)
     sig = {"breach": True, "reason": reason, "ttl": ttl}
-    if changed and (_last_sig != sig) and _can_notify("on"):
-        extra = f" • ttl={ttl}s" if ttl > 0 else ""
-        tg_send(f"🛑 Breaker ON • reason: {reason}{extra}", priority="error")
+    if changed and (_last_sig != sig):
         _last_sig.update(sig)
+        _emit_on(reason, ttl)
 
 def set_on_for(minutes: float, reason: str = "manual", source: str = "human") -> None:
     ttl = max(0, int(minutes * 60))
@@ -217,15 +258,40 @@ def set_on_until(reason: str, until_epoch_sec: int, source: str = "human") -> No
     set_on(reason=reason, ttl_sec=ttl, source=source)
 
 def extend(ttl_delta_sec: int) -> None:
-    d = status()
+    d = _normalize(_load_raw())
     if not d.get("breach"):
         return
     new_ttl = max(0, int(ttl_delta_sec))
     d.update({"ts": _now(), "ttl": new_ttl})
     _save_raw(d)
+    _touch_db_mirror(True, d.get("reason", "") or "")
     log_event("guard", "breaker_extend", symbol="", account_uid="", payload={"ttl": new_ttl})
     if _can_notify("on"):
         tg_send(f"⏩ Breaker TTL set • ttl={new_ttl}s", priority="info")
+
+# ---------- approval client detection ----------
+def _approval_available() -> bool:
+    try:
+        from core.approval_client import require_approval  # noqa
+        return True
+    except Exception:
+        return False
+
+def _require_clear_approval(reason: str) -> None:
+    if not APPROVAL_REQUIRE_CLEAR:
+        return
+    if not _approval_available():
+        raise RuntimeError("Approval required to clear breaker, but approval_client not available.")
+    from core.approval_client import require_approval  # type: ignore
+    rid = require_approval(
+        action="breaker_clear",
+        account_key=APPROVAL_ACCOUNT_KEY,
+        reason=reason or "manual_clear",
+        ttl_sec=max(60, APPROVAL_TIMEOUT_SEC),
+        timeout_sec=APPROVAL_TIMEOUT_SEC,
+        poll_sec=2.5
+    )
+    tg_send(f"🔐 Approval OK • breaker_clear • req={rid}", priority="success")
 
 def set_off(reason: str = "manual_clear", source: str = "human") -> None:
     try:
@@ -236,13 +302,14 @@ def set_off(reason: str = "manual_clear", source: str = "human") -> None:
         raise
 
     cur_active = is_active()
-    d = status()
+    d = _normalize(_load_raw())
     d.update({"breach": False, "reason": reason, "ts": _now(), "ttl": 0, "source": source, "version": SCHEMA_VERSION})
     _save_raw(d)
+    _touch_db_mirror(False, reason)
 
     log_event("guard", "breaker_off", symbol="", account_uid="", payload={"reason": reason, "source": source})
-    if cur_active and _can_notify("off"):
-        tg_send("✅ Breaker OFF • entries re-enabled", priority="success")
+    if cur_active:
+        _emit_off()
 
 # Alias
 def breach(reason: str = "manual", ttl_sec: Optional[int] = None, source: str = "human") -> None:
@@ -322,7 +389,6 @@ def trip_for_heartbeat(stale_sec: int) -> None:
     if stale_sec <= 0:
         return
     h = _read_health()
-    # expecting format: {"bots": {"name": {"last": epoch_sec, "critical": true}, ...}}
     try:
         bots = (h.get("bots") or {})
         now = _now()
@@ -368,6 +434,29 @@ def auto_tick() -> None:
     # heartbeat stale
     if HEARTBEAT_STALE_SEC > 0:
         trip_for_heartbeat(HEARTBEAT_STALE_SEC)
+
+# ---------- boot reconciliation ----------
+def _reconcile_db_with_file() -> None:
+    """
+    If DB says breaker ON and file says OFF, mirror DB into file.
+    If file says ON and DB says OFF, mirror file into DB.
+    Keeps reason from the non-empty source.
+    """
+    local = _load_raw()
+    db_on, db_reason = _db_view()
+    local_on = bool(local.get("breach"))
+    if db_on and not local_on:
+        local.update({"breach": True, "reason": db_reason or local.get("reason", "") or "db_sync",
+                      "ts": _now(), "ttl": int(local.get("ttl", 0) or 0)})
+        _save_raw(local)
+    elif local_on and not db_on:
+        _touch_db_mirror(True, local.get("reason", "") or "file_sync")
+
+# Run reconciliation at import
+try:
+    _reconcile_db_with_file()
+except Exception:
+    pass
 
 # ---------- CLI ----------
 def _cli():

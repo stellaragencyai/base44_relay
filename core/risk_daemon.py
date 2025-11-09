@@ -1,54 +1,55 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 — Risk Daemon (portfolio guardrails + PnL snapshots)
-Core-aligned edition: uses core.bybit_client and core.breaker; keeps your PnL + rollups intact.
+Base44 — Risk Daemon (portfolio guardrails + PnL snapshots + DB guard_state sync)
 
-What it does
-- Polls unified equity for MAIN + each SUB (SUB_UIDS), optionally excluding manual subs from enforcement.
-- Tracks a per-day local baseline and computes drawdown; trips a global breaker when DD exceeds threshold.
-- Persists breaker state via core.breaker (shared TTL/extend/notify semantics).
-- Writes JSONL snapshots to logs/pnl/<YYYY-MM-DD>.jsonl (so your PnL log isn't a separate snowflake).
-- Sends hourly rollups and end-of-day summary with alert cooldowns.
-- Optional enforcement hooks (passive; never flattens positions).
+What it does (finalized)
+- Polls unified equity for MAIN + SUB_UIDS.
+- Sets/maintains a per-day baseline; computes daily drawdown vs that baseline.
+- Trips/clears the global breaker via core.breaker when thresholds are crossed.
+- Logs JSONL snapshots to logs/pnl/*.jsonl and writes a heartbeat file.
+- Sends hourly rollups and daily summary over Telegram.
+- SYNC: Updates DB guard_state running PnL and resets DB day anchor on new day.
+- SYNC: Mirrors breaker_on/off into DB guard_state so all bots can read one truth.
+- Exclusions honored for enforcement-only logic (MANUAL_SUB_UIDS, EXCLUDE_MAIN_FROM_ENFORCE).
 
-Env (.env)
-  # polling + timezone
+.env keys
+  # cadence & timezone
   PNL_POLL_SEC=30
   TZ=America/Phoenix
 
-  # PnL rollups
+  # rollups
   PNL_SEND_HOURLY=true
   PNL_SEND_DAILY=true
   PNL_DAILY_SEND_HOUR=23
   PNL_LOG_DIR=logs/pnl
-  PNL_ROTATE_DAILY=0           # 1 -> rotate files by day
+  PNL_ROTATE_DAILY=0
 
-  # Accounts
+  # accounts
   SUB_UIDS=260417078,302355261,152304954,65986659,65986592,152499802
-  MANUAL_SUB_UIDS=             # CSV of subs you manually trade; excluded from enforcement but still logged
-  EXCLUDE_MAIN_FROM_ENFORCE=0  # set 1 if you never want breaker to affect MAIN
+  MANUAL_SUB_UIDS=
+  EXCLUDE_MAIN_FROM_ENFORCE=0
 
-  # Risk guardrails
-  RISK_MAX_DD_PCT=3.0          # daily max drawdown vs local-day baseline; triggers breaker
-  RISK_NOTIFY_EVERY_MIN=10     # min minutes between identical alerts
-  RISK_STARTUP_GRACE_SEC=20    # grace period after boot before evaluating DD
-  RISK_AUTOFIX=false           # if true, will trip breaker via core.breaker (no position closing attempted)
-  RISK_AUTOFIX_DRY_RUN=true    # retained for future active enforcement (currently informational only)
+  # guardrails
+  RISK_MAX_DD_PCT=3.0
+  RISK_NOTIFY_EVERY_MIN=10
+  RISK_STARTUP_GRACE_SEC=20
+  RISK_AUTOFIX=true              # recommend true; daemon only flips breaker, never flattens
+  RISK_AUTOFIX_DRY_RUN=true      # placeholder for future active enforcement
 
-  # Relay awareness (optional; improves diagnostics before calling upstream)
+  # relay (optional)
   RELAY_URL=https://<your-ngrok>
   RELAY_TOKEN=...
 
-  # Bybit creds (used by core.bybit_client under the hood)
+  # bybit (used by core.bybit_client)
   BYBIT_API_KEY=...
   BYBIT_API_SECRET=...
-  BYBIT_ENV=mainnet|testnet
+  BYBIT_ENV=mainnet
 
-  # Logging
+  # logging
   LOG_LEVEL=INFO
 
-  # Breaker defaults (honored by core.breaker)
+  # breaker defaults (honored by core.breaker)
   BREAKER_DEFAULT_TTL_SEC=3600
   BREAKER_NOTIFY_COOLDOWN_SEC=8
 """
@@ -72,6 +73,19 @@ except Exception:
 from core.bybit_client import Bybit
 from core import breaker
 
+# DB guard_state sync (per your db.py API)
+try:
+    # Expected functions from your recent db.py:
+    # guard_load() -> dict, guard_update_pnl(delta_usd: float), guard_reset_day(baseline_usd: float),
+    # guard_set_breaker(active: bool, reason: str)
+    from core.db import guard_load, guard_update_pnl, guard_reset_day, guard_set_breaker
+except Exception:
+    # Fallback stubs so the daemon still runs if DB layer isn’t present yet
+    def guard_load() -> dict: return {}
+    def guard_update_pnl(delta_usd: float) -> None: pass
+    def guard_reset_day(baseline_usd: float) -> None: pass
+    def guard_set_breaker(active: bool, reason: str = "") -> None: pass
+
 getcontext().prec = 28
 
 # ---- boot/env ----
@@ -84,8 +98,9 @@ log = logging.getLogger("risk_daemon")
 
 STATE_DIR = ROOT / ".state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
+HEARTBEAT_PATH = STATE_DIR / "risk_daemon.heartbeat"
 
-EFFECTIVE_DIR = ROOT / ".state" / "effective"          # where strategy_config writes
+EFFECTIVE_DIR = ROOT / ".state" / "effective"
 EFFECTIVE_DIR.mkdir(parents=True, exist_ok=True)
 
 PNL_DIR = Path(os.getenv("PNL_LOG_DIR", str(ROOT / "logs" / "pnl")))
@@ -98,16 +113,12 @@ def env_bool(k: str, default: bool) -> bool:
     return v in {"1","true","yes","on"}
 
 def env_int(k: str, default: int) -> int:
-    try:
-        return int((os.getenv(k, str(default)) or "").strip())
-    except Exception:
-        return default
+    try: return int((os.getenv(k, str(default)) or "").strip())
+    except Exception: return default
 
 def env_float(k: str, default: float) -> float:
-    try:
-        return float((os.getenv(k, str(default)) or "").strip())
-    except Exception:
-        return default
+    try: return float((os.getenv(k, str(default)) or "").strip())
+    except Exception: return default
 
 def env_csv(k: str) -> list[str]:
     raw = os.getenv(k, "") or ""
@@ -115,11 +126,9 @@ def env_csv(k: str) -> list[str]:
 
 # ---- config knobs ----
 PNL_POLL_SEC = env_int("PNL_POLL_SEC", 30)
-
 PNL_SEND_HOURLY       = env_bool("PNL_SEND_HOURLY", True)
 PNL_SEND_DAILY        = env_bool("PNL_SEND_DAILY", True)
 PNL_DAILY_SEND_HOUR   = env_int("PNL_DAILY_SEND_HOUR", 23)
-
 TZ = os.getenv("TZ", "America/Phoenix") or "America/Phoenix"
 
 SUB_UIDS = env_csv("SUB_UIDS")
@@ -132,7 +141,7 @@ RISK_STARTUP_GRACE_SEC = env_int("RISK_STARTUP_GRACE_SEC", 20)
 RISK_AUTOFIX           = env_bool("RISK_AUTOFIX", False)
 RISK_AUTOFIX_DRY       = env_bool("RISK_AUTOFIX_DRY_RUN", True)
 
-# relay (for diagnostics)
+# relay (optional)
 RELAY_URL = (os.getenv("RELAY_URL", "") or os.getenv("DASHBOARD_RELAY_BASE", "")).rstrip("/")
 RELAY_TOKEN = os.getenv("RELAY_TOKEN", "") or os.getenv("RELAY_SECRET", "")
 
@@ -140,7 +149,6 @@ RELAY_TOKEN = os.getenv("RELAY_TOKEN", "") or os.getenv("RELAY_SECRET", "")
 BYBIT_KEY = os.getenv("BYBIT_API_KEY","")
 BYBIT_SECRET = os.getenv("BYBIT_API_SECRET","")
 BYBIT_ENV = (os.getenv("BYBIT_ENV","mainnet") or "mainnet").lower().strip()
-
 if not (BYBIT_KEY and BYBIT_SECRET):
     raise SystemExit("Missing BYBIT_API_KEY/BYBIT_API_SECRET in .env")
 
@@ -184,9 +192,6 @@ def _equity_unified_try(extra: dict) -> Decimal:
         return Decimal("0")
 
 def _equity_unified(extra: dict) -> Decimal:
-    """
-    Returns total equity (USD notionally) for an account (main or sub).
-    """
     try:
         return _equity_unified_try(extra)
     except Exception as e:
@@ -194,20 +199,13 @@ def _equity_unified(extra: dict) -> Decimal:
         return Decimal("0")
 
 def _equity_for_uid(uid: str) -> Decimal:
-    """
-    Try memberId first (master querying sub), then subUid (direct sub credential),
-    returning the first non-zero equity we get.
-    """
     uid = str(uid).strip()
     if not uid:
         return Decimal("0")
-    # Try memberId
     eq = _equity_unified({"memberId": uid})
     if eq > 0:
         return eq
-    # Fallback: subUid
-    eq = _equity_unified({"subUid": uid})
-    return eq
+    return _equity_unified({"subUid": uid})
 
 def snapshot_equities() -> Dict[str, str]:
     data: Dict[str, str] = {}
@@ -260,14 +258,20 @@ def compute_dd_pct(cur_total: Decimal, base_total: Decimal) -> float:
 def breaker_enforce(reason: str):
     """
     Passive enforcement: trip breaker using core.breaker (honors BREAKER_DEFAULT_TTL_SEC).
+    Also mirror into DB guard_state.
     """
     breaker.set_on(reason=reason, ttl_sec=None, source="risk_daemon")
+    guard_set_breaker(True, reason=reason)
     tg_send(f"⛔ Risk breaker SET • {reason}", priority="error")
 
 def breaker_clear():
     if breaker.is_active():
         breaker.set_off(reason="risk_daemon_clear", source="risk_daemon")
+        guard_set_breaker(False, reason="risk_daemon_clear")
         tg_send("✅ Risk breaker cleared.", priority="success")
+    else:
+        # Still mirror DB in case it was stale
+        guard_set_breaker(False, reason="risk_daemon_clear")
 
 # ---- relay sanity (optional) ----
 def probe_relay() -> Tuple[bool, str]:
@@ -285,6 +289,12 @@ def probe_relay() -> Tuple[bool, str]:
     except Exception as e:
         return (False, str(e))
 
+def write_heartbeat():
+    try:
+        HEARTBEAT_PATH.write_text(str(int(time.time())), encoding="utf-8")
+    except Exception:
+        pass
+
 # ---- main loop ----
 def main():
     boot_t = time.time()
@@ -300,6 +310,9 @@ def main():
     ok, why = probe_relay()
     if not ok:
         tg_send(f"⚠️ Relay not reachable for diagnostics: {why}", priority="warn")
+
+    # ensure DB breaker reflects actual breaker at boot
+    guard_set_breaker(breaker.is_active(), reason="boot_sync")
 
     while True:
         try:
@@ -317,6 +330,12 @@ def main():
             # set baseline if new day
             if day not in baseline_by_day:
                 baseline_by_day[day] = snap
+                base_total_boot = float(snap["total"])
+                # reset DB day anchor to current total
+                try:
+                    guard_reset_day(base_total_boot)
+                except Exception as e:
+                    log.warning(f"guard_reset_day failed: {e}")
                 # clear breaker on new day start, fresh baseline
                 breaker_clear()
 
@@ -324,6 +343,13 @@ def main():
             cur_total = Decimal(snap["total"])
             base_total = Decimal(base["total"])
             dd_pct = compute_dd_pct(cur_total, base_total)
+
+            # DB running PnL delta
+            try:
+                delta_usd = float(cur_total - base_total)
+                guard_update_pnl(delta_usd)
+            except Exception as e:
+                log.debug(f"guard_update_pnl skipped: {e}")
 
             # hourly rollup
             if PNL_SEND_HOURLY and hour != last_hour:
@@ -351,6 +377,9 @@ def main():
                             tg_send(f"⛔ Risk breaker still active • {reason}", priority="error")
                     else:
                         tg_send(f"⚠️ RISK: {reason}", priority="warn")
+
+            # heartbeat
+            write_heartbeat()
 
             time.sleep(PNL_POLL_SEC)
 
