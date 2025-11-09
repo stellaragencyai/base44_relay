@@ -13,12 +13,13 @@ Public API (backward-compatible + extended):
   - warm(symbols: List[str])           -> Dict[str, bool]  prefetch into cache
   - invalidate(symbols: List[str]|None)-> None             drop from mem+disk so next call refetches
 
-What’s improved (on top of your version):
+What’s improved:
   • In-memory LRU with thread lock on top of disk cache for speed.
   • Fallback to Bybit public /v5/market/instruments-info if relay/proxy fails.
   • Helpers to warm/refresh/invalidate symbols.
   • Single-symbol accessor for convenience across bots.
-  • Still TTL-aware and resilient to weird payload shapes.
+  • TTL-aware and resilient to weird payload shapes.
+  • Atomic cache writes.
 
 Env (optional):
   INSTRUMENTS_TTL_SEC=3600
@@ -30,7 +31,7 @@ Env (optional):
 """
 
 from __future__ import annotations
-import os, json, time, math, pathlib, typing, threading
+import os, json, time, math, pathlib, threading
 from typing import Dict, List, Any, Union, Optional, Tuple
 
 # Local relay client
@@ -102,9 +103,10 @@ def _mem_invalidate(symbols: Optional[List[str]] = None) -> None:
             _mem_order.clear()
             return
         for s in symbols:
-            _mem.pop(s.upper().strip(), None)
+            k = s.upper().strip()
+            _mem.pop(k, None)
             try:
-                _mem_order.remove(s.upper().strip())
+                _mem_order.remove(k)
             except ValueError:
                 pass
 
@@ -134,7 +136,7 @@ def _unwrap_primary_body(payload: dict) -> dict:
 def _extract_list(payload: dict) -> list:
     """
     Normalize Bybit instruments payloads:
-      {result:{list:[...]}}, {list:[...]}, {data:[...]}, or {{primary:{body:{result:{list:[...]}}}}.
+      {result:{list:[...]}}, {list:[...]}, {data:[...]}, or {primary:{body:{result:{list:[...]}}}}.
     """
     body = _unwrap_primary_body(payload)
     if not isinstance(body, dict):
@@ -193,8 +195,11 @@ def _read_cache() -> dict:
     return {"ts": 0, "instruments": {}}
 
 def _write_cache(data: dict) -> None:
+    # atomic write to avoid torn JSON
     try:
-        CACHE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp = CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(CACHE)
     except Exception:
         # cache failure is non-fatal
         pass
@@ -203,7 +208,7 @@ def _fresh_enough(cache_ts_ms: int) -> bool:
     if HARD_REFRESH:
         return False
     age = (int(time.time()*1000) - int(cache_ts_ms)) / 1000.0
-    return age <= max(60, TTL_SEC)  # never use TTL < 60s because that’s silly
+    return age <= max(60, TTL_SEC)  # never use TTL < 60s
 
 # -------- network with retries --------
 def _relay_instruments_info(symbol: str) -> dict:
@@ -215,8 +220,9 @@ def _relay_instruments_info(symbol: str) -> dict:
     for d in delays:
         if d > 0:
             time.sleep(d)
+        # FIX: relay_client.proxy uses 'qs=' not 'params='
         raw = proxy("GET", "/v5/market/instruments-info",
-                    params={"category": CATEGORY, "symbol": symbol})
+                    qs={"category": CATEGORY, "symbol": symbol})
         payload = _coerce_json(raw)
         lst = _extract_list(payload)
         if lst:
