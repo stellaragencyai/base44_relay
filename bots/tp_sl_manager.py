@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Base44 — TP/SL Manager (5 equal TPs + adopt-only + laddered SL)
-Core-stack edition: no pybit; HTTP-only sweep; reduce-only everything.
+Core-stack edition: HTTP-only sweep; reduce-only safety; guard-aware.
 
 What it does
 - Maintains 5 reduce-only TP rungs spaced by equal-R (0.5R..2.5R).
@@ -10,8 +10,10 @@ What it does
 - SL policy: pick closer of structure stop vs ATR fallback. Reduce-only safety.
 - Maker-first shading so PostOnly rests; no amendments unless we own the order.
 - No flattening, no flips, no market closes. Ever.
-- Obeys breaker: keeps SL protection, skips TP maintenance while breaker is ON.
-- HTTP periodic sweep, no WebSocket dependency.
+- **Guard-aware**: respects global breaker via core.guard.
+  • When breaker ON: keep/ensure SL protection, pause TP ladder, cancel entry-type non-RO orders,
+    and flip working orders to reduce-only where possible.
+  • When breaker OFF: full TP ladder maintenance.
 
 Env (via core.config.settings; add in .env to override)
   TP_ADOPT_EXISTING=true
@@ -40,8 +42,9 @@ Env (via core.config.settings; add in .env to override)
   # Optional symbol control
   TP_SYMBOL_WHITELIST=BTCUSDT,ETHUSDT
 
-Files
-  .state/risk_state.json        # breaker flag file ({"breach": true})
+Notes
+- Uses Bybit v5 client from core.bybit_client (private endpoints for orders/positions).
+- Uses tools.notifier_telegram.tg via a tiny compat wrapper (quiet by default).
 """
 
 from __future__ import annotations
@@ -56,6 +59,7 @@ from core.config import settings
 from core.logger import get_logger, bind_context
 from core.bybit_client import Bybit
 from tools.notifier_telegram import tg
+from core.guard import guard_blocking_reason  # ← use the real breaker, not a file hack
 
 # ---------- logging ----------
 log = get_logger("bots.tp_sl_manager")
@@ -112,17 +116,6 @@ class _CompatTG:
 
 def tg_send(msg: str, priority: str = "info", **kwargs):
     _CompatTG.send(msg)
-
-# ---------- breaker ----------
-def breaker_active() -> bool:
-    path = STATE_DIR / "risk_state.json"
-    try:
-        if not path.exists():
-            return False
-        js = json.loads(path.read_text(encoding="utf-8"))
-        return bool(js.get("breach") or js.get("breaker") or js.get("active"))
-    except Exception:
-        return False
 
 # ---------- public HTTP helpers (no auth) ----------
 import urllib.request, urllib.parse
@@ -324,6 +317,13 @@ def fetch_open_tp_orders(symbol: str, close_side: str) -> List[dict]:
             continue
     return out
 
+def list_all_open_orders(symbol: str) -> List[dict]:
+    ok, data, err = by.get_open_orders(category="linear", symbol=symbol, openOnly=True)
+    if not ok:
+        log.warning("open_orders err %s: %s", symbol, err)
+        return []
+    return (data.get("result") or {}).get("list") or []
+
 def place_limit_reduce(symbol: str, side: str, price: Decimal, qty: Decimal, tick: Decimal) -> Optional[str]:
     # Shade away from mid so PostOnly rests
     off = adaptive_offset_ticks(symbol, tick)
@@ -422,6 +422,49 @@ def build_equal_r_targets(entry: Decimal, stop: Decimal, side_word: str, tick: D
         targets.append(round_to_tick(raw_px, tick))
     return targets
 
+# ---------- breaker-aware enforcement ----------
+def enforce_reduce_only_and_cancel_entries(symbol: str) -> None:
+    """
+    On breaker ON:
+      - cancel obvious entry orders (non-reduce-only LIMIT/MARKET)
+      - flip amendable orders to reduce-only if possible
+    """
+    try:
+        orders = list_all_open_orders(symbol)
+    except Exception as e:
+        log.warning("list_open_orders failed %s: %s", symbol, e)
+        return
+
+    for o in orders:
+        try:
+            reduce_only = str(o.get("reduceOnly", "0")).lower() in {"1", "true"}
+            side = str(o.get("side", "")).upper()
+            ord_type = str(o.get("orderType", "")).upper()
+            link = o.get("orderLinkId")
+            oid  = o.get("orderId")
+            qty  = Decimal(str(o.get("qty", "0") or "0"))
+
+            # Treat any non-reduce-only order as "entry-like" and cancel it
+            if not reduce_only and ord_type in {"LIMIT", "MARKET"} and qty > 0:
+                if TP_DRY_RUN:
+                    tg_send(f"✋ DRY_RUN breaker: cancel entry {symbol} {side} qty={qty}")
+                else:
+                    ok, _, err = by.cancel_order(category="linear", orderId=oid, symbol=symbol)
+                    if not ok:
+                        log.warning("cancel entry failed %s: %s", symbol, err)
+                continue
+
+            # Flip to reduce-only when possible
+            if not reduce_only:
+                if TP_DRY_RUN:
+                    tg_send(f"🔒 DRY_RUN breaker: set reduce-only on {symbol} order {oid}")
+                else:
+                    ok, _, err = by.amend_order(category="linear", orderId=oid, reduceOnly=True)
+                    if not ok:
+                        log.warning("amend reduce-only failed %s: %s", symbol, err)
+        except Exception as e:
+            log.warning("breaker RO enforcement err %s: %s", symbol, e)
+
 # ---------- core sync ----------
 def place_or_sync_ladder(symbol: str, side_word: str, entry: Decimal, qty: Decimal, pos_idx: int) -> None:
     filters = get_symbol_filters(symbol)
@@ -431,11 +474,15 @@ def place_or_sync_ladder(symbol: str, side_word: str, entry: Decimal, qty: Decim
     # Always ensure SL first
     stop = ensure_stop(symbol, side_word, entry, pos_idx, tick)
 
-    # If breaker is ON, skip TPs but keep SL
-    if breaker_active():
-        tg_send(f"⛔ Breaker ON • {symbol} • SL ensured at {stop} • TPs paused")
+    # Check guard/breaker
+    blocked, why = guard_blocking_reason()
+    if blocked:
+        # Under breaker: enforce reduce-only on any stray orders and pause TPs.
+        enforce_reduce_only_and_cancel_entries(symbol)
+        tg_send(f"⛔ Breaker ON • {symbol} • SL ensured at {stop} • TPs paused ({why})")
         return
 
+    # Build ladder targets and chunks
     targets = build_equal_r_targets(entry, stop, side_word, tick)
     target_chunks = split_even(qty, step, minq, RUNGS)
     existing = fetch_open_tp_orders(symbol, close_side)
@@ -488,7 +535,7 @@ def place_or_sync_ladder(symbol: str, side_word: str, entry: Decimal, qty: Decim
         except Exception:
             cur_px, cur_qty = tpx, tq
 
-        # Replace if price drifted beyond tol, or qty deviates by >= 1 step
+        # Replace if price drifted beyond tolerance, or qty deviates by >= 1 step
         if abs(cur_px - tpx) > tol or abs(cur_qty - tq) >= step:
             cancel_order(symbol, ex_id, ex_link)
             place_limit_reduce(symbol, close_side, tpx, tq, tick)
