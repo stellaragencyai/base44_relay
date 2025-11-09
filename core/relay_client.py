@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 Relay Client — hardened, sub-account aware, automation-ready (final)
+core/relay_client.py — hardened, sub-account aware, automation-ready
 
 Key features
 - Reads relay base from: RELAY_URL | BASE44_RELAY_URL | EXECUTOR_RELAY_BASE | RELAY_BASE | default http://127.0.0.1:5000
 - Reads token from: RELAY_TOKEN | BASE44_RELAY_TOKEN | EXECUTOR_RELAY_TOKEN
 - Unified requests.Session with Bearer; retries + backoff (idempotent GET/POST)
 - Robust JSON unwrapping across relay shapes (envelope/raw)
-- `extra={'subUid': ...}` passthrough for sub-account routing, plus context helper
-- Convenience v5 wrappers: create_limit, cancel_order, create_sl, set_tp_sl, etc.
-- Health helpers: `is_token_ok()`, `/diag/ping` support
-- Safe Telegram sender with tiny retry
+- `extra={'subUid': ...}` passthrough for sub-account routing, plus context helper with `with_sub`
+- Convenience v5 wrappers: create_limit, cancel_order, create_sl_market, set_tp_sl, get_positions, get_open_orders, etc.
+- Health helpers: `is_token_ok()`, `/diag/ping` probe
+- Safe Telegram sender with notifier fallback
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import os
 import json
 import csv
 import time
+import random
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Callable
@@ -33,7 +34,6 @@ from dotenv import load_dotenv
 # ──────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-# Base URL priority: explicit ngrok > executor vars > fallback localhost:5000
 _RELAY_BASE = (
     os.getenv("RELAY_URL")
     or os.getenv("BASE44_RELAY_URL")
@@ -42,7 +42,6 @@ _RELAY_BASE = (
     or "http://127.0.0.1:5000"
 ).rstrip("/")
 
-# Token priority: explicit > executor
 _RELAY_TOKEN = (
     os.getenv("RELAY_TOKEN")
     or os.getenv("BASE44_RELAY_TOKEN")
@@ -50,8 +49,8 @@ _RELAY_TOKEN = (
     or ""
 ).strip()
 
-TG_TOKEN   = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-TG_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+HTTP_TIMEOUT_S = int(os.getenv("HTTP_TIMEOUT_S", "15") or "15")
+BYBIT_PUBLIC = (os.getenv("BYBIT_BASE_URL") or "https://api.bybit.com").rstrip("/")
 
 DEFAULT_SUB_UID = (os.getenv("DEFAULT_SUB_UID") or "").strip()
 
@@ -66,10 +65,10 @@ _SESSION.headers.update({
     "Authorization": f"Bearer {_RELAY_TOKEN}",
     "ngrok-skip-browser-warning": "true",
     "Content-Type": "application/json",
-    "User-Agent": "Base44-RelayClient/1.3",
+    "User-Agent": "Base44-RelayClient/1.4",
 })
 
-# Per-process default subUid context (overridable with with_sub)
+# Per-process default subUid context
 _default_extra: Dict[str, Any] = {"subUid": DEFAULT_SUB_UID} if DEFAULT_SUB_UID else {}
 
 def _u(path: str) -> str:
@@ -77,50 +76,54 @@ def _u(path: str) -> str:
     return f"{_RELAY_BASE}{path}"
 
 def _json_or_text(resp: Response) -> dict:
-    """Return JSON if possible; else include raw text."""
     try:
         return resp.json()
     except Exception:
-        return {"status": resp.status_code, "raw": resp.text[:2000]}
+        return {"status": resp.status_code, "raw": (resp.text or "")[:2000]}
 
-def _raise_for_auth(resp: Response):
+def _raise_for_auth(resp: Response) -> None:
     if resp.status_code == 401:
-        raise RuntimeError("401 from relay: token mismatch or not provided")
+        raise RuntimeError("401 from relay: token missing/invalid")
     if resp.status_code == 403:
-        raise RuntimeError("403 from relay: forbidden (IP allowlist? token role?)")
+        raise RuntimeError("403 from relay: forbidden (role/allowlist)")
 
-def _retry_call(fn: Callable[[], Response], *, retries=2, backoff_base=0.4, max_wait=2.5) -> Response:
-    """
-    Tiny retry helper for idempotent requests (GET/POST to our relay).
-    Retries on network errors and 5xx/429 from relay.
-    """
-    last_exc = None
-    for attempt in range(retries + 1):
+def _backoff(i: int, base: float = 0.35, cap: float = 2.5) -> float:
+    # jittered exponential backoff
+    return min(cap, base * (2 ** i)) * (0.9 + random.random() * 0.2)
+
+def _retry_call(fn: Callable[[], Response], *, retries=2) -> Response:
+    last_exc: Optional[Exception] = None
+    for i in range(retries + 1):
         try:
             r = fn()
             if r.status_code in (429, 500, 502, 503, 504):
-                # soft backoff
-                delay = min(max_wait, backoff_base * (2 ** attempt))
-                time.sleep(delay)
+                time.sleep(_backoff(i))
                 continue
             return r
         except Exception as e:
             last_exc = e
-            delay = min(max_wait, backoff_base * (2 ** attempt))
-            time.sleep(delay)
+            time.sleep(_backoff(i))
     if last_exc:
         raise last_exc
     raise RuntimeError("relay request failed after retries")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Telegram
+# Telegram convenience (uses tools.notifier_telegram if present)
 # ──────────────────────────────────────────────────────────────────────────────
 def tg_send(text: str, parse_mode: Optional[str] = None) -> None:
-    """Best-effort Telegram message with micro-retry. No exceptions leak."""
-    if not TG_TOKEN or not TG_CHAT_ID:
+    try:
+        from tools.notifier_telegram import tg  # type: ignore
+        tg.send_text(text, parse_mode=parse_mode)
         return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": text}
+    except Exception:
+        pass
+    # ultra-minimal fallback; best-effort only
+    tok = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+    chat = os.getenv("TELEGRAM_CHAT_ID") or ""
+    if not tok or not chat:
+        return
+    url = f"https://api.telegram.org/bot{tok}/sendMessage"
+    payload = {"chat_id": chat, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode
     for _ in range(2):
@@ -134,7 +137,7 @@ def tg_send(text: str, parse_mode: Optional[str] = None) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Raw relay HTTP with retry
 # ──────────────────────────────────────────────────────────────────────────────
-def relay_get(path: str, params: Optional[dict] = None, timeout: int = 15) -> dict:
+def relay_get(path: str, params: Optional[dict] = None, timeout: int = HTTP_TIMEOUT_S) -> dict:
     try:
         def go():
             return _SESSION.get(_u(path), params=params or {}, timeout=timeout)
@@ -144,7 +147,7 @@ def relay_get(path: str, params: Optional[dict] = None, timeout: int = 15) -> di
     except Exception as e:
         return {"error": str(e), "path": path, "params": params or {}}
 
-def relay_post(path: str, body: Optional[dict] = None, timeout: int = 20) -> dict:
+def relay_post(path: str, body: Optional[dict] = None, timeout: int = HTTP_TIMEOUT_S) -> dict:
     try:
         def go():
             return _SESSION.post(_u(path), json=body or {}, timeout=timeout)
@@ -171,22 +174,17 @@ def _unwrap_body(env: Any) -> dict:
             body = primary.get("body")
             if isinstance(body, dict):
                 return body
-        # maybe relay already returned Bybit body
         if "retCode" in env or "result" in env:
             return env
     return {}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Low-level Bybit proxy (returns FULL relay envelope)
-# Supports `extra` for context (e.g., {"subUid":"260417078"})
+# Supports `extra` context (e.g., {"subUid":"260417078"})
 # ──────────────────────────────────────────────────────────────────────────────
 def bybit_proxy(method: str, path: str, params: Optional[dict] = None,
                 body: Optional[dict] = None, extra: Optional[dict] = None,
-                timeout: int = 20) -> dict:
-    """
-    Request through the relay. Returns full envelope:
-      {"primary":{"status":...,"body":{...}}, "fallback":{...}, "error":?...}
-    """
+                timeout: int = HTTP_TIMEOUT_S) -> dict:
     payload: Dict[str, Any] = {"method": method.upper(), "path": path}
     if params:
         payload["params"] = params
@@ -197,14 +195,20 @@ def bybit_proxy(method: str, path: str, params: Optional[dict] = None,
         merged_extra.update(extra)
     if merged_extra:
         payload["extra"] = merged_extra
-    return relay_post("/bybit/proxy", payload, timeout=timeout)
+    return relay_post("/bybit/proxy", body=payload, timeout=timeout)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Bot-friendly proxy (returns Bybit JSON BODY directly)
+# Accepts both params= and qs= for compatibility.
 # ──────────────────────────────────────────────────────────────────────────────
-def proxy(method: str, path: str, params: Optional[dict] = None,
-          body: Optional[dict] = None, extra: Optional[dict] = None,
-          timeout: int = 20) -> dict:
+def proxy(method: str, path: str, *,
+          params: Optional[dict] = None,
+          qs: Optional[dict] = None,
+          body: Optional[dict] = None,
+          extra: Optional[dict] = None,
+          timeout: int = HTTP_TIMEOUT_S) -> dict:
+    if qs and not params:
+        params = qs
     env = bybit_proxy(method, path, params=params, body=body, extra=extra, timeout=timeout)
     return _unwrap_body(env) or env
 
@@ -245,18 +249,44 @@ def equity_unified(coin: Optional[str] = None, extra: Optional[dict] = None) -> 
     except Exception:
         return 0.0
 
-def ticker(symbol: str, category: str = "linear") -> dict:
-    j = proxy("GET", "/v5/market/tickers", params={"category": category, "symbol": symbol})
-    return ((j.get("result", {}) or {}).get("list", []) or [{}])[0]
+def ticker(symbol: str, category: str = "linear") -> dict | None:
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return None
+    j = proxy("GET", "/v5/market/tickers", params={"category": category, "symbol": sym})
+    try:
+        arr = ((j.get("result") or {}).get("list") or [])
+        if arr:
+            rec = dict(arr[0])
+            for k in ("bid1Price", "ask1Price", "lastPrice"):
+                if k in rec:
+                    rec[k] = str(rec[k])
+            return rec
+    except Exception:
+        pass
+    # public fallback
+    try:
+        r = requests.get(
+            f"{BYBIT_PUBLIC}/v5/market/tickers",
+            params={"category": category, "symbol": sym},
+            timeout=HTTP_TIMEOUT_S,
+        )
+        if r.ok:
+            data = r.json()
+            if data.get("retCode") == 0:
+                arr = ((data.get("result") or {}).get("list") or [])
+                return arr[0] if arr else None
+    except Exception:
+        return None
+    return None
 
 def klines(symbol: str, interval: str = "1", limit: int = 50, category: str = "linear") -> list:
     params = {"category": category, "symbol": symbol, "interval": interval, "limit": limit}
-    env = bybit_proxy("GET", "/v5/market/kline", params=params)
-    body = _unwrap_body(env)
-    return ((body.get("result", {}) or {}).get("list", []) or [])
+    body = proxy("GET", "/v5/market/kline", params=params)
+    return ((body.get("result") or {}).get("list") or []) if isinstance(body, dict) else []
 
 # ──────────────────────────────────────────────────────────────────────────────
-# v5 Order helpers (reduce boilerplate for bots)
+# v5 Order helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def create_limit(symbol: str, side: str, qty: float, price: float, *,
                  category: str = "linear", post_only: bool = True,
@@ -265,10 +295,10 @@ def create_limit(symbol: str, side: str, qty: float, price: float, *,
     p = {
         "category": category,
         "symbol": symbol,
-        "side": side,  # "Buy" | "Sell"
+        "side": side,
         "orderType": "Limit",
         "qty": f"{qty}",
-        "price": f"{price:.8f}",
+        "price": f"{price:.10f}".rstrip("0").rstrip("."),
         "timeInForce": "PostOnly" if post_only else "GoodTillCancel",
         "reduceOnly": reduce_only,
     }
@@ -298,7 +328,7 @@ def create_sl_market(symbol: str, side: str, qty: float, trigger_price: float, *
         "orderType": "Market",
         "qty": f"{qty}",
         "reduceOnly": True,
-        "triggerPrice": f"{trigger_price:.8f}",
+        "triggerPrice": f"{trigger_price:.10f}".rstrip("0").rstrip("."),
         "triggerBy": trigger_by.upper(),
         "tpslMode": "Partial"
     }
@@ -307,15 +337,11 @@ def create_sl_market(symbol: str, side: str, qty: float, trigger_price: float, *
 def set_tp_sl(symbol: str, side: str, *, tp: Optional[float] = None,
               sl: Optional[float] = None, category: str = "linear",
               extra: Optional[dict] = None) -> dict:
-    """
-    Warning: many bots avoid set_trading_stop for TP to keep control via ladders.
-    Provided here for completeness.
-    """
     p: Dict[str, Any] = {"category": category, "symbol": symbol, "positionIdx": 0}
     if tp is not None:
-        p["takeProfit"] = f"{tp:.8f}"
+        p["takeProfit"] = f"{tp:.10f}".rstrip("0").rstrip(".")
     if sl is not None:
-        p["stopLoss"] = f"{sl:.8f}"
+        p["stopLoss"] = f"{sl:.10f}".rstrip("0").rstrip(".")
     return proxy("POST", "/v5/position/trading-stop", body=p, extra=extra)
 
 def get_open_orders(category: str = "linear", symbol: Optional[str] = None,
@@ -335,8 +361,7 @@ def get_positions(category: str = "linear", symbol: Optional[str] = None,
     return proxy("GET", "/v5/position/list", params=p, extra=extra)
 
 def get_wallet_balance(accountType: str = "UNIFIED", extra: Optional[dict] = None) -> dict:
-    params = {"accountType": accountType}
-    return proxy("GET", "/v5/account/wallet-balance", params=params, extra=extra)
+    return proxy("GET", "/v5/account/wallet-balance", params={"accountType": accountType}, extra=extra)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Registry helpers (CSV / JSON)
@@ -355,7 +380,6 @@ def load_sub_uids(csv_path: str = "registry/sub_uids.csv",
                     if val:
                         uids.append(val)
             except Exception:
-                # fallback: first col per line
                 f.seek(0)
                 for line in f:
                     s = line.strip().split(",")[0].strip()
@@ -422,11 +446,8 @@ def get_closed_pnl(member_id: str, symbol: Optional[str] = None) -> dict:
 # Health
 # ──────────────────────────────────────────────────────────────────────────────
 def is_token_ok() -> bool:
-    """True if relay answers /diag/ping with 200 JSON."""
     try:
-        def go():
-            return _SESSION.get(_u("/diag/ping"), timeout=5)
-        r = _retry_call(go, retries=1)
+        r = _SESSION.get(_u("/diag/ping"), timeout=5)
         _raise_for_auth(r)
         _ = r.json()
         return True
@@ -435,3 +456,4 @@ def is_token_ok() -> bool:
 
 if __name__ == "__main__":
     print(relay_get("/diag/time"))
+    print("token_ok:", is_token_ok())
