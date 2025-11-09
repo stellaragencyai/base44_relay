@@ -31,9 +31,20 @@ Public API:
 """
 
 from __future__ import annotations
-import os, io, json, time, atexit, socket, hashlib, threading, queue, shutil
+import os, io, json, time, atexit, socket, hashlib, threading, queue
 import datetime as dt
 from typing import Dict, Any, Optional, List
+
+# Settings-aware paths and timezone
+try:
+    from core.config import settings
+except Exception:
+    settings = None  # type: ignore
+
+try:
+    from zoneinfo import ZoneInfo  # py>=3.9
+except Exception:
+    ZoneInfo = None  # type: ignore
 
 # ---------------- Env ----------------
 def _env_str(k: str, d: str) -> str:
@@ -47,8 +58,15 @@ def _env_int(k: str, d: int) -> int:
     except Exception:
         return d
 
-LOG_DIR = _env_str("DECISION_LOG_DIR", "./logs/decisions")
+# Base directory defaults to settings.DIR_LOGS/decisions if available
+_default_dir = None
+if settings and getattr(settings, "DIR_LOGS", None):
+    _default_dir = os.path.join(str(settings.DIR_LOGS), "decisions")
+
+LOG_DIR = _env_str("DECISION_LOG_DIR", _default_dir or "./logs/decisions")
 FORMATS = [s.strip().lower() for s in _env_str("DECISION_LOG_FORMATS", "jsonl,parquet").split(",") if s.strip()]
+if not FORMATS:
+    FORMATS = ["jsonl"]
 FLUSH_SEC = max(1, _env_int("DECISION_LOG_FLUSH_SEC", 2))
 ROTATE_DAYS = max(1, _env_int("DECISION_LOG_ROTATE_DAYS", 7))
 QUEUE_MAX = max(1000, _env_int("DECISION_LOG_QUEUE_MAX", 10000))
@@ -58,7 +76,7 @@ RUN_ID = _env_str("RUN_ID", "")
 HOSTNAME = socket.gethostname()
 PID = os.getpid()
 
-# Optional parquet engines (no pandas requirement)
+# Optional parquet engines (no pandas requirement if pyarrow is present)
 _parquet_ok = False
 _parquet_engine = None
 try:
@@ -86,8 +104,18 @@ _extra_ctx: Dict[str, Any] = {}
 def _ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
+def _now_tz(ts: Optional[float] = None) -> dt.datetime:
+    val = ts if ts is not None else time.time()
+    if settings and getattr(settings, "TZ", None) and ZoneInfo:
+        try:
+            return dt.datetime.fromtimestamp(val, ZoneInfo(settings.TZ))
+        except Exception:
+            pass
+    # fallback localtime
+    return dt.datetime.fromtimestamp(val)
+
 def _today_parts(ts: Optional[float] = None):
-    d = dt.datetime.fromtimestamp(ts or time.time())
+    d = _now_tz(ts)
     return d.strftime("%Y"), d.strftime("%m"), d.strftime("%d")
 
 def _jsonl_path(ts: Optional[float] = None) -> str:
@@ -103,15 +131,66 @@ def _parquet_dir(ts: Optional[float] = None) -> str:
     return base
 
 def _event_hash(e: Dict[str, Any]) -> str:
-    s = json.dumps(e, sort_keys=True, default=str, ensure_ascii=False)
+    # stable hash for dedupe/correlation; payload order-agnostic
+    try:
+        s = json.dumps(e, sort_keys=True, default=str, ensure_ascii=False)
+    except Exception:
+        # desperate fallback: drop payload
+        safe = dict(e)
+        safe["payload"] = "<unserializable>"
+        s = json.dumps(safe, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+def _prune_old_jsonl():
+    try:
+        cutoff = dt.datetime.utcnow() - dt.timedelta(days=ROTATE_DAYS)
+        y_cut, m_cut, d_cut = int(cutoff.strftime("%Y")), int(cutoff.strftime("%m")), int(cutoff.strftime("%d"))
+        base = os.path.join(LOG_DIR, "jsonl")
+        if not os.path.isdir(base):
+            return
+        for ydir in list(os.scandir(base)):
+            if not ydir.is_dir():
+                continue
+            try:
+                y = int(ydir.name)
+            except Exception:
+                continue
+            for mdir in list(os.scandir(ydir.path)):
+                if not mdir.is_dir():
+                    continue
+                try:
+                    m = int(mdir.name)
+                except Exception:
+                    continue
+                for f in list(os.scandir(mdir.path)):
+                    if not f.is_file() or not f.name.endswith(".jsonl"):
+                        continue
+                    try:
+                        d = int(f.name.replace(".jsonl", ""))
+                        if dt.datetime(y, m, d) < cutoff:
+                            os.remove(f.path)
+                    except Exception:
+                        continue
+                # clean empty month dirs
+                try:
+                    if not any(os.scandir(mdir.path)):
+                        os.rmdir(mdir.path)
+                except Exception:
+                    pass
+            # clean empty year dirs
+            try:
+                if not any(os.scandir(ydir.path)):
+                    os.rmdir(ydir.path)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 def _prune_old_parquet():
     if not _parquet_ok:
         return
     try:
         cutoff = dt.datetime.utcnow() - dt.timedelta(days=ROTATE_DAYS)
-        y_cut, m_cut, d_cut = int(cutoff.strftime("%Y")), int(cutoff.strftime("%m")), int(cutoff.strftime("%d"))
         base = os.path.join(LOG_DIR, "parquet")
         if not os.path.isdir(base):
             return
@@ -131,21 +210,26 @@ def _prune_old_parquet():
                     if not (ddir.is_dir() and ddir.name.startswith("d=")): continue
                     try:
                         d = int(ddir.name.split("=",1)[-1])
-                        if (dt.datetime(y, m, d) < cutoff):
-                            # delete all parts in this day partition
+                        if dt.datetime(y, m, d) < cutoff:
                             for f in list(os.scandir(ddir.path)):
-                                try:
-                                    os.remove(f.path)
-                                except Exception:
-                                    pass
-                            try:
-                                os.rmdir(ddir.path)
-                            except Exception:
-                                pass
+                                try: os.remove(f.path)
+                                except Exception: pass
+                            try: os.rmdir(ddir.path)
+                            except Exception: pass
                     except Exception:
                         continue
+                try:
+                    if not any(os.scandir(mdir.path)):
+                        os.rmdir(mdir.path)
+                except Exception:
+                    pass
+            try:
+                if not any(os.scandir(ydir.path)):
+                    os.rmdir(ydir.path)
+            except Exception:
+                pass
     except Exception:
-        pass  # pruning is best-effort
+        pass  # best-effort
 
 # ---------------- Flush backends ----------------
 def _flush_jsonl(rows: List[Dict[str, Any]], ts: Optional[float] = None):
@@ -155,12 +239,20 @@ def _flush_jsonl(rows: List[Dict[str, Any]], ts: Optional[float] = None):
     try:
         with open(path, "a", encoding="utf-8") as f:
             for r in rows:
-                f.write(json.dumps(r, ensure_ascii=False, default=str))
+                # ensure serializable
+                try:
+                    line = json.dumps(r, ensure_ascii=False, default=str)
+                except Exception:
+                    r2 = dict(r)
+                    r2["payload"] = "<unserializable>"
+                    line = json.dumps(r2, ensure_ascii=False)
+                f.write(line)
                 f.write("\n")
     except Exception:
         # last-ditch fallback
         try:
             fb = os.path.join(LOG_DIR, "jsonl_fallback.log")
+            _ensure_dir(os.path.dirname(fb))
             with open(fb, "a", encoding="utf-8") as f:
                 for r in rows:
                     f.write(json.dumps(r, ensure_ascii=False, default=str))
@@ -181,7 +273,6 @@ def _flush_parquet(rows: List[Dict[str, Any]], ts: Optional[float] = None):
             tbl = pa.Table.from_pylist(rows)        # schema inferred
             pq.write_table(tbl, path)
         else:
-            # fastparquet path needs pandas
             import pandas as pd  # type: ignore
             df = pd.DataFrame(rows)
             _fp.write(path, df)  # type: ignore
@@ -199,6 +290,7 @@ def _flush_batch(rows: List[Dict[str, Any]], force_ts: Optional[float] = None):
         _flush_parquet(rows, ts)
     # hourly-ish pruning
     if int(ts) % 3600 < FLUSH_SEC:
+        _prune_old_jsonl()
         _prune_old_parquet()
 
 # ---------------- Worker ----------------
@@ -209,7 +301,6 @@ def _writer():
         try:
             try:
                 item = _q.get(timeout=0.5)
-                # ignore internal ping
                 if isinstance(item, dict) and item.get("__ping__"):
                     pass
                 else:
@@ -223,7 +314,7 @@ def _writer():
                 buf.clear()
                 last = now
         except Exception:
-            # Never crash the writer
+            # Never crash the writer; drop the batch and keep going
             buf.clear()
             last = time.time()
 
@@ -251,7 +342,7 @@ def close():
         _q.put_nowait({"__ping__": True})
     except Exception:
         pass
-    # drain a bit
+    # quick drain and flush
     t0 = time.time()
     batch: List[Dict[str, Any]] = []
     while time.time() - t0 < 2.5:
@@ -303,6 +394,18 @@ def clear_context(keys: Optional[List[str]] = None):
             _extra_ctx.clear()
 
 # ---------------- Public logging ----------------
+def _safe_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not payload:
+        return {}
+    out: Dict[str, Any] = {}
+    for k, v in payload.items():
+        try:
+            json.dumps(v, default=str)
+            out[k] = v
+        except Exception:
+            out[k] = repr(v)
+    return out
+
 def _base_event(component: str,
                 event: str,
                 symbol: str,
@@ -316,13 +419,13 @@ def _base_event(component: str,
         ctx = dict(_extra_ctx)
     e = {
         "ts": ts,
-        "level": level,
+        "level": (level or "info").lower(),
         "component": component or "",
         "event": event or "",
         "symbol": (symbol or "").upper(),
         "account_uid": str(account_uid or ""),
         "trade_id": trade_id or "",
-        "payload": (payload or {}),
+        "payload": _safe_payload(payload),
         "run_id": RUN_ID,
         "host": HOSTNAME,
         "pid": PID,
@@ -357,9 +460,8 @@ def log_event(component: str,
                 _ = _q.get_nowait()  # evict one
                 _q.put_nowait(e)
             except Exception:
-                # still full: drop newest to avoid blocking trade path
-                pass
-        # else: silently drop newest
+                pass  # still full: drop newest to avoid blocking
+        # else: drop newest silently
 
 def log_event_sync(component: str,
                    event: str,
