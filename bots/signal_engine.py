@@ -15,7 +15,7 @@ What it does:
 - Appends machine-readable signals to signals/observed.jsonl for an executor.
 - Rate-limits per (symbol, timeframe, direction) and dedupes once per bar.
 - Sends startup ping and periodic heartbeats.
-- Obeys global breaker: still heartbeats, but does NOT emit signals when breaker is ON.
+- Obeys global breaker: still heartbeats, but does NOT scan or emit signals when breaker is ON.
 """
 
 from __future__ import annotations
@@ -34,6 +34,9 @@ from typing import Dict, List, Tuple, Optional
 from core.config import settings
 from core.logger import get_logger
 from tools.notifier_telegram import tg
+
+# Guard helpers (single source of truth for breaker state)
+from core.guard import guard_blocking_reason, guard_gate
 
 log = get_logger("bots.signal_engine")
 
@@ -96,23 +99,6 @@ TZ_STR: str = settings.TZ or "Europe/London"
 
 # Network/base
 BYBIT_BASE_URL = settings.BYBIT_BASE_URL.rstrip("/")
-
-# =========================
-# Breaker support
-# =========================
-
-_STATE_DIR = settings.ROOT / ".state"
-_STATE_DIR.mkdir(parents=True, exist_ok=True)
-_BREAKER_FILE = _STATE_DIR / "risk_state.json"
-
-def breaker_active() -> bool:
-    try:
-        if not _BREAKER_FILE.exists():
-            return False
-        js = json.loads(_BREAKER_FILE.read_text(encoding="utf-8"))
-        return bool(js.get("breach") or js.get("breaker") or js.get("active"))
-    except Exception:
-        return False
 
 # =========================
 # HTTP: Bybit public kline
@@ -314,7 +300,7 @@ def decide(symbol: str, tf: int, bias: Dict, f: Dict) -> Tuple[bool, str, str, f
 
     direction = "long" if long_ok and (not short_ok or bias["trend_up"]) else "short"
     vz = f.get("vz", 0.0)
-    score += max(0.0, min(0.25, (vz - 0.5) / 4.0))  # small boost from volume energy
+    score += max(0.0, min(0.25, (vz - 0.5) / 4.0))  # tiny boost from volume energy
 
     conf = max(0.0, min(1.0, score))
     return (True, direction, "; ".join(reasons), conf)
@@ -373,9 +359,10 @@ def maybe_emit(symbol: str, tf: int, direction: str, why: str, bias: Dict, f: Di
     if now - _last_alert[key] < SIG_CD_SEC:
         return
 
-    # breaker gate: observe but don't emit when ON
-    if breaker_active():
-        log.info("breaker ON: suppressing emit %s %sm %s conf=%.2f", symbol, tf, direction, conf)
+    # guard again right before emission (breaker could have flipped mid-iteration)
+    blocked, why_break = guard_blocking_reason()
+    if blocked:
+        log.info("guarded (emit): %s %sm %s conf=%.2f • %s", symbol, tf, direction, conf, why_break)
         return
 
     _last_alert[key] = now
@@ -427,16 +414,26 @@ def maybe_emit(symbol: str, tf: int, direction: str, why: str, bias: Dict, f: Di
 # =========================
 
 def loop_once() -> bool:
+    # If breaker is ON, don’t waste API calls; keep heartbeating elsewhere.
+    blocked, why = guard_blocking_reason()
+    if blocked:
+        log.info("guarded (scan): %s — skipping scan cycle", why)
+        return False
+
     any_signal = False
     for sym in SYMS:
         try:
             bias = bias_context(sym, BIAS_TF)
             for tf in INTRA_TFS:
                 f = intra_features(sym, tf)
-                ok, direction, why, conf = decide(sym, tf, bias, f)
+                ok, direction, why_dec, conf = decide(sym, tf, bias, f)
                 if ok:
                     any_signal = True
-                    maybe_emit(sym, tf, direction, why, bias, f, conf)
+                    # guard again at emission granularity
+                    with guard_gate(bot="signal_engine", action=f"emit/{sym}/{tf}") as allowed:
+                        if not allowed:
+                            continue
+                        maybe_emit(sym, tf, direction, why_dec, bias, f, conf)
         except Exception as e:
             log.warning("loop %s error: %s", sym, e)
     return any_signal
@@ -463,12 +460,13 @@ def main() -> None:
             log.error("scan error: %s", e)
             any_signal = False
 
-        # heartbeat (always, even if breaker blocks emits)
+        # heartbeat (always, even if breaker blocks emits/scans)
         now = time.time()
         if HEARTBEAT_MIN > 0 and (now - _last_hb) >= HEARTBEAT_MIN * 60:
             _last_hb = now
+            blocked, why = guard_blocking_reason()
             tg.safe_text(
-                f"🟢 Signal Engine heartbeat • SYMS={','.join(SYMS)} • TFs={INTRA_TFS} • Bias={BIAS_TF}m • queue={QUEUE_PATH.name} • signals={'yes' if any_signal else 'no'} • breaker={'ON' if breaker_active() else 'OFF'}",
+                f"💓 Signal Engine heartbeat • SYMS={','.join(SYMS)} • TFs={INTRA_TFS} • Bias={BIAS_TF}m • queue={QUEUE_PATH.name} • signals={'yes' if any_signal else 'no'} • guard={'ON' if blocked else 'OFF'}{(' • '+why) if blocked else ''}",
                 quiet=True,
             )
         time.sleep(max(5, SIG_POLL_SEC))
