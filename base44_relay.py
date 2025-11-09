@@ -23,20 +23,8 @@ Base44 Relay — Hardened + Normalization + Diagnostics (Flask)
                         GET  /heartbeat        (TG ping)
                         GET  /diag/telegram    (verifies token + recent chat IDs)
                         GET  /diag/wallet-normalized  ← proves availableBalance is present
-
-.env keys:
-  RELAY_TOKEN=...
-  ALLOWED_ORIGINS=http://localhost:5000,https://your-ngrok.ngrok-free.app
-  BYBIT_ENV=mainnet  # or testnet
-  BYBIT_BASE=        # optional; auto-picked from BYBIT_ENV if empty
-  BYBIT_API_KEY=...
-  BYBIT_API_SECRET=...
-  BYBIT_RECV_WINDOW=20000
-  RELAY_TIMEOUT=25
-  TELEGRAM_BOT_TOKEN=...
-  TELEGRAM_CHAT_ID=...
-  RELAY_HOST=0.0.0.0
-  RELAY_PORT=5000
+- Status UI:            GET  /status           (aggregate JSON, auth required)
+                        GET  /ui/status        (tiny HTML dashboard; fetches /status with your token)
 """
 
 from __future__ import annotations
@@ -369,6 +357,67 @@ def _pretty_name(uid: str) -> str:
     return f"sub:{uid}"
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Status helpers (for /status and UI)
+# ──────────────────────────────────────────────────────────────────────────────
+def _read_json_file(p: Path, default):
+    try:
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
+
+def _tail_lines(path: Path, n: int = 50) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            block = 2048
+            data = b""
+            while size > 0 and data.count(b"\n") <= n:
+                step = min(block, size)
+                size -= step
+                f.seek(size)
+                data = f.read(step) + data
+            return [ln.decode("utf-8", "replace").strip() for ln in data.splitlines()[-n:]]
+    except Exception:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
+        except Exception:
+            return []
+
+def _calc_gross_exposure_linear() -> Tuple[float, dict]:
+    status, body = _http_call("GET", "/v5/position/list", {"category": "linear"}, None)
+    gross = 0.0
+    detail: Dict[str, float] = {}
+    if status == 200 and isinstance(body, dict):
+        for p in (body.get("result") or {}).get("list") or []:
+            try:
+                sym = str(p.get("symbol") or "")
+                sz = float(p.get("size") or 0)
+                px = float(p.get("avgPrice") or 0)
+                g = abs(sz * px)
+                gross += g
+                if sym:
+                    detail[sym] = detail.get(sym, 0.0) + g
+            except Exception:
+                continue
+    return gross, detail
+
+def _total_equity_unified() -> float:
+    status, body = _http_call("GET", "/v5/account/wallet-balance", {"accountType":"UNIFIED"}, None)
+    total = 0.0
+    if status == 200 and isinstance(body, dict):
+        for acct in (body.get("result") or {}).get("list") or []:
+            try:
+                total += float(acct.get("totalEquity") or 0)
+            except Exception:
+                pass
+    return total
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Routes
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -670,6 +719,111 @@ def compat_market_tickers_v5():
     if symbol: params["symbol"] = symbol
     prox = bybit_proxy_internal({"method": "GET", "path": "/v5/market/tickers", "params": params})
     return _passthrough_primary(prox)
+
+# ---- Aggregated status JSON (auth required) ----
+@app.get("/status")
+@require_auth
+def status_aggregate():
+    """
+    Aggregated, low-latency system status for the UI.
+    Includes: equity, gross exposure, breaker hint (file), recent signals.
+    """
+    # breaker hint from file fallback (same file executor checks)
+    risk_state = _read_json_file(ROOT / ".state" / "risk_state.json", {})
+    breaker_on = bool(risk_state.get("breach") or risk_state.get("breaker") or risk_state.get("active"))
+
+    equity = _total_equity_unified()
+    gross, gross_by = _calc_gross_exposure_linear()
+
+    # last signals
+    sig_path = (ROOT / "signals" / "observed.jsonl")
+    sig_lines = _tail_lines(sig_path, 25)
+    recent_signals = []
+    for ln in sig_lines:
+        try:
+            js = json.loads(ln)
+            recent_signals.append({
+                "ts": int(js.get("ts", 0)),
+                "symbol": str(js.get("symbol","")).upper(),
+                "signal": str(js.get("signal","") or js.get("dir","")).upper(),
+                "features_class": (js.get("features") or {}).get("class")
+            })
+        except Exception:
+            continue
+
+    return _json_ok(
+        env=BYBIT_ENV,
+        bybit_base=BYBIT_BASE,
+        breaker=breaker_on,
+        equity=round(equity, 2),
+        gross_exposure=round(gross, 2),
+        gross_by_symbol={k: round(v,2) for k,v in gross_by.items()},
+        signals=recent_signals[-15:]
+    )
+
+# ---- Minimal HTML dashboard (token via ?token=) ----
+@app.get("/ui/status")
+def ui_status():
+    """
+    Minimal dashboard. Pass token via ?token=... or it will prompt.
+    """
+    tok = request.args.get("token","")
+    html = f"""
+<!doctype html>
+<meta charset="utf-8">
+<title>Base44 Status</title>
+<style>
+  body {{ font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 20px; }}
+  .row {{ display:flex; gap:24px; flex-wrap:wrap; }}
+  .card {{ border:1px solid #ddd; border-radius:10px; padding:14px; min-width:280px; box-shadow:0 1px 3px rgba(0,0,0,.05); }}
+  h1 {{ margin:0 0 12px 0; font-size:20px; }}
+  table {{ border-collapse: collapse; width:100%; }}
+  td, th {{ padding:4px 8px; border-bottom:1px solid #eee; text-align:left; }}
+  code {{ background:#f6f8fa; padding:2px 4px; border-radius:4px; }}
+</style>
+<div class="row">
+  <div class="card"><h1>Overview</h1>
+    <div id="ov"></div>
+  </div>
+  <div class="card"><h1>Gross by Symbol</h1>
+    <table id="gross"></table>
+  </div>
+  <div class="card" style="flex:1 1 420px;"><h1>Recent Signals</h1>
+    <table id="sig"></table>
+  </div>
+</div>
+<script>
+const tokenParam = new URLSearchParams(location.search).get('token') || '{tok}';
+async function fetchStatus() {{
+  const hdrs = tokenParam ? {{'x-relay-token': tokenParam}} : {{}};
+  if(!tokenParam) {{
+    const t = prompt('Relay token? (stored in this tab only)');
+    if(!t) return;
+    location.search = '?token='+encodeURIComponent(t);
+    return;
+  }}
+  const r = await fetch('/status', {{headers: hdrs}});
+  const js = await r.json().catch(()=>({{ok:false}}));
+  if(!js.ok) {{
+    document.body.innerHTML = '<p>Auth failed. Add ?token=YOUR_TOKEN to the URL.</p>';
+    return;
+  }}
+  const pct = js.equity>0 ? (js.gross_exposure/js.equity*100).toFixed(1) : '0.0';
+  document.getElementById('ov').innerHTML =
+    `<div>Env: <b>${{js.env}}</b> → <code>${{js.bybit_base}}</code></div>
+     <div>Breaker: <b style="color:${{js.breaker?'#c00':'#090'}}">${{js.breaker?'ON':'OFF'}}</b></div>
+     <div>Equity: <b>${{js.equity.toFixed(2)}}</b></div>
+     <div>Gross: <b>${{js.gross_exposure.toFixed(2)}}</b> (${pct}% of equity)</div>`;
+  const gross = js.gross_by_symbol || {{}};
+  const gtbl = Object.entries(gross).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<tr><td>${{k}}</td><td style="text-align:right">${{v.toFixed(2)}}</td></tr>`).join('');
+  document.getElementById('gross').innerHTML = '<tr><th>Symbol</th><th>Gross</th></tr>'+gtbl;
+  const sigs = (js.signals||[]).slice().reverse().map(s=>`<tr><td>${{new Date(s.ts||0).toLocaleTimeString()}}</td><td>${{s.symbol}}</td><td>${{s.signal}}</td><td>${{s.features_class||""}}</td></tr>`).join('');
+  document.getElementById('sig').innerHTML = '<tr><th>Time</th><th>Symbol</th><th>Dir</th><th>Class</th></tr>'+sigs;
+}}
+fetchStatus(); setInterval(fetchStatus, 6000);
+</script>
+"""
+    return make_response(html, 200, {"Content-Type": "text/html; charset=utf-8"})
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint
