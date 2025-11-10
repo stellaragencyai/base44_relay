@@ -3,65 +3,69 @@
 """
 tools.chaos_harness — end-to-end drills against a mock exchange.
 
-What it does
-- Monkeypatches core.bybit_client.Bybit to our MockBybit before importing bots.
-- Spawns threads: executor, tp_sl_manager, reconciler, outcome_watcher.
-- Generates signals into signals/observed.jsonl.
-- Ticks prices, fills rungs, flips breaker on/off, injects rejections and net flaps.
-- Prints a tidy summary at the end: orders, executions, positions, outcomes.
-
-Config (env)
-  CHAOS_SYMBOLS=BTCUSDT,ETHUSDT
-  CHAOS_RUNTIME_SEC=45
-  CHAOS_SIGNAL_RATE=0.8      # signals per second per symbol
-  CHAOS_TREND_BPS=5          # drift per tick in bps
-  CHAOS_TICK_MS=400
-  EXEC_DRY_RUN=false         # we want real flows through the mock
-  TP_DRY_RUN=false
-  TPSL_ENABLED=true
-  SIG_DRY_RUN=false
+Run with:
+  python -m tools.chaos_harness
+or:
+  # if you insist on direct-run
+  # at the very top add project root to sys.path
 """
 
 from __future__ import annotations
 import os, sys, time, json, threading, random
 from pathlib import Path
 
-ROOT = Path(os.getcwd())
-STATE = ROOT / "state"; STATE.mkdir(exist_ok=True, parents=True)
+# ------------------------------------------------------------------
+# Make sure imports resolve when running as a script
+# ------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+STATE = ROOT / "state";   STATE.mkdir(exist_ok=True, parents=True)
 SIGNALS = ROOT / "signals"; SIGNALS.mkdir(exist_ok=True, parents=True)
 QUEUE = SIGNALS / "observed.jsonl"
 
-# 1) Patch Bybit to mock BEFORE importing your bots
-import importlib
-import types
+# ------------------------------------------------------------------
+# FORCE CHAOS ENVS *BEFORE* IMPORTING ANY BOTS
+# ------------------------------------------------------------------
+# Trading modes
+os.environ["EXEC_DRY_RUN"] = "false"     # real flows through the mock
+os.environ["SIG_DRY_RUN"]  = "false"
+os.environ["TP_DRY_RUN"]   = "false"
+os.environ["TPSL_ENABLED"] = "true"
 
-# create a shim module object with MockBybit
+# Symbols and limits
+os.environ.setdefault("TP_SYMBOL_WHITELIST", "")       # manage all
+os.environ.setdefault("RECON_SYMBOL_WHITELIST", "")
+
+# Silence Telegram no matter what your shell says
+os.environ["TELEGRAM_NOTIFY"] = "0"
+os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+os.environ.pop("TELEGRAM_CHAT_ID", None)
+os.environ.pop("TELEGRAM_CHAT_IDS", None)
+
+# Keep outcome bus quiet if you wired one
+os.environ.setdefault("OUTCOME_NOTIFY", "false")
+
+# ------------------------------------------------------------------
+# Monkeypatch Bybit to mock BEFORE importing bots
+# ------------------------------------------------------------------
+import types
 from core.bybit_mock import MockBybit
 bybit_client_mod = types.ModuleType("core.bybit_client")
 setattr(bybit_client_mod, "Bybit", MockBybit)
-
-# force-inject into sys.modules so downstream imports see the mock
 sys.modules["core.bybit_client"] = bybit_client_mod
 
-# 2) Now import your bots
+# Now it's safe to import bots and guard
 from bots.executor_v1 import main as executor_main
 from bots.tp_sl_manager import main as tpsl_main
 from bots.reconciler import main as reconciler_main
 from bots.outcome_watcher import main as outcome_main
-
-# guard for breaker toggles
 from core.guard import guard_set, guard_clear
 
-# Set sane env defaults for chaos
-os.environ.setdefault("EXEC_DRY_RUN", "false")
-os.environ.setdefault("TP_DRY_RUN", "false")
-os.environ.setdefault("SIG_DRY_RUN", "false")
-os.environ.setdefault("TPSL_ENABLED", "true")
-os.environ.setdefault("TP_SYMBOL_WHITELIST", "")       # manage all
-os.environ.setdefault("RECON_SYMBOL_WHITELIST", "")
-os.environ.setdefault("OUTCOME_NOTIFY", "false")
-os.environ.setdefault("TELEGRAM_NOTIFY", "0")
-
+# ------------------------------------------------------------------
+# Chaos knobs
+# ------------------------------------------------------------------
 SYMS = [s.strip().upper() for s in (os.getenv("CHAOS_SYMBOLS","BTCUSDT,ETHUSDT")).split(",") if s.strip()]
 RUNTIME = int(os.getenv("CHAOS_RUNTIME_SEC", "45"))
 SIG_RATE = float(os.getenv("CHAOS_SIGNAL_RATE", "0.8"))
@@ -80,7 +84,7 @@ def _append_signal(sym: str, side: str, *, r_stop_dist: float = 0.004):
             "tag": "B44",
             "maker_only": True,
             "spread_max_bps": 12,
-            "stop_dist": r_stop_dist  # in price units; small but nonzero
+            "stop_dist": r_stop_dist
         },
         "features": {
             "class": "EqualR",
@@ -101,10 +105,9 @@ def _signal_feeder():
         time.sleep(max(0.05, TICK_MS/1000.0))
 
 def _price_driver():
-    # Access the mock directly through any imported bot’s Bybit instance class
-    # We instantiate a throwaway mock only to access its internal state typing
+    # the patched Bybit is our MockBybit
     from core.bybit_client import Bybit
-    by = Bybit()  # a mock
+    by = Bybit()
     rnd = random.Random(7)
     mids = {s: (50000.0 if "BTC" in s else 3000.0) for s in SYMS}
     while not _stop.is_set():
@@ -112,21 +115,21 @@ def _price_driver():
             drift = 1.0 + (TREND_BPS/10000.0) * (1 if rnd.random() < 0.5 else -1)
             noise = 1.0 + rnd.uniform(-0.0008, 0.0008)
             mids[s] *= drift * noise
-            # call the mock’s private tick to cross resting orders
             try:
-                by._tick(s, mids[s])
+                by._tick(s, mids[s])  # cross resting reduce-only orders
             except Exception:
                 pass
         time.sleep(TICK_MS/1000.0)
 
 def _breaker_gremlin():
     rnd = random.Random(1337)
-    t0 = time.time()
+    # start with breaker OFF so we actually open positions
+    guard_clear("chaos start")
     while not _stop.is_set():
         time.sleep(3.5)
+        # 35% chance to flip the breaker with a short TTL
         if rnd.random() < 0.35:
             guard_set("chaos_breaker", ttl_sec=rnd.randint(3,8))
-        # auto-clear happens via TTL
 
 def _spawn(target, name):
     th = threading.Thread(target=target, name=name, daemon=True)
@@ -164,7 +167,8 @@ def _summary():
     print("\n=== CHAOS SUMMARY ===")
     print(f"outcomes: total={len(outcomes)}  won={ok}  lost={ng}")
     if model:
-        print("priors:", {k: round(v.get('alpha',0)/(v.get('alpha',0)+v.get('beta',1)), 3) for k,v in model.items()})
+        pri = {k: round(v.get('alpha',0)/(v.get('alpha',0)+v.get('beta',1)), 3) for k,v in model.items()}
+        print("priors:", pri)
     print("state dir:", str(STATE))
 
 def main():

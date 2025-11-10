@@ -20,3 +20,29 @@
 {"ts":"2025-11-10T12:28:23.521+00:00","level":"WARNING","name":"bots.auto_executor","msg":"exposure check failed: mock: transient network","taskName":null,"comp":"executor"}
 {"ts":"2025-11-10T12:28:24.675+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
 {"ts":"2025-11-10T12:28:24.752+00:00","level":"WARNING","name":"bots.tp_sl_manager","msg":"loop error: mock: transient network","taskName":null,"comp":"tpsl"}
+{"ts":"2025-11-10T14:05:08.267+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
+{"ts":"2025-11-10T14:05:08.270+00:00","level":"INFO","name":"bots.outcome_watcher","msg":"Outcome watcher online: poll=5s lookback=900s own_enf=True","taskName":null,"comp":"outcome"}
+{"ts":"2025-11-10T14:05:08.276+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
+{"ts":"2025-11-10T14:05:09.333+00:00","level":"INFO","name":"bots.auto_executor","msg":"online • maker=True postOnly=True dry=False queue=C:\\Users\\nolan\\OneDrive\\Documents\\Desktop\\base44_relay\\signals\\observed.jsonl","taskName":null,"comp":"executor"}
+{"ts":"2025-11-10T14:05:09.497+00:00","level":"INFO","name":"bots.reconciler","msg":"online • interval=5s tag=B44 dry=True safe=True touch_manual=False","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T14:05:09.716+00:00","level":"WARNING","name":"bots.reconciler","msg":"reconcile_ladder entrypoint not found; ladder maintenance skipped.","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T14:05:14.710+00:00","level":"WARNING","name":"bots.reconciler","msg":"reconcile_ladder entrypoint not found; ladder maintenance skipped.","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T14:05:19.712+00:00","level":"WARNING","name":"bots.reconciler","msg":"reconcile_ladder entrypoint not found; ladder maintenance skipped.","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T14:05:21.816+00:00","level":"WARNING","name":"bots.auto_executor","msg":"exposure check failed: mock: transient network","taskName":null,"comp":"executor"}
+{"ts":"2025-11-10T14:05:24.591+00:00","level":"WARNING","name":"bots.reconciler","msg":"reconcile loop error: mock: transient network","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T14:05:25.780+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
+{"ts":"2025-11-10T14:05:28.882+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
+{"ts":"2025-11-10T14:05:30.584+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
+{"ts":"2025-11-10T14:05:33.035+00:00","level":"WARNING","name":"bots.tp_sl_manager","msg":"loop error: mock: transient network","taskName":null,"comp":"tpsl"}
+{"ts":"2025-11-10T14:05:34.714+00:00","level":"WARNING","name":"bots.reconciler","msg":"reconcile_ladder entrypoint not found; ladder maintenance skipped.","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T14:05:38.109+00:00","level":"WARNING","name":"bots.auto_executor","msg":"exposure check failed: mock: transient network","taskName":null,"comp":"executor"}
+{"ts":"2025-11-10T14:05:39.213+00:00","level":"WARNING","name":"bots.auto_executor","msg":"exposure check failed: mock: transient network","taskName":null,"comp":"executor"}
+{"ts":"2025-11-10T14:05:39.715+00:00","level":"WARNING","name":"bots.reconciler","msg":"reconcile_ladder entrypoint not found; ladder maintenance skipped.","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T14:05:39.785+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
+{"ts":"2025-11-10T14:05:41.036+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
+{"ts":"2025-11-10T14:05:43.286+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
+{"ts":"2025-11-10T14:05:45.099+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
+{"ts":"2025-11-10T14:05:49.162+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
+{"ts":"2025-11-10T14:05:52.214+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
+{"ts":"2025-11-10T14:05:52.937+00:00","level":"WARNING","name":"bots.auto_executor","msg":"exposure check failed: mock: transient network","taskName":null,"comp":"executor"}
+{"ts":"2025-11-10T14:05:53.351+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
