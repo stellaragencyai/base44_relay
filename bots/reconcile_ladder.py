@@ -58,7 +58,7 @@ try:
 except Exception:
     pass
 
-# notifier
+# notifier (multi-bot aware; we’ll pass sub_uid)
 try:
     from core.notifier_bot import tg_send
 except Exception:
@@ -70,11 +70,17 @@ try:
 except Exception:
     def log_event(*_, **__): pass  # no-op if not available
 
-# breaker
-try:
-    from core.breaker import is_active as breaker_active
-except Exception:
-    def breaker_active() -> bool: return False
+# breaker: prefer core.guard; fall back to legacy core.breaker
+def _breaker_active() -> bool:
+    try:
+        from core.guard import guard_blocking_reason  # type: ignore
+        return bool(guard_blocking_reason()[0])
+    except Exception:
+        try:
+            from core.breaker import is_active  # type: ignore
+            return bool(is_active())
+        except Exception:
+            return False
 
 # instruments helpers
 try:
@@ -96,11 +102,17 @@ except Exception:
         except Exception:
             return 0.0
 
-# prefer core.relay_client.proxy; fallback to direct POST /bybit/proxy
+# prefer core.relay_client.proxy; fallback to direct POST /bybit/proxy; last resort: direct Bybit client
 try:
     from core.relay_client import proxy as relay_proxy
 except Exception:
     relay_proxy = None
+
+_Bybit = None
+try:
+    from core.bybit_client import Bybit as _Bybit  # type: ignore
+except Exception:
+    _Bybit = None
 
 # ---- env helpers ---------------------------------------------------------------
 def _csv(name: str) -> List[str]:
@@ -166,26 +178,83 @@ def _relay_headers() -> Dict[str,str]:
         h["x-relay-token"] = RELAY_TOKEN
     return h
 
-# ---- relay proxy wrapper --------------------------------------------------------
+# ---- low-level API wrappers ----------------------------------------------------
+# Strategy:
+# 1) If relay_proxy exists, use it.
+# 2) Else POST to /bybit/proxy if RELAY_URL set.
+# 3) Else try direct Bybit client (requires API keys).
+
+_bybit_direct = _Bybit() if _Bybit else None
+if _bybit_direct:
+    try:
+        _bybit_direct.sync_time()
+    except Exception:
+        pass
+
 def _bybit_proxy(target: str, params: Dict, method: str="GET") -> dict:
-    """
-    Calls relay /bybit/proxy. Prefer core.relay_client.proxy; else do HTTP POST.
-    Supports optional subUid scoping.
-    """
     p = dict(params or {})
+    # pass subUid when available for scoped actions
     if CFG["sub_uid"]:
         p.setdefault("subUid", CFG["sub_uid"])
+
+    # 1) core.relay_client
     if relay_proxy:
         return relay_proxy(method, target, params=p)
-    url = f"{RELAY_URL}/bybit/proxy"
-    payload = {"target": target, "method": method, "params": p}
-    r = requests.post(url, headers=_relay_headers(), json=payload, timeout=15)
-    r.raise_for_status()
-    js = r.json()
-    # Some relays nest payloads; normalize a bit
-    if isinstance(js, dict) and "primary" in js and "body" in js.get("primary", {}):
-        js = js["primary"]["body"]
-    return js
+
+    # 2) explicit relay HTTP
+    if RELAY_URL:
+        url = f"{RELAY_URL}/bybit/proxy"
+        payload = {"target": target, "method": method, "params": p}
+        r = requests.post(url, headers=_relay_headers(), json=payload, timeout=20)
+        r.raise_for_status()
+        js = r.json()
+        if isinstance(js, dict) and "primary" in js and "body" in js.get("primary", {}):
+            js = js["primary"]["body"]
+        return js
+
+    # 3) direct client (very small surface we need)
+    if not _bybit_direct:
+        raise RuntimeError("No relay or bybit client available")
+
+    cat = p.get("category") or CFG["category"]
+    sym = p.get("symbol")
+    if target.endswith("/v5/position/list"):
+        ok, data, err = _bybit_direct.get_positions(category=cat, symbol=sym)
+        if not ok: raise RuntimeError(err or "pos fetch failed")
+        return data
+    if target.endswith("/v5/order/realtime"):
+        ok, data, err = _bybit_direct.get_open_orders(category=cat, symbol=sym, openOnly=True)
+        if not ok: raise RuntimeError(err or "orders fetch failed")
+        return data
+    if target.endswith("/v5/order/create"):
+        # create order
+        body = dict(p)
+        ok, data, err = _bybit_direct.place_order(**body)
+        if not ok: raise RuntimeError(err or "create failed")
+        return data
+    if target.endswith("/v5/order/cancel"):
+        ok, data, err = _bybit_direct.cancel_order(category=cat, symbol=sym, orderId=p.get("orderId"), orderLinkId=p.get("orderLinkId"))
+        if not ok: raise RuntimeError(err or "cancel failed")
+        return data
+    if target.endswith("/v5/market/kline"):
+        # map to public market kline
+        import urllib.parse
+        # Bybit client mock has no direct kline; rely on relay or public http
+        # If you hit this path without relay, we fallback to public REST:
+        base = (os.getenv("BYBIT_BASE_URL") or "https://api.bybit.com").rstrip("/")
+        q = urllib.parse.urlencode({"category": p.get("category","linear"), "symbol": p["symbol"], "interval": p["interval"], "limit": p.get("limit","200")})
+        r = requests.get(f"{base}/v5/market/kline?{q}", timeout=15)
+        r.raise_for_status()
+        return r.json()
+    if target.endswith("/v5/market/instruments-info"):
+        import urllib.parse
+        base = (os.getenv("BYBIT_BASE_URL") or "https://api.bybit.com").rstrip("/")
+        q = urllib.parse.urlencode({"category": p.get("category","linear"), "symbol": p["symbol"]})
+        r = requests.get(f"{base}/v5/market/instruments-info?{q}", timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+    raise RuntimeError(f"Unsupported direct call path: {target}")
 
 # ---- exchange info helpers -----------------------------------------------------
 def _inst_info(symbols: List[str]) -> Dict[str, dict]:
@@ -214,18 +283,22 @@ def _inst_info(symbols: List[str]) -> Dict[str, dict]:
 
 def _round_price_for_side(px: float, tick: float, side: str) -> float:
     """
-    For longs we prefer floor to avoid taker; for shorts we prefer ceil away from market.
+    For longs we place Sells above last; for shorts we place Buys below last.
+    Use floor-to-tick and nudge 1 tick if rounding overshoots the intention.
     """
     if tick <= 0:
         return float(px)
-    if side == "Buy":  # TP is Sell, above market; use floor to nearest tick on target price
-        return inst_round_price(px, tick)
-    else:              # TP is Buy, below market; still use floor which moves toward zero; adjust:
-        # Ensure rounding does not push price the wrong way for shorts
-        floored = inst_round_price(px, tick)
-        if floored > px:  # rare due to floor; guard anyway
-            return floored - tick
-        return floored
+    floored = inst_round_price(px, tick)
+    if side == "Buy":
+        # We'll place Sell at p; ensure we don't push under target due to rounding noise
+        if floored > px:
+            floored -= tick
+        return max(floored, tick)
+    else:
+        # We'll place Buy at p; ensure we don't push above target
+        if floored > px:
+            floored -= tick
+        return max(floored, tick)
 
 # ---- API wrappers --------------------------------------------------------------
 def _fetch_positions() -> List[dict]:
@@ -345,16 +418,17 @@ def _qty_ramp(mode: str, total: float, count: int) -> List[float]:
 # ---- core reconcile ------------------------------------------------------------
 _last_hb = 0.0
 _last_alert = 0.0
+_last_breaker_note = 0.0
 
 def _reduce_only(o: dict) -> bool:
-    v = o.get("reduceOnly")
+    v = o.get("reduceOnly", o.get("isClose"))
     if isinstance(v, bool): return v
     s = str(v).lower()
     return s in {"1","true","yes","on"}
 
 def _is_conditional(o: dict) -> bool:
     # Bybit sends triggerPrice for conditionals; orderType Market for SL/TP market
-    return "triggerPrice" in o or o.get("orderType") in {"Stop","Market"} and o.get("stopOrderType")
+    return "triggerPrice" in o or (o.get("orderType") in {"Stop","Market"} and o.get("stopOrderType"))
 
 def _ensure_for_position(pos: dict, filters: dict):
     symbol = pos.get("symbol","")
@@ -379,17 +453,20 @@ def _ensure_for_position(pos: dict, filters: dict):
     prefix = CFG["tag_prefix"]
     ours, others, all_tp = [], [], []
     for o in open_orders:
-        if not _reduce_only(o):  # manage exits only
+        try:
+            if not _reduce_only(o):
+                continue
+            if (o.get("orderType") or "").lower() != "limit":
+                # keep for SL detection below
+                continue
+            all_tp.append(o)
+            link = (o.get("orderLinkId") or "")
+            if link.startswith(prefix):
+                ours.append(o)
+            else:
+                others.append(o)
+        except Exception:
             continue
-        if (o.get("orderType") or "").lower() != "limit":
-            # keep for SL detection below
-            continue
-        all_tp.append(o)
-        link = (o.get("orderLinkId") or "")
-        if link.startswith(prefix):
-            ours.append(o)
-        else:
-            others.append(o)
 
     # Adoption/cancellation logic
     if CFG["cancel_strays"] and others and not CFG["dry"]:
@@ -398,7 +475,7 @@ def _ensure_for_position(pos: dict, filters: dict):
                 _cancel_order(symbol, order_id=o.get("orderId"))
                 log_event("reconciler", "cancel_stray", symbol, CFG["sub_uid"], {"orderId": o.get("orderId")})
             except Exception as e:
-                tg_send(f"⚠️ Reconciler cancel stray err {symbol}: {e}", priority="warn")
+                tg_send(f"⚠️ Reconciler cancel stray err {symbol}: {e}", priority="warn", sub_uid=CFG["sub_uid"] or None)
 
     # If adopting and there are already enough reduce-only TP limits total, do nothing
     total_ro_tps = len(all_tp)
@@ -434,15 +511,19 @@ def _ensure_for_position(pos: dict, filters: dict):
     created = 0
     updated = 0
 
-    # Respect breaker
-    if breaker_active():
-        tg_send(f"🛑 Reconciler skip writes (breaker ON)", priority="warn")
-        # still send heartbeat below; no writes
+    if _breaker_active():
+        # Throttle breaker spam
+        global _last_breaker_note
+        now = time.time()
+        if now - _last_breaker_note > 30:
+            _last_breaker_note = now
+            tg_send(f"🛑 Reconciler skip writes (breaker ON)", priority="warn", sub_uid=CFG["sub_uid"] or None)
+        # still ensure SL if safe_mode (but do not write)
     else:
         for i in range(target_cnt):
             q = qtys[i]
             p = targets[i]
-            if q < min_qty:
+            if q < min_qty or q <= 0:
                 continue
             p = _round_price_for_side(p, tick, side)
             link_id = f"{prefix}:{symbol}:{i+1}"[:36]
@@ -461,14 +542,13 @@ def _ensure_for_position(pos: dict, filters: dict):
                             try:
                                 _cancel_order(symbol, order_id=found.get("orderId"))
                             except Exception as e:
-                                tg_send(f"⚠️ Reconciler cancel err {symbol} r{i+1}: {e}", priority="warn")
+                                tg_send(f"⚠️ Reconciler cancel err {symbol} r{i+1}: {e}", priority="warn", sub_uid=CFG["sub_uid"] or None)
                             try:
                                 _create_limit(symbol, "Sell" if side == "Buy" else "Buy", q, p, CFG["post_only"], link_id)
                                 updated += 1
                                 log_event("reconciler", "tp_reprice", symbol, CFG["sub_uid"], {"rung": i+1, "from": curp, "to": p, "qty": q})
                             except Exception as e:
-                                tg_send(f"❌ Reconciler create err {symbol} r{i+1}: {e}", priority="error")
-                # else weird; ignore
+                                tg_send(f"❌ Reconciler create err {symbol} r{i+1}: {e}", priority="error", sub_uid=CFG["sub_uid"] or None)
             else:
                 if CFG["dry"]:
                     print(f"[recon] DRY create {symbol} rung {i+1} @ {p:.8g} qty {q:.8g}")
@@ -478,9 +558,9 @@ def _ensure_for_position(pos: dict, filters: dict):
                         created += 1
                         log_event("reconciler", "tp_create", symbol, CFG["sub_uid"], {"rung": i+1, "price": p, "qty": q})
                     except Exception as e:
-                        tg_send(f"❌ Reconciler create err {symbol} r{i+1}: {e}", priority="error")
+                        tg_send(f"❌ Reconciler create err {symbol} r{i+1}: {e}", priority="error", sub_uid=CFG["sub_uid"] or None)
 
-    # SL protection
+    # SL protection (respect breaker & dry-run inside helper)
     if CFG["safe_mode"]:
         _ensure_sl(symbol, side, size, last, step, min_qty, open_orders)
 
@@ -493,18 +573,13 @@ def _ensure_sl(symbol: str, side: str, size: float, last: float, step: float, mi
     if existing_sl:
         return
     avg = last
-    try:
-        # positions API has avgPrice in caller; but we receive 'last' already; best-effort
-        pass
-    except Exception:
-        pass
     off = CFG["sl_offset_bps"]/10000.0
     sl_px = (avg * (1 - off)) if side == "Buy" else (avg * (1 + off))
     q = inst_round_qty(size, step, min_qty)
     if q < min_qty or q <= 0:
         return
-    if breaker_active():
-        print(f"[recon] breaker ON; skip SL placement for {symbol}")
+    if _breaker_active():
+        # don't spam
         return
     if CFG["dry"]:
         print(f"[recon] DRY SL {symbol} @ {sl_px:.8g} qty {q:.8g} trigger={CFG['sl_trigger']}")
@@ -513,7 +588,7 @@ def _ensure_sl(symbol: str, side: str, size: float, last: float, step: float, mi
         _create_sl(symbol, side, q, sl_px, CFG["sl_trigger"])
         log_event("reconciler", "sl_place", symbol, CFG["sub_uid"], {"trigger": sl_px, "qty": q, "triggerBy": CFG["sl_trigger"]})
     except Exception as e:
-        tg_send(f"❌ Reconciler SL err {symbol}: {e}", priority="error")
+        tg_send(f"❌ Reconciler SL err {symbol}: {e}", priority="error", sub_uid=CFG["sub_uid"] or None)
 
 # ---- main loop ----------------------------------------------------------------
 def _heartbeat():
@@ -525,17 +600,19 @@ def _heartbeat():
         _last_hb = now
         tg_send(
             f"🟢 Reconciler heartbeat • dry={CFG['dry']} • rungs={CFG['rung_count']} • grid={CFG['grid_mode']} • tol={CFG['price_tol_bps']}bps • subUid={CFG['sub_uid'] or 'main'}",
-            priority="success"
+            priority="success",
+            sub_uid=CFG["sub_uid"] or None
         )
 
 def main():
     if not CFG["enabled"]:
-        tg_send("Reconciler disabled (RECON_ENABLED=false).", priority="warn")
+        tg_send("Reconciler disabled (RECON_ENABLED=false).", priority="warn", sub_uid=CFG["sub_uid"] or None)
         return
 
     tg_send(
         f"🟢 Reconciler online • dry={CFG['dry']} • rungs={CFG['rung_count']} • grid={CFG['grid_mode']} • tol={CFG['price_tol_bps']}bps • subUid={CFG['sub_uid'] or 'main'}",
-        priority="success"
+        priority="success",
+        sub_uid=CFG["sub_uid"] or None
     )
 
     while True:
@@ -574,8 +651,9 @@ def main():
         except Exception as e:
             # Only ping occasionally to avoid alert storms
             now = time.time()
+            global _last_alert
             if now - _last_alert >= CFG["alert_cooldown"]:
-                tg_send(f"⚠️ Reconciler loop error: {e}", priority="warn")
+                tg_send(f"⚠️ Reconciler loop error: {e}", priority="warn", sub_uid=CFG["sub_uid"] or None)
                 _last_alert = now
 
         time.sleep(CFG["poll_sec"])
