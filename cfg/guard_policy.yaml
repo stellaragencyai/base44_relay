@@ -1,0 +1,11 @@
+# Base44 Guard Policy (Phase-4)
+# Human-readable limits; env can override.
+
+max_daily_loss_pct: 3.0            # trip if realized loss ≥ 3% of session start equity
+max_realized_loss_usd: 0.0         # absolute loss cap; 0 disables
+gross_exposure_cap_pct: 65         # trip if gross exposure ≥ 65% of equity
+cooldown_min: 45                   # stay tripped this many minutes
+require_equity: false              # if true, block trading when equity can't be fetched
+
+# future: class/session windows can live here
+sessions: {}

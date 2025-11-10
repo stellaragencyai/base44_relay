@@ -1,0 +1,26 @@
+# One bot per subaccount. Keep this file out of version control.
+# name is just a label; sub_uid must match what your bots use (OWNERSHIP_SUB_UID / EXEC_ACCOUNT_UID).
+bots:
+  - name: main-alpha
+    sub_uid: "260417071"
+    token: "123456:AAABBBCCC..."         # BotFather token
+    chat_id: -1001234567890              # channel/group/user id
+    parse_mode: "MarkdownV2"             # or "HTML", "Markdown"
+    rate_limit_per_min: 40               # safety
+    dedupe_sec: 5                        # drop identical repeats in this window
+    enabled: true
+
+  - name: main-beta
+    sub_uid: "260417072"
+    token: "654321:ZZZYYYXXX..."
+    chat_id: 987654321
+    parse_mode: "MarkdownV2"
+    rate_limit_per_min: 40
+    dedupe_sec: 5
+    enabled: true
+
+# Optional defaults if a bot is missing fields
+defaults:
+  parse_mode: "MarkdownV2"
+  rate_limit_per_min: 40
+  dedupe_sec: 5
