@@ -3,7 +3,7 @@
 # -*- coding: utf-8 -*-
 """
 Notifier Bot (core) — quiet on import, layered env, retries, rate limit, media helpers.
-Now with multi-bot routing per subaccount (optional cfg/tg_subaccounts.yaml).
+Now with multi-bot routing per subaccount (optional cfg/tg_subaccounts.yaml) and hard mute.
 
 What you get:
 - Loads env via core/env_bootstrap (layered .env, repo-safe paths).
@@ -15,18 +15,18 @@ What you get:
     * Falls back to legacy single-bot env if no YAML or no match
 - Optional thread routing (forum topics) via TELEGRAM_THREAD_ID.
 - Global rate limiting (token bucket) and per-bot de-duplication.
-- Retries with backoff + jitter.
+- Retries with backoff + jitter + 401 squelch (prevents log spam on bad tokens).
 - Chunking for >4096 char messages.
-- Media helpers: tg_send_photo(), tg_send_document() (now accept sub_uid too).
+- Media helpers: tg_send_photo(), tg_send_document() (accept sub_uid too).
 - Console mirror for every message; Telegram send is optional and never raises.
-- CLI: --validate, --updates, --ping [name], --echo "msg".
+- CLI: --validate, --updates, --ping [name], --echo "msg", --probe-yaml.
 
 Env (in .env or process):
   TELEGRAM_BOT_TOKEN=123456:ABC...
   TELEGRAM_CHAT_ID=7776809236
   TELEGRAM_CHAT_IDS=777,888,-100123...
   TELEGRAM_THREAD_ID=123
-  TELEGRAM_SILENT=0|1
+  TELEGRAM_SILENT=0|1                # hard mute: never call Telegram APIs when "1"
   TELEGRAM_DISABLE_PREVIEW=1|0
   TELEGRAM_DEFAULT_PARSE_MODE=Markdown | HTML
   TELEGRAM_NOTIFY=1|0
@@ -62,7 +62,9 @@ import json
 import random
 import threading
 import datetime
-from typing import Any, Iterable, Optional, List, Union, Dict, Tuple
+from typing import Any, Iterable, Optional, List, Union, Dict
+
+from pathlib import Path
 
 # Layered env + safe paths (not strictly required here)
 try:
@@ -112,8 +114,10 @@ _TZ = (_getenv("TZ", "America/Phoenix") or "America/Phoenix")
 _TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{30,}$")
 
 def _mask_token(tok: str) -> str:
-    if not tok: return "<empty>"
-    if len(tok) < 12: return tok[:2] + "…" + tok[-2:]
+    if not tok:
+        return "<empty>"
+    if len(tok) < 12:
+        return tok[:2] + "…" + tok[-2:]
     return tok[:6] + "…" + tok[-6:]
 
 def _valid_token(tok: str) -> bool:
@@ -131,7 +135,7 @@ except Exception:
     settings = _S()  # type: ignore
 
 # Multi-bot YAML (optional)
-_TG_CFG_PATH = Path = __import__("pathlib").Path(os.getenv("TG_CONFIG_PATH", "cfg/tg_subaccounts.yaml"))
+_TG_CFG_PATH = Path(os.getenv("TG_CONFIG_PATH", "cfg/tg_subaccounts.yaml"))
 
 def _load_yaml(path: Path) -> Dict[str, Any]:
     try:
@@ -149,6 +153,7 @@ def _load_yaml(path: Path) -> Dict[str, Any]:
 
 _cfg_cache: Dict[str, Any] = {}
 _bot_state: Dict[str, Dict[str, Any]] = {}  # per-sub_uid runtime (dedupe/rl)
+_unauth_squelch: Dict[str, float] = {}      # token -> last 401 ts
 
 def _reload_cfg() -> Dict[str, Any]:
     global _cfg_cache
@@ -173,7 +178,7 @@ def _pick_bot(sub_uid: Optional[str]) -> Optional[Dict[str, Any]]:
     if bots:
         if sub_uid:
             for b in bots:
-                if not b.get("enabled", True): 
+                if not b.get("enabled", True):
                     continue
                 if str(b.get("sub_uid")) == str(sub_uid):
                     out = dict(defaults); out.update(b); return out
@@ -280,17 +285,22 @@ def _split_message(msg: str, limit: int = 4096) -> List[str]:
 # Enablement checks
 # --------------------------------------------------------------------------------------
 def _telegram_enabled_env() -> bool:
-    return bool(_TELEGRAM_BOT_TOKEN and _TELEGRAM_CHAT_IDS) and not _TELEGRAM_SILENT
+    # require non-silent and valid token+dest
+    return (not _TELEGRAM_SILENT) and _valid_token(_TELEGRAM_BOT_TOKEN) and bool(_TELEGRAM_CHAT_IDS)
 
 def _telegram_enabled_any() -> bool:
-    # either multi-bot config has at least one enabled bot with token+chat
+    if _TELEGRAM_SILENT:
+        return False
+    # either multi-bot config has at least one enabled bot with valid token+chat
     cfg = _cfg()
     bots = cfg.get("bots") or []
     if bots:
         for b in bots:
-            if not b.get("enabled", True): 
+            if not b.get("enabled", True):
                 continue
-            if b.get("token") and b.get("chat_id") is not None:
+            tok = str(b.get("token") or "")
+            cid = b.get("chat_id", None)
+            if _valid_token(tok) and (cid is not None):
                 return True
     # or legacy env single bot
     return _telegram_enabled_env()
@@ -306,7 +316,18 @@ def _retry_delay(attempt: int) -> float:
     base = (_BACKOFF_BASE_MS / 1000.0) * (2 ** attempt)
     return min(8.0, base) + random.uniform(0, 0.15)
 
+def _squelch_unauthorized(token: str) -> bool:
+    """Return True if we should suppress logging another 401 for this token right now."""
+    now = time.time()
+    last = _unauth_squelch.get(token, 0.0)
+    if now - last < 60.0:
+        return True
+    _unauth_squelch[token] = now
+    return False
+
 def _post_telegram_json_token(token: str, path: str, payload: dict) -> Optional[requests.Response]:
+    if _TELEGRAM_SILENT or not _valid_token(token):
+        return None
     url = f"{_api_base_for_token(token)}/{path.lstrip('/')}"
     last_exc = None
     for attempt in range(_MAX_RETRIES + 1):
@@ -314,6 +335,10 @@ def _post_telegram_json_token(token: str, path: str, payload: dict) -> Optional[
         try:
             resp = requests.post(url, json=payload, timeout=20)
             if resp.ok:
+                return resp
+            if resp.status_code == 401:
+                if not _squelch_unauthorized(token):
+                    _console_print("notifier/telegram/error:", f"HTTP 401 Unauthorized (token={_mask_token(token)})")
                 return resp
             if resp.status_code in (429, 500, 502, 503, 504):
                 delay = _retry_delay(attempt)
@@ -335,6 +360,8 @@ def _post_telegram_json_token(token: str, path: str, payload: dict) -> Optional[
     return None
 
 def _post_telegram_multipart_token(token: str, path: str, fields: dict, files: dict) -> Optional[requests.Response]:
+    if _TELEGRAM_SILENT or not _valid_token(token):
+        return None
     url = f"{_api_base_for_token(token)}/{path.lstrip('/')}"
     last_exc = None
     for attempt in range(_MAX_RETRIES + 1):
@@ -342,6 +369,10 @@ def _post_telegram_multipart_token(token: str, path: str, fields: dict, files: d
         try:
             resp = requests.post(url, data=fields, files=files, timeout=30)
             if resp.ok:
+                return resp
+            if resp.status_code == 401:
+                if not _squelch_unauthorized(token):
+                    _console_print("notifier/telegram/error:", f"HTTP 401 Unauthorized (token={_mask_token(token)})")
                 return resp
             if resp.status_code in (429, 500, 502, 503, 504):
                 delay = _retry_delay(attempt)
@@ -365,7 +396,10 @@ def _post_telegram_multipart_token(token: str, path: str, fields: dict, files: d
 # Legacy single-bot helpers remain for CLI validate/diag
 def _get_telegram_env(path: str, *, params: Optional[dict] = None) -> Optional[requests.Response]:
     try:
-        base = _api_base_for_token(_TELEGRAM_BOT_TOKEN) if _TELEGRAM_BOT_TOKEN else "https://api.telegram.org/bot"
+        token = _TELEGRAM_BOT_TOKEN
+        if _TELEGRAM_SILENT or not _valid_token(token):
+            return None
+        base = _api_base_for_token(token)
         url = f"{base}/{path.lstrip('/')}"
         return requests.get(url, params=params or {}, timeout=15)
     except Exception as e:
@@ -386,6 +420,9 @@ def tg_diag(verbose_updates: bool = False) -> bool:
     """Validate token with getMe (legacy single-bot) and optionally fetch getUpdates."""
     if _TELEGRAM_DEBUG:
         _console_print("notifier/info:", f"Token preview: {_mask_token(_TELEGRAM_BOT_TOKEN)} ({_bom_prefix_debug(_TELEGRAM_BOT_TOKEN)})")
+    if _TELEGRAM_SILENT:
+        _console_print("notifier/warn:", "Silent mode is ON; skipping Telegram validation.")
+        return True
     if not _valid_token(_TELEGRAM_BOT_TOKEN):
         _console_print("notifier/error:", "Bot token format is invalid (env TELEGRAM_BOT_TOKEN).")
         _console_print("notifier/help:", "Ensure .env is UTF-8 (no BOM) and line TELEGRAM_BOT_TOKEN=<token>")
@@ -483,7 +520,7 @@ def tg_send(msg: str,
         target_uid = _resolve_sub_uid(sub_uid)
         bot_cfg = _pick_bot(target_uid)
 
-        if bot_cfg and bot_cfg.get("token") and (bot_cfg.get("chat_id") is not None):
+        if bot_cfg and _valid_token(str(bot_cfg.get("token") or "")) and (bot_cfg.get("chat_id") is not None):
             token = str(bot_cfg["token"]).strip()
             chat_id = bot_cfg["chat_id"]
             per_min = int(bot_cfg.get("rate_limit_per_min", 40))
@@ -577,6 +614,10 @@ def tg_validate(verbose_updates: bool = False) -> bool:
     Validate in legacy env mode. If you’re using multi-bot routing, just send a test via tg_send(..., sub_uid="...").
     Returns True if at least one chat succeeded.
     """
+    if _TELEGRAM_SILENT:
+        _console_print("notifier/warn:", "Silent mode is ON; skipping Telegram validation.")
+        return True
+
     if not tg_diag(verbose_updates=verbose_updates):
         return False
 
@@ -650,7 +691,7 @@ def tg_send_photo(photo: Union[str, bytes, io.BytesIO],
         target_uid = _resolve_sub_uid(sub_uid)
         bot_cfg = _pick_bot(target_uid)
 
-        if bot_cfg and bot_cfg.get("token") and (bot_cfg.get("chat_id") is not None):
+        if bot_cfg and _valid_token(str(bot_cfg.get("token") or "")) and (bot_cfg.get("chat_id") is not None):
             token = str(bot_cfg["token"]).strip()
             chat_id = bot_cfg["chat_id"]
             fields = {
@@ -716,7 +757,7 @@ def tg_send_document(document: Union[str, bytes, io.BytesIO],
         target_uid = _resolve_sub_uid(sub_uid)
         bot_cfg = _pick_bot(target_uid)
 
-        if bot_cfg and bot_cfg.get("token") and (bot_cfg.get("chat_id") is not None):
+        if bot_cfg and _valid_token(str(bot_cfg.get("token") or "")) and (bot_cfg.get("chat_id") is not None):
             token = str(bot_cfg["token"]).strip()
             chat_id = bot_cfg["chat_id"]
             fields = {
