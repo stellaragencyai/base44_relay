@@ -433,6 +433,30 @@ def _record_execution(link_id: str, qty_val: float, px: float, fee: float = 0.0)
         log.warning("DB exec write failed (%s): %s", link_id, e)
 
 # ------------------------
+# Outcome-watcher hook: persist entry metadata
+# ------------------------
+
+def _save_entry_meta(link_id: str, symbol: str, side: str, setup_tag: Optional[str], stop_dist: Optional[float]) -> None:
+    """
+    Store entry metadata so bots/outcome_watcher.py can compute realized R later.
+    """
+    try:
+        p = STATE_DIR / "entries_meta.json"
+        obj = {}
+        if p.exists():
+            obj = json.loads(p.read_text(encoding="utf-8"))
+        obj[link_id or symbol] = {
+            "symbol": symbol,
+            "side": side,
+            "setup_tag": (setup_tag or "Unknown"),
+            "stop_dist": (float(stop_dist) if stop_dist is not None else None),
+            "ts": int(time.time() * 1000),
+        }
+        p.write_text(json.dumps(obj, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    except Exception:
+        pass
+
+# ------------------------
 # Placement
 # ------------------------
 
@@ -467,6 +491,16 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
     qty_txt = _format_qty(qty_val)
     tif = "PostOnly" if (EXEC_POST_ONLY and maker_only and px is not None) else ("ImmediateOrCancel" if px is None else "GoodTillCancel")
 
+    # NEW: record entry meta for outcome watcher (setup tag + stop distance)
+    setup_tag = features.get("class") or params.get("tag") or "Unknown"
+    stop_dist = None
+    try:
+        if params.get("stop_dist"):
+            stop_dist = float(params["stop_dist"])
+    except Exception:
+        stop_dist = None
+    _save_entry_meta(link_id, symbol, side, setup_tag, stop_dist)
+
     _record_order_state(link_id, symbol, side, qty_val, px, state="NEW")
 
     # initial risk in USD if stop_dist present
@@ -498,7 +532,7 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
     req = dict(
         category="linear",
         symbol=symbol,
-        side=side,
+        side=side,  # Buy|Sell
         orderType=("Limit" if px is not None else "Market"),
         qty=str(qty_txt),
         reduceOnly=False,
