@@ -104,6 +104,9 @@ _extra_ctx: Dict[str, Any] = {}
 def _ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
+# ensure base log dir exists early (tiny hardening)
+_ensure_dir(LOG_DIR)
+
 def _now_tz(ts: Optional[float] = None) -> dt.datetime:
     val = ts if ts is not None else time.time()
     if settings and getattr(settings, "TZ", None) and ZoneInfo:
@@ -273,9 +276,9 @@ def _flush_parquet(rows: List[Dict[str, Any]], ts: Optional[float] = None):
             tbl = pa.Table.from_pylist(rows)        # schema inferred
             pq.write_table(tbl, path)
         else:
-            import pandas as pd  # type: ignore
-            df = pd.DataFrame(rows)
-            _fp.write(path, df)  # type: ignore
+            # use the already-imported pandas alias to avoid redundant import
+            df = _pd.DataFrame(rows)  # type: ignore
+            _fp.write(path, df)       # type: ignore
     except Exception:
         # parquet is optional; ignore
         pass

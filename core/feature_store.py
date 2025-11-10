@@ -1,51 +1,53 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Feature store: logs pre-trade features and post-trade outcomes.
-- Writes compact JSONL always
-- Optionally writes Parquet if pyarrow/fastparquet is installed
-Schema keys:
-  signal_id: str (stable id, e.g., orderLinkId)
-  ts_ms: int
-  symbol: str
-  sub_uid: str
-  kind: "features" | "outcome"
+core/feature_store.py — append-only feature logging for pre-trade context
+
+Writes both JSONL and CSV to logs/features/.
 """
+
 from __future__ import annotations
-import os, json, time
+import os, json, csv, time
 from pathlib import Path
 from typing import Dict, Any
 
-ROOT = Path(os.getenv("STATE_DIR", "./state")).resolve()
-DATA_DIR = Path(os.getenv("FEATURE_STORE_DIR", "./data/features")).resolve()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-FEAT_JSONL = DATA_DIR / "features.jsonl"
-OUT_JSONL  = DATA_DIR / "outcomes.jsonl"
+ROOT = Path(os.getenv("B44_ROOT", Path(__file__).resolve().parents[1]))
+OUT_DIR = ROOT / "logs" / "features"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-def _write_jsonl(path: Path, row: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n")
+JSONL = OUT_DIR / "pretrade_features.jsonl"
+CSV   = OUT_DIR / "pretrade_features.csv"
 
-def log_features(signal_id: str, symbol: str, sub_uid: str, features: Dict[str, Any], ts_ms: int | None=None) -> None:
-    row = {"signal_id": signal_id, "ts_ms": ts_ms or int(time.time()*1000), "symbol": symbol, "sub_uid": str(sub_uid), "kind": "features", "features": features}
-    _write_jsonl(FEAT_JSONL, row)
-    _maybe_parquet("features", row)
+def log_features(link_id: str, symbol: str, account: str, features: Dict[str, Any]) -> None:
+    ts = int(time.time() * 1000)
+    row = {"ts": ts, "link": link_id, "symbol": symbol, "account": account, **(features or {})}
 
-def log_outcome(signal_id: str, symbol: str, sub_uid: str, outcome: Dict[str, Any], ts_ms: int | None=None) -> None:
-    row = {"signal_id": signal_id, "ts_ms": ts_ms or int(time.time()*1000), "symbol": symbol, "sub_uid": str(sub_uid), "kind": "outcome", "outcome": outcome}
-    _write_jsonl(OUT_JSONL, row)
-    _maybe_parquet("outcomes", row)
-
-def _maybe_parquet(name: str, row: Dict[str, Any]) -> None:
+    # JSONL
     try:
-        import pandas as pd
-        df = pd.DataFrame([row])
-        out = DATA_DIR / f"{name}.parquet"
-        if out.exists():
-            old = pd.read_parquet(out)
-            df = pd.concat([old, df], ignore_index=True)
-        df.to_parquet(out, index=False)  # requires pyarrow or fastparquet if available
+        with open(JSONL, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
     except Exception:
-        # parquet is best-effort; jsonl is authoritative
+        pass
+
+    # CSV with evolving header
+    try:
+        header = list(row.keys())
+        write_header = not CSV.exists()
+        if CSV.exists():
+            # try to keep a stable superset of columns
+            with open(CSV, "r", encoding="utf-8", newline="") as fh:
+                rd = csv.reader(fh)
+                first = next(rd, None)
+                if first:
+                    old = list(first)
+                    for k in header:
+                        if k not in old:
+                            old.append(k)
+                    header = old
+        with open(CSV, "a", encoding="utf-8", newline="") as fh:
+            wr = csv.DictWriter(fh, fieldnames=header, extrasaction="ignore")
+            if write_header:
+                wr.writeheader()
+            wr.writerow(row)
+    except Exception:
         pass

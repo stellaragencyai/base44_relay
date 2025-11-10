@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Trade lifecycle classifier.
-Returns: "trend", "breakout", "meanrev" based on features. Pluggable.
+core/trade_classifier.py — tiny heuristic classifier
+Returns one of: "trend", "breakout", "meanrev", "other"
 """
+
 from __future__ import annotations
 from typing import Dict
 
-def classify(features: Dict) -> str:
-    slope = float(features.get("trend_slope", 0.0))
-    volz  = float(features.get("vol_z", 0.0))
-    rvbps = float(features.get("realized_vol_bps", 0.0))
-    # crude but effective baseline:
-    if slope > 0.0005 and volz > 0.5:
-        return "trend"
-    if rvbps > 25 and volz > 0.8:
-        return "breakout"
-    return "meanrev"
+def classify(f: Dict) -> str:
+    try:
+        e20  = float(f.get("ema20", 0))
+        e50  = float(f.get("ema50", 0))
+        e200 = float(f.get("ema200", 0))
+        close= float(f.get("close", 0))
+        vz   = float(f.get("intra_vz", f.get("vz", 0)))
+        if e20 > e50 > e200 or e20 < e50 < e200:
+            return "trend"
+        if vz > 1.0 and (close > max(e20, e50) or close < min(e20, e50)):
+            return "breakout"
+        if abs(close - e20) / (e20 or 1e-9) < 0.002 and abs(e20 - e50) / (e50 or 1e-9) < 0.002:
+            return "meanrev"
+        return "other"
+    except Exception:
+        return "other"

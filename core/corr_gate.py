@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Correlation/confirmation gate: require supportive regime from majors.
-Simple version: if BTC & ETH trend_slope < 0 and realized_vol low, block high-beta alts.
-"""
-from __future__ import annotations
-import json
-from pathlib import Path
+core/corr_gate.py — correlation gate (minimal)
+Default: allow everything. You can tighten later.
 
-STATE = Path("./.state/regime_state.json")
+Env:
+  CORR_DISABLE=true            -> always allow
+  CORR_BLOCKLIST=BTCUSDT,PEPEUSDT
+"""
+
+from __future__ import annotations
+import os
+
+_BLOCK = {s.strip().upper() for s in (os.getenv("CORR_BLOCKLIST","") or "").split(",") if s.strip()}
+_ALWAYS_ALLOW = str(os.getenv("CORR_DISABLE","false")).lower() in ("1","true","yes","on")
 
 def allow(symbol: str) -> bool:
-    try:
-        st = json.loads(STATE.read_text(encoding="utf-8"))
-    except Exception:
+    if _ALWAYS_ALLOW:
         return True
-    trend = float(st.get("trend_slope", 0.0))
-    vol   = float(st.get("realized_vol_bps", 0.0))
-    if symbol.upper() not in ("BTCUSDT","ETHUSDT"):
-        if trend < -0.0004 and vol < 15:
-            return False
+    if symbol and symbol.upper() in _BLOCK:
+        return False
+    # TODO: plug real correlation logic here when you actually want it
     return True
