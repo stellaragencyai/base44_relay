@@ -49,7 +49,7 @@ Key env (.env):
 
 from __future__ import annotations
 import os, time, math, json, requests
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 # ---- core env + optional integrations -----------------------------------------
 try:
@@ -239,8 +239,6 @@ def _bybit_proxy(target: str, params: Dict, method: str="GET") -> dict:
     if target.endswith("/v5/market/kline"):
         # map to public market kline
         import urllib.parse
-        # Bybit client mock has no direct kline; rely on relay or public http
-        # If you hit this path without relay, we fallback to public REST:
         base = (os.getenv("BYBIT_BASE_URL") or "https://api.bybit.com").rstrip("/")
         q = urllib.parse.urlencode({"category": p.get("category","linear"), "symbol": p["symbol"], "interval": p["interval"], "limit": p.get("limit","200")})
         r = requests.get(f"{base}/v5/market/kline?{q}", timeout=15)
@@ -589,6 +587,59 @@ def _ensure_sl(symbol: str, side: str, size: float, last: float, step: float, mi
         log_event("reconciler", "sl_place", symbol, CFG["sub_uid"], {"trigger": sl_px, "qty": q, "triggerBy": CFG["sl_trigger"]})
     except Exception as e:
         tg_send(f"❌ Reconciler SL err {symbol}: {e}", priority="error", sub_uid=CFG["sub_uid"] or None)
+
+# ---- single-position entrypoints for bots.reconciler ---------------------------
+def reconcile_ladder_for_symbol(*,
+                                symbol: str,
+                                side: str,
+                                qty: float,
+                                dry_run: bool,
+                                safe_mode: bool,
+                                tag_prefix: str,
+                                cancel_strays: bool,
+                                bybit=None,
+                                mfe_hint_bps: Optional[float] = None):
+    """
+    Thin per-symbol wrapper used by bots.reconciler.
+    Applies incoming flags to CFG, fetches filters, builds a one-off position and reconciles it.
+    """
+    # map flags to CFG for this invocation
+    CFG["dry"] = bool(dry_run)
+    CFG["safe_mode"] = bool(safe_mode)
+    CFG["tag_prefix"] = str(tag_prefix or CFG["tag_prefix"])
+    CFG["cancel_strays"] = bool(cancel_strays)
+
+    # fetch filters for this symbol
+    inst = _inst_info([symbol]).get(symbol) or {"tickSize":0.01, "lotStep":0.001, "minQty":0.001}
+
+    # get a mid from relay/public; if fail, best-effort fallback to avg later
+    mid = 0.0
+    try:
+        t = _bybit_proxy("/v5/market/instruments-info", {"category": CFG["category"], "symbol": symbol}, "GET")
+        # price info isn't in instruments; try tickers instead
+        t = _bybit_proxy("/v5/market/kline", {"category": CFG["category"], "symbol": symbol, "interval": "1", "limit": "2"}, "GET")
+        lst = ((t.get("result") or {}).get("list") or [])
+        if lst:
+            # use last close as mid-ish
+            mid = float(lst[-1][4])
+    except Exception:
+        pass
+
+    pos = {
+        "symbol": symbol,
+        "size": float(qty) if side.lower().startswith("b") else -float(qty),
+        "markPrice": mid or None,
+        "avgPrice": mid or None,
+    }
+
+    _ensure_for_position(pos, inst)
+
+# Backward-compatible aliases if other bots import different names
+def reconcile_for_symbol(**kwargs):
+    return reconcile_ladder_for_symbol(**kwargs)
+
+def reconcile(**kwargs):
+    return reconcile_ladder_for_symbol(**kwargs)
 
 # ---- main loop ----------------------------------------------------------------
 def _heartbeat():

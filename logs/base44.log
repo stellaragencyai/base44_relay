@@ -46,3 +46,18 @@
 {"ts":"2025-11-10T14:05:52.214+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
 {"ts":"2025-11-10T14:05:52.937+00:00","level":"WARNING","name":"bots.auto_executor","msg":"exposure check failed: mock: transient network","taskName":null,"comp":"executor"}
 {"ts":"2025-11-10T14:05:53.351+00:00","level":"WARNING","name":"tools.notifier_telegram","msg":"[tg] not configured (missing token or chat id)","taskName":null}
+{"ts":"2025-11-10T15:25:00.623+00:00","level":"INFO","name":"bots.outcome_watcher","msg":"Outcome watcher online: poll=5s lookback=900s own_enf=True","taskName":null,"comp":"outcome"}
+{"ts":"2025-11-10T15:25:00.635+00:00","level":"INFO","name":"bots.auto_executor","msg":"online • maker=True postOnly=True dry=True queue=C:\\Users\\nolan\\OneDrive\\Documents\\Desktop\\base44_relay\\signals\\observed.jsonl","taskName":null,"comp":"executor"}
+{"ts":"2025-11-10T15:25:00.677+00:00","level":"INFO","name":"bots.reconciler","msg":"online • interval=5s tag=B44 dry=False safe=True touch_manual=False","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T15:25:00.891+00:00","level":"WARNING","name":"bots.reconciler","msg":"reconcile_ladder entrypoint not found; ladder maintenance skipped.","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T15:25:05.892+00:00","level":"WARNING","name":"bots.reconciler","msg":"reconcile_ladder entrypoint not found; ladder maintenance skipped.","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T15:25:08.719+00:00","level":"WARNING","name":"bots.auto_executor","msg":"exposure check failed: mock: transient network","taskName":null,"comp":"executor"}
+{"ts":"2025-11-10T15:25:10.767+00:00","level":"WARNING","name":"bots.outcome_watcher","msg":"loop error: mock: transient network","taskName":null,"comp":"outcome"}
+{"ts":"2025-11-10T15:25:10.893+00:00","level":"WARNING","name":"bots.reconciler","msg":"reconcile_ladder entrypoint not found; ladder maintenance skipped.","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T15:25:15.894+00:00","level":"WARNING","name":"bots.reconciler","msg":"reconcile loop error: mock: transient network","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T15:25:16.946+00:00","level":"WARNING","name":"bots.auto_executor","msg":"exposure check failed: mock: transient network","taskName":null,"comp":"executor"}
+{"ts":"2025-11-10T15:25:25.896+00:00","level":"WARNING","name":"bots.reconciler","msg":"reconcile_ladder entrypoint not found; ladder maintenance skipped.","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T15:25:30.897+00:00","level":"WARNING","name":"bots.reconciler","msg":"reconcile_ladder entrypoint not found; ladder maintenance skipped.","taskName":null,"comp":"reconciler"}
+{"ts":"2025-11-10T15:25:30.967+00:00","level":"WARNING","name":"bots.tp_sl_manager","msg":"loop error: mock: transient network","taskName":null,"comp":"tpsl"}
+{"ts":"2025-11-10T15:25:33.452+00:00","level":"WARNING","name":"bots.auto_executor","msg":"exposure check failed: mock: transient network","taskName":null,"comp":"executor"}
+{"ts":"2025-11-10T15:25:46.391+00:00","level":"WARNING","name":"bots.reconciler","msg":"reconcile loop error: mock: transient network","taskName":null,"comp":"reconciler"}
