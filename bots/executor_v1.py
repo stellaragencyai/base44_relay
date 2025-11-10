@@ -6,14 +6,6 @@ Breaker-aware, ownership-tagged, risk-sized; keeps your Bayesian nudge, feature 
 DB hooks, corr gate, and spread checks. Plays nice with TP/SL Manager and Portfolio Guard.
 
 Signal source: signals/observed.jsonl (append-only)
-
-Highlights vs your previous version
-- Uses core.guard.guard_blocking_reason() as the primary breaker, falls back to core.breaker/file.
-- Ownership tag baked into orderLinkId (core.order_tag if available), Bybit-safe length (≤64).
-- Optional gross exposure cap (% of equity) to avoid over-levering during chaos.
-- Fixed maker-only default bug and a log format crash.
-- Safer env getters; unified booleans.
-- NEW: per-strategy risk buckets and per-symbol session windows (no news locks).
 """
 
 from __future__ import annotations
@@ -53,6 +45,14 @@ try:
 except Exception:
     def log_event(*_, **__):  # type: ignore
         pass
+
+# Optional Portfolio Guard risk pool (register opens/closes)
+_pg_ok = True
+try:
+    from core.portfolio_guard import guard as pg_guard  # type: ignore
+except Exception:
+    _pg_ok = False
+    pg_guard = None  # type: ignore
 
 # DB hooks (optional; fall back cleanly if Core/ vs core/ casing differs or DB not present)
 try:
@@ -188,7 +188,6 @@ except Exception as e:
 # ------------------------
 
 def _fallback_breaker_active_file() -> bool:
-    """File-based breaker fallback used if no guard and no legacy breaker."""
     path = STATE_DIR / "risk_state.json"
     try:
         if not path.exists():
@@ -199,21 +198,18 @@ def _fallback_breaker_active_file() -> bool:
         return False
 
 def breaker_active() -> Tuple[bool, str]:
-    # Preferred: core.guard
     if callable(guard_blocking_reason):
         try:
             blocked, why = guard_blocking_reason()  # type: ignore
             return bool(blocked), str(why or "")
         except Exception:
             pass
-    # Legacy breaker
     if callable(legacy_breaker_is_active):
         try:
             if bool(legacy_breaker_is_active()):
                 return True, "legacy_breaker"
         except Exception:
             pass
-    # File fallback
     return (_fallback_breaker_active_file(), "file_breaker")
 
 def _load_json(path: Path, default):
@@ -231,9 +227,6 @@ def _save_json(path: Path, obj) -> None:
         log.error("failed writing %s: %s", path.name, e)
 
 def _mk_link_id(symbol: str, ts_ms: int, signal: str, tag: str) -> str:
-    """
-    Build a deterministic short base and then attach full owner tag to stay <= 64 chars.
-    """
     base = f"{tag}-{symbol}-{int(ts_ms/1000)}-{signal}".replace(" ", "")[:24]
     return _attach_link_id(base, OWNER_TAG)
 
@@ -320,11 +313,10 @@ def _in_ranges(hhmm: str, ranges: List[str]) -> bool:
             hb, mb = map(int, b.split(":"))
             start = ha * 60 + ma
             end = hb * 60 + mb
-            # same-day or wrap past midnight
             if (start <= end and start <= cur <= end) or (start > end and (cur >= start or cur <= end)):
                 return True
     except Exception:
-        return True  # fail open rather than crash
+        return True
     return False
 
 def can_trade_now(sym: str, cls: str) -> bool:
@@ -345,7 +337,6 @@ def _qty_core(price: float, params: Dict) -> float:
     Then scale by per-class risk_pct if provided (default 0.003).
     """
     risk_pct = float(params.get("risk_pct") or 0.003)
-    # normalize EXEC_QTY_USDT vs default risk 0.003 so buckets scale up/down linearly
     base_qty_usd = max(0.0, EXEC_QTY_USDT * (risk_pct / 0.003))
 
     if EXEC_QTY_BASE > 0:
@@ -355,9 +346,8 @@ def _qty_core(price: float, params: Dict) -> float:
             px_delta = float(params["stop_dist"])
             remaining_risk_usd = None
             try:
-                from core.portfolio_guard import guard as pg_guard  # type: ignore
-                if hasattr(pg_guard, "current_risk_value"):
-                    remaining_risk_usd = float(pg_guard.current_risk_value())  # type: ignore
+                if _pg_ok and hasattr(pg_guard, "current_risk_value"):
+                    remaining_risk_usd = float(pg_guard.current_risk_value())
             except Exception:
                 pass
             qty = risk_capped_qty(
@@ -394,10 +384,6 @@ def _save_seen(seen: Dict[str, int]) -> None:
     _save_json(SEEN_FILE, seen)
 
 def _tail_queue(path: Path, start_pos: int) -> Tuple[int, List[str]]:
-    """
-    Read new lines from 'path' starting at byte offset start_pos.
-    Handles truncation (e.g., log rotated) by resetting to 0 if needed.
-    """
     if not path.exists():
         return start_pos, []
     size = path.stat().st_size
@@ -428,7 +414,6 @@ def _load_regime_snapshot() -> Dict:
 def _record_order_state(link_id: str, symbol: str, side: str, qty_val: float, px: Optional[float],
                         state: str, exchange_id: Optional[str] = None,
                         err_code: Optional[str] = None, err_msg: Optional[str] = None) -> None:
-    """Write order state to DB if DB module is available; otherwise no-op."""
     if insert_order is None or set_order_state is None:
         return
     try:
@@ -453,11 +438,6 @@ def _record_execution(link_id: str, qty_val: float, px: float, fee: float = 0.0)
 
 def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint: Optional[float],
                  features: Dict) -> Tuple[bool, str]:
-    """
-    Place a maker-first limit at book edge (PostOnly) when maker_only, else Market (IOC).
-    Enforces spread ceiling (bps). Respects DRY mode.
-    Records states to DB (NEW → SENT → ACKED; FILLED simulated in dry-run).
-    """
     bid, ask, mid = _fetch_best_prices(symbol)
     if bid is None or ask is None:
         return False, "no orderbook"
@@ -469,7 +449,6 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
 
     maker_only = bool(params.get("maker_only", MAKER_ONLY))
 
-    # Choose price: if hint provided and maker_only, bias to rest
     if maker_only:
         px = bid if side == "Buy" else ask
         if isinstance(price_hint, (int, float)) and price_hint > 0:
@@ -480,7 +459,6 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
     else:
         px = None  # market
 
-    # Base qty then Bayesian nudge
     base_qty = _qty_core(price=px or mid, params=params)
     prior_p  = float(features.get("prior_win_p", PRIOR_WIN_P))
     edge_p   = float(features.get("edge_prob", EVIDENCE_WIN_P_FALLB))
@@ -489,41 +467,53 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
     qty_txt = _format_qty(qty_val)
     tif = "PostOnly" if (EXEC_POST_ONLY and maker_only and px is not None) else ("ImmediateOrCancel" if px is None else "GoodTillCancel")
 
-    # DB: NEW
     _record_order_state(link_id, symbol, side, qty_val, px, state="NEW")
+
+    # initial risk in USD if stop_dist present
+    initial_risk_usd = None
+    try:
+        if params.get("stop_dist"):
+            initial_risk_usd = max(0.0, float(qty_val) * float(params["stop_dist"]))
+    except Exception:
+        initial_risk_usd = None
 
     if EXEC_DRY_RUN:
         msg = f"🟡 DRY • {symbol} • {side} qty≈{qty_txt} @ {px if px is not None else 'MKT'} • spr {spr_bps:.2f}bps • tif={tif} • link={link_id}"
         tg_send(msg, priority="info")
         log_event("executor", "entry_dry", symbol, EXEC_ACCOUNT_UID or "MAIN",
                   {"side": side, "qty": qty_txt, "px": px, "spr_bps": spr_bps, "tif": tif, "link": link_id, "features": features})
-        # Simulate filled for analytics continuity
+
+        # Risk pool integration: open+immediate close in DRY so pool isn’t pinned
+        try:
+            if _pg_ok and initial_risk_usd and hasattr(pg_guard, "register_open") and hasattr(pg_guard, "register_close"):
+                pg_guard.register_open(trade_id=link_id, symbol=symbol, initial_risk_usd=float(initial_risk_usd))
+                pg_guard.register_close(trade_id=link_id, realized_pnl_usd=0.0, released_risk_usd=float(initial_risk_usd))
+        except Exception:
+            pass
+
         _record_order_state(link_id, symbol, side, qty_val, px, state="FILLED", exchange_id="DRY-RUN")
         _record_execution(link_id, qty_val, float(px or mid), fee=0.0)
         return True, "dry-run"
 
-    # Build request
     req = dict(
         category="linear",
         symbol=symbol,
-        side=side,  # Buy|Sell
+        side=side,
         orderType=("Limit" if px is not None else "Market"),
         qty=str(qty_txt),
         reduceOnly=False,
         timeInForce=("PostOnly" if px is not None and EXEC_POST_ONLY and maker_only else ("IOC" if px is None else "GoodTillCancel")),
-        orderLinkId=link_id,  # includes full owner/session tail
-        tpslMode=None,        # exits handled by TP/SL manager
+        orderLinkId=link_id,
+        tpslMode=None,
     )
     if px is not None:
         req["price"] = f"{px}"
 
-    # Attempt placement
     ok, data, err = by.place_order(**req)
     if not ok:
         _record_order_state(link_id, symbol, side, qty_val, px, state="REJECTED", err_code="bybit_err", err_msg=str(err or "place_order failed"))
         return False, (err or "place_order failed")
 
-    # Parse exchange response
     try:
         result = (data.get("result") or {})
         exch_id = result.get("orderId") or result.get("order_id")
@@ -532,6 +522,14 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
 
     _record_order_state(link_id, symbol, side, qty_val, px, state="SENT", exchange_id=exch_id)
     _record_order_state(link_id, symbol, side, qty_val, px, state="ACKED", exchange_id=exch_id)
+
+    # Risk pool integration: register the initial risk once order is acknowledged
+    try:
+        if _pg_ok and initial_risk_usd and hasattr(pg_guard, "register_open"):
+            pg_guard.register_open(trade_id=link_id, symbol=symbol, initial_risk_usd=float(initial_risk_usd))
+    except Exception:
+        pass
+
     return True, "ok"
 
 # ------------------------
@@ -553,14 +551,12 @@ def main() -> None:
             new_pos, lines = _tail_queue(QUEUE_PATH, pos)
             if not lines:
                 time.sleep(max(1, EXEC_POLL_SEC))
-                # heal truncation
                 if new_pos < pos:
                     pos = new_pos
                     _write_offset(pos)
                 continue
 
             for raw in lines:
-                # parse
                 try:
                     obj = json.loads(raw)
                 except Exception:
@@ -581,56 +577,41 @@ def main() -> None:
                     except Exception:
                         hint_px = None
 
-                # optional allowlist
                 if EXEC_SYMBOLS and symbol not in EXEC_SYMBOLS:
-                    log.debug("skip %s (not in EXEC_SYMBOLS)", symbol)
                     continue
 
-                # staleness filter
                 if ts_ms and EXEC_MAX_SIGNAL_AGE:
                     if now_ms - ts_ms > EXEC_MAX_SIGNAL_AGE * 1000:
                         log.info("stale signal %s dropped (age=%ds)", symbol, int((now_ms - ts_ms)/1000))
                         continue
 
-                # regime snapshot (best-effort)
                 regime = _load_regime_snapshot()
                 if regime:
                     for k in ("realized_vol_bps","trend_slope","vol_z"):
                         if k in regime:
                             features.setdefault(k, regime[k])
 
-                # trade class
                 features["class"] = features.get("class") or classify_trade(features)
-
-                # optional prior/evidence for Bayesian sizing
                 features.setdefault("prior_win_p", PRIOR_WIN_P)
                 features.setdefault("edge_prob",   EVIDENCE_WIN_P_FALLB)
 
-                # cross-symbol correlation gate
                 if not corr_allow(symbol):
-                    msg = f"⏸️ Corr gate block • {symbol}"
-                    tg_send(msg, priority="warn")
+                    tg_send(f"⏸️ Corr gate block • {symbol}", priority="warn")
                     log_event("executor", "block_corr", symbol, EXEC_ACCOUNT_UID or "MAIN", {"features": features})
                     continue
 
-                # override tag if provided, but still attach full owner tag
                 tag = str(params.get("tag", TAG) or "B44").strip() or "B44"
                 link_id = _mk_link_id(symbol, ts_ms or now_ms, ("LONG" if "LONG" in signal else "SHORT"), tag)
 
-                # de-dupe
                 if link_id in seen:
-                    log.debug("dup %s (already seen)", link_id)
                     continue
 
-                # breaker gate
                 blocked, why = breaker_active()
                 if blocked:
-                    msg = f"⛔ Breaker ON • {why or 'guard'} • skip {symbol} {signal}"
-                    tg_send(msg, priority="warn")
+                    tg_send(f"⛔ Breaker ON • {why or 'guard'} • skip {symbol} {signal}", priority="warn")
                     log_event("executor", "block_breaker", symbol, EXEC_ACCOUNT_UID or "MAIN", {"signal": signal, "reason": why})
                     continue
 
-                # exposure gate
                 try:
                     eq = _wallet_equity()
                     gross = _gross_exposure_usdt()
@@ -641,17 +622,14 @@ def main() -> None:
                 except Exception as e:
                     log.warning("exposure check failed: %s", e)
 
-                # session window gate (new)
                 cls = features.get("class") or "default"
                 if not can_trade_now(symbol, cls):
                     tg_send(f"⏸️ Session closed • {symbol} • {cls}", priority="warn")
                     log_event("executor", "block_session", symbol, EXEC_ACCOUNT_UID or "MAIN", {"class": cls})
                     continue
 
-                # per-class risk bucket (new)
                 params["risk_pct"] = _risk_pct_for_class(cls)
 
-                # Log features before placing
                 try:
                     log_features(link_id, symbol, EXEC_ACCOUNT_UID or "MAIN", dict(features))
                 except Exception as e:
@@ -672,7 +650,6 @@ def main() -> None:
                     log_event("executor", "entry_fail", symbol, EXEC_ACCOUNT_UID or "MAIN", {"side": side, "error": msg})
                     log.warning("entry fail %s %s: %s", symbol, side, msg)
 
-            # commit offset after processing batch
             pos = new_pos
             _write_offset(pos)
 
