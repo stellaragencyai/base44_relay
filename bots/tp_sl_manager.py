@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 — TP/SL Manager (v2.1)
-Equal-R ladder, adopt-once grace, breaker-aware, ownership-aware, decision-logged.
-
-What this does (fast version)
-- Keeps a single protective SL (position trading-stop) and a 5-rung reduce-only TP ladder.
-- Equal-R ladder: targets at R_START, R_START+R_STEP, ... from entry vs stop.
-- Adopts foreign rungs during warmup/adopt window; manages only “ours” after.
-- Breaker ON: enforce reduce-only, cancel entry-type orders, keep SL; pause new TP placement.
-- Emits structured events to decision_log.
-- Maker-first shading so PostOnly rests; falls back only if you remove POST_ONLY yourself.
+Base44 — TP/SL Manager (v2.2, Phase-4 hardened)
+Equal-R ladder, adopt-once grace, breaker-aware, ownership-aware, decision-logged,
+and now with:
+- strict reduce-only enforcement for exits
+- breaker override path to market-flatten owned positions
+- cancel entry-type orders when breaker is ON
+- optional DB hooks for best-effort order logging
 
 Key settings (env or core.settings)
   TPSL_ENABLED=true
@@ -69,6 +66,14 @@ try:
 except Exception:
     def log_event(*_, **__):  # type: ignore
         pass
+
+# Optional DB hooks (best-effort; safe if absent)
+try:
+    from core import db as _db
+    _DB_OK = True
+except Exception:
+    _DB_OK = False
+    _db = None  # type: ignore
 
 # ---------- logging ----------
 log = bind_context(get_logger("bots.tp_sl_manager"), comp="tpsl")
@@ -415,7 +420,7 @@ def place_limit_reduce(symbol: str, side: str, price: Decimal, qty: Decimal, tic
     ptxt = f"{px.normalize()}"
 
     if TP_DRY_RUN:
-        tg_send(f"🧪 DRY_RUN: {side} {symbol} qty={qtxt} @ {ptxt}")
+        tg_send(f"🧪 DRY_RUN: {side} {symbol} qty={qtxt} @ {ptxt} • ro")
         log_event("tpsl", "tp_place_dry", symbol, "MAIN", {"side": side, "qty": float(qty), "px": float(px)})
         return None
 
@@ -427,7 +432,7 @@ def place_limit_reduce(symbol: str, side: str, price: Decimal, qty: Decimal, tic
         qty=qtxt,
         price=ptxt,
         timeInForce="PostOnly" if POST_ONLY else "GoodTillCancel",
-        reduceOnly=True,
+        reduceOnly=True,  # hard lock: exits only
         orderLinkId=make_link("tp"),
     )
     if not ok:
@@ -436,6 +441,12 @@ def place_limit_reduce(symbol: str, side: str, price: Decimal, qty: Decimal, tic
         return None
     oid = (data.get("result") or {}).get("orderId")
     log_event("tpsl", "tp_place_ok", symbol, "MAIN", {"orderId": oid, "qty": float(qty), "px": float(px)})
+    # best-effort DB echo
+    if _DB_OK and oid:
+        try:
+            _db.insert_order(oid, symbol, side, float(qty), float(px), TP_TAG, state="NEW")
+        except Exception:
+            pass
     return oid
 
 def cancel_order(symbol: str, order_id: str, link_id: Optional[str]) -> None:
@@ -499,8 +510,9 @@ def build_equal_r_targets(entry: Decimal, stop: Decimal, side_word: str, tick: D
         targets.append(round_to_tick(raw_px, tick))
     return targets
 
-# ---------- breaker behavior ----------
+# ---------- breaker behaviors ----------
 def enforce_reduce_only_and_cancel_entries(symbol: str) -> None:
+    """When breaker is ON, force all open orders to be reduce-only and cancel any entry-type orders."""
     try:
         orders = list_all_open_orders(symbol)
     except Exception as e:
@@ -541,7 +553,76 @@ def enforce_reduce_only_and_cancel_entries(symbol: str) -> None:
         except Exception as e:
             log.warning("breaker RO enforcement err %s: %s", symbol, e)
 
+def _flatten_all_if_breaker() -> None:
+    """If breaker is ON, market-flatten owned positions with reduce-only IOC."""
+    active, why = guard_blocking_reason()
+    if not active:
+        return
+    tg_send(f"🧯 Breaker ON • flattening positions • {why}")
+    log_event("tpsl", "breaker_flatten_begin", "", "MAIN", {"reason": str(why)})
+
+    ok, data, err = by.get_positions(category="linear")
+    if not ok:
+        log.warning("positions fail during breaker: %s", err)
+        return
+    rows = (data.get("result") or {}).get("list") or []
+    for p in rows:
+        try:
+            symbol = (p.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            size = Decimal(str(p.get("size") or "0"))
+            if size == 0:
+                continue
+            if OWNERSHIP_ENFORCED and not _position_owned(symbol, p):
+                continue
+
+            # choose close side and qty
+            side_word = _side_word_from_row(p)
+            mkt_side = side_to_close(side_word) if side_word in ("long","short") else ("Sell" if size > 0 else "Buy")
+            qty = abs(size)
+            qtxt = f"{qty.normalize()}"
+
+            if TP_DRY_RUN:
+                tg_send(f"🧯 DRY_RUN FLAT • {symbol} {mkt_side} qty={qtxt}")
+                log_event("tpsl", "breaker_flatten_dry", symbol, "MAIN", {"qty": float(qty), "side": mkt_side})
+                continue
+
+            ok2, data2, err2 = by.place_order(
+                category="linear",
+                symbol=symbol,
+                side=mkt_side,
+                orderType="Market",
+                qty=qtxt,
+                reduceOnly=True,
+                timeInForce="IOC",
+                orderLinkId=make_link("mx"),
+            )
+            if not ok2:
+                log.warning("breaker flatten fail %s: %s", symbol, err2)
+                log_event("tpsl", "breaker_flatten_fail", symbol, "MAIN", {"err": str(err2)}, level="error")
+            else:
+                tg_send(f"🧯 FLAT • {symbol} {mkt_side} qty={qtxt}")
+                log_event("tpsl", "breaker_flatten_ok", symbol, "MAIN", {"qty": float(qty), "side": mkt_side})
+        except Exception as e:
+            log.warning("flatten error: %s", e)
+
 # ---------- core sync ----------
+def _side_word_from_row(p: dict) -> Optional[str]:
+    try:
+        side_raw = (p.get("side") or "").lower()
+        if side_raw.startswith("b"): return "long"
+        if side_raw.startswith("s"): return "short"
+    except Exception:
+        pass
+    try:
+        sz = Decimal(p.get("size") or "0")
+        if sz > 0:  return "long"
+        if sz < 0:  return "short"
+    except Exception:
+        pass
+    return None
+
 def place_or_sync_ladder(symbol: str, side_word: str, entry: Decimal, qty: Decimal, pos_idx: int) -> None:
     filters = get_symbol_filters(symbol)
     tick, step, minq = filters.tick, filters.step, filters.min_qty
@@ -634,22 +715,10 @@ def place_or_sync_ladder(symbol: str, side_word: str, entry: Decimal, qty: Decim
                "rungs": RUNGS, "maker": POST_ONLY})
 
 # ---------- sweep loop ----------
-def _side_word_from_row(p: dict) -> Optional[str]:
-    try:
-        side_raw = (p.get("side") or "").lower()
-        if side_raw.startswith("b"): return "long"
-        if side_raw.startswith("s"): return "short"
-    except Exception:
-        pass
-    try:
-        sz = Decimal(p.get("size") or "0")
-        if sz > 0:  return "long"
-        if sz < 0:  return "short"
-    except Exception:
-        pass
-    return None
-
 def sweep_once() -> None:
+    # Breaker may demand immediate flatten before any other work.
+    _flatten_all_if_breaker()
+
     ok, data, err = by.get_positions(category="linear")
     if not ok:
         log.warning("positions err: %s", err)
