@@ -392,6 +392,44 @@ class Bybit:
 
         body = _with_extra(body, extra)
         return self._request_private_json("/v5/order/create", body=body, method="POST")
+    
+    def amend_order(
+        self,
+        category: str,
+        symbol: str,
+        orderId: Optional[str] = None,
+        orderLinkId: Optional[str] = None,
+        price: Optional[str] = None,
+        qty: Optional[str] = None,
+        triggerPrice: Optional[str] = None,
+        takeProfit: Optional[str] = None,
+        stopLoss: Optional[str] = None,
+        reduceOnly: Optional[bool] = None,
+        **extra,   # may include memberId or subUid
+    ) -> Tuple[bool, Dict[str, Any], str]:
+        """
+        /v5/order/amend — supports price/qty/TP/SL/RO tweaks.
+        Only send fields you intend to change; Bybit rejects null junk.
+        """
+        body: Dict[str, Any] = {"category": category, "symbol": symbol}
+        if orderId:
+            body["orderId"] = orderId
+        if orderLinkId:
+            body["orderLinkId"] = orderLinkId
+        if price is not None:
+            body["price"] = price
+        if qty is not None:
+            body["qty"] = qty
+        if triggerPrice is not None:
+            body["triggerPrice"] = triggerPrice
+        if takeProfit is not None:
+            body["takeProfit"] = takeProfit
+        if stopLoss is not None:
+            body["stopLoss"] = stopLoss
+        if reduceOnly is not None:
+            body["reduceOnly"] = bool(reduceOnly)
+        body = _with_extra(body, extra)
+        return self._request_private_json("/v5/order/amend", body=body, method="POST")
 
     def cancel_order(
         self,
