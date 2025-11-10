@@ -1,74 +1,101 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-core/outcome_bus.py — append-only outcomes feed for online learning
+core.outcome_bus — single-writer outcome emitter with fan-out hooks.
 
-File layout:
-  logs/outcomes/outcomes.jsonl  (one JSON per outcome)
+Responsibilities
+- Append each outcome as a JSON line to state/outcomes.jsonl (durable log).
+- Best-effort notify via Telegram (compact).
+- Wake the online learner (local function call) to update priors immediately.
+- Expose a no-throw API: emit_outcome(...).
 
-Schema (per line):
-  {
-    "ts": 1731020400123,         # ms
-    "link": "B44-BTC-...|sub:strat:session",
-    "symbol": "BTCUSDT",
-    "setup_tag": "TrendPullback_5m",
-    "pnl_r": 0.85,               # realized R multiple (neg for loss)
-    "won": true,                 # convenience flag
-    "features": {...}            # optional: snapshot of pretrade features
-  }
+Outcome schema (keys):
+  link_id (str), symbol (str), setup_tag (str), pnl_r (float), won (bool),
+  features (dict), ts_ms (int)
 
-Public helpers:
-  emit_outcome(link_id, symbol, setup_tag, pnl_r, won, features=None)
-  tail_outcomes(start_pos) -> (new_pos, [dict,...])
+Env / settings (optional):
+  OUTCOME_PATH=state/outcomes.jsonl
+  OUTCOME_NOTIFY=true|false
+  OUTCOME_TG_SUB_UID=<route to specific subaccount bot>
 """
 
 from __future__ import annotations
-import os, json, time
+import os, json, time, threading
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, Optional
 
-ROOT = Path(os.getenv("B44_ROOT", Path(__file__).resolve().parents[1]))
-OUT_DIR = ROOT / "logs" / "outcomes"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+# settings optional
+try:
+    from core.config import settings
+except Exception:
+    class _S: ROOT = Path(os.getcwd())
+    settings = _S()  # type: ignore
 
-BUS_PATH = OUT_DIR / "outcomes.jsonl"
+# notifier optional; do not crash
+try:
+    from core.notifier_bot import tg_send
+except Exception:
+    def tg_send(*_a, **_k):  # type: ignore
+        pass
 
-def emit_outcome(link_id: str,
+# inline learner hook (best-effort)
+try:
+    from learn.online_learner import update_from_outcome  # type: ignore
+except Exception:
+    def update_from_outcome(*_a, **_k):  # type: ignore
+        pass
+
+ROOT = getattr(settings, "ROOT", Path(os.getcwd()))
+STATE_DIR = ROOT / "state"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+OUTCOME_PATH = Path(os.getenv("OUTCOME_PATH", STATE_DIR / "outcomes.jsonl"))
+OUTCOME_NOTIFY = (str(os.getenv("OUTCOME_NOTIFY", "true")).lower() in ("1","true","yes","on"))
+OUTCOME_TG_SUB_UID = os.getenv("OUTCOME_TG_SUB_UID") or None
+
+_lock = threading.RLock()
+
+def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    with _lock:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+def emit_outcome(*,
+                 link_id: str,
                  symbol: str,
                  setup_tag: str,
                  pnl_r: float,
                  won: bool,
-                 features: Dict[str, Any] | None = None) -> None:
-    row = {
-        "ts": int(time.time()*1000),
-        "link": str(link_id),
-        "symbol": str(symbol).upper(),
-        "setup_tag": str(setup_tag or "Unclassified"),
+                 features: Optional[Dict[str, Any]] = None) -> None:
+    """Durably emit an outcome and nudge the learner. Never raises upstream."""
+    ts_ms = int(time.time() * 1000)
+    obj = {
+        "ts_ms": ts_ms,
+        "link_id": str(link_id or ""),
+        "symbol": str(symbol or "").upper(),
+        "setup_tag": str(setup_tag or "Unknown"),
         "pnl_r": float(pnl_r),
         "won": bool(won),
         "features": dict(features or {}),
     }
     try:
-        with open(BUS_PATH, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        _append_jsonl(OUTCOME_PATH, obj)
     except Exception:
         pass
 
-def tail_outcomes(start_pos: int = 0) -> Tuple[int, List[Dict[str, Any]]]:
-    if not BUS_PATH.exists():
-        return start_pos, []
-    size = BUS_PATH.stat().st_size
-    pos = start_pos if 0 <= start_pos <= size else 0
-    out: List[Dict[str, Any]] = []
-    with open(BUS_PATH, "r", encoding="utf-8") as fh:
-        fh.seek(pos, 0)
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                continue
-        new_pos = fh.tell()
-    return new_pos, out
+    # Nudge learner (best-effort)
+    try:
+        update_from_outcome(obj)
+    except Exception:
+        pass
+
+    # Optional compact notify
+    if OUTCOME_NOTIFY:
+        try:
+            emoji = "🟢" if won else "🔴"
+            short = f"{emoji} OUTCOME • {obj['symbol']} • {obj['setup_tag']} • R={pnl_r:+.2f}"
+            tg_send(short, priority=("success" if won else "warn"), sub_uid=OUTCOME_TG_SUB_UID)
+        except Exception:
+            pass
