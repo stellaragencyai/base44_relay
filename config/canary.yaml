@@ -1,0 +1,51 @@
+# Phase-4 Canary Execution Policy
+enabled: true
+mode: "canary"           # can be: canary | shadow | off
+shadow_emit_telemetry: true
+
+# Time windows (UTC) for live execution; outside these, shadow-only
+live_windows:
+  - { days: [1,2,3,4,5], start: "14:00", end: "22:00" }   # Mon–Fri 14:00–22:00 UTC
+  - { days: [6],         start: "16:00", end: "20:00" }   # Sat window
+  - { days: [0],         start: "16:00", end: "20:00" }   # Sun window
+
+# Canary throttle (percent of normal size)
+size_factor: 0.25        # take 25% of calculated qty during canary
+
+# Hard caps
+max_concurrent_initial_risk_pct: 6.0
+max_symbol_concentration_pct: 50.0
+max_daily_attempts: 20
+cooldown_minutes_on_loss: 12
+
+# Whitelist/blacklist
+symbol_whitelist: ["BTCUSDT","ETHUSDT","ADAUSDT","HBARUSDT","PUMPFUNUSDT","FARTCOINUSDT"]
+symbol_blacklist: []
+
+# Regime gates (must all pass)
+min_adx_bias: 16.0
+min_atr_pct_intraday: 0.35
+min_vol_zscore: -0.5       # allow mildly negative, block illiquid sludge
+
+# Correlation guard (block sibling entries if corr > threshold within lookback)
+corr:
+  enabled: true
+  lookback_min: 1800       # seconds
+  threshold: 0.75
+
+# Breaker integration
+breaker_required_clear: true
+
+# News lockout intentionally disabled in Phase 4 per current plan
+news_lockout:
+  enabled: false
+
+# Per-subaccount canary rollout
+accounts:
+  "260417078": { mode: "canary", size_factor: 0.20, max_daily_attempts: 10 }   # Sniper42
+  "152304954": { mode: "shadow" }                                              # AJ Account
+  "302355261": { mode: "canary" }
+  "65986659":  { mode: "shadow" }
+  "65986592":  { mode: "canary" }
+  "152499802": { mode: "shadow" }
+  "SUB7":      { mode: "canary", size_factor: 0.15 }                           # Canary lane
