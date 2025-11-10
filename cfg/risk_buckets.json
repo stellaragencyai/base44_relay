@@ -1,0 +1,8 @@
+{
+  "default_risk_pct": 0.003,
+  "by_class": {
+    "breakout": 0.004,
+    "pullback": 0.003,
+    "mean_revert": 0.002
+  }
+}

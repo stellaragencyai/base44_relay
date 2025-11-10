@@ -13,13 +13,11 @@ $VenvPy = Join-Path $BaseDir ".venv\Scripts\python.exe"
 $Logs   = Join-Path $BaseDir "logs"
 New-Item -ItemType Directory -Force -Path $Logs | Out-Null
 
-# Sanity
 if (-not (Test-Path $VenvPy)) {
   Write-Error "Venv python not found: $VenvPy"
   exit 1
 }
 
-# Ensure child pythons flush logs
 $env:PYTHONUNBUFFERED = "1"
 
 function Add-LogHeader {
@@ -27,12 +25,11 @@ function Add-LogHeader {
   "==== $(Get-Date -Format s) START ====" | Add-Content -Path $File
 }
 
-# Helper: persistent tab that restarts the target on exit and tees to a log
 function New-TabWatch {
   param(
-    [Parameter(Mandatory)] [string]$Title,     # window title
-    [Parameter(Mandatory)] [string]$Cmd,       # e.g. "-m bots.executor_v1"
-    [Parameter(Mandatory)] [string]$LogFile    # full path to log
+    [Parameter(Mandatory)] [string]$Title,
+    [Parameter(Mandatory)] [string]$Cmd,       # e.g. "-m bots.auto_executor"
+    [Parameter(Mandatory)] [string]$LogFile
   )
   Add-LogHeader -File $LogFile
   $escapedLog = $LogFile.Replace("'", "''")
@@ -65,7 +62,6 @@ while (`$true) {
   Start-Process powershell -ArgumentList @("-NoExit","-NoLogo","-Command", $psCmd) -WindowStyle Normal | Out-Null
 }
 
-# Helper: one-shot tab (no restart), still logs
 function New-TabOnce {
   param(
     [Parameter(Mandatory)] [string]$Title,
@@ -83,13 +79,23 @@ Write-Host ("== {0} @ {1} ==" -f "$Title", (Get-Date -Format o)) -ForegroundColo
   Start-Process powershell -ArgumentList @("-NoExit","-NoLogo","-Command", $psCmd) -WindowStyle Normal | Out-Null
 }
 
-# Decide which executor module we’re using
-$ExecutorModule = if (Test-Path (Join-Path $BaseDir "bots\executor_v1.py")) { "-m bots.executor_v1" } else { "-m bots.trade_executor" }
+# --- presence checks for modules (so we don't pretend) ---
+function Test-ModuleFile($RelPath) { Test-Path (Join-Path $BaseDir $RelPath) }
 
-# 1) Relay (Flask) — persistent
-New-TabWatch -Title "relay" -Cmd "-m relay.base44_relay" -LogFile (Join-Path $Logs "relay.log")
+$HasRelay          = (Test-ModuleFile "relay\base44_relay.py")
+$HasPortfolioGuard = (Test-ModuleFile "core\portfolio_guard.py") -or (Test-ModuleFile "bots\portfolio_guard.py")
+$HasTpSl           = (Test-ModuleFile "bots\tp_sl_manager.py")
+$HasExecutor       = (Test-ModuleFile "bots\auto_executor.py")
+$HasWatchdog       = (Test-ModuleFile "ops\watchdog.py")
 
-# 2) ngrok (optional, no restart loop)
+# 1) Relay (optional)
+if ($HasRelay) {
+  New-TabWatch -Title "relay" -Cmd "-m relay.base44_relay" -LogFile (Join-Path $Logs "relay.log")
+} else {
+  Write-Host "relay/base44_relay.py not found; skipping relay." -ForegroundColor DarkYellow
+}
+
+# 2) ngrok (optional)
 if (-not $SkipNgrok -and (Get-Command ngrok -ErrorAction SilentlyContinue)) {
   $ngrokLog = Join-Path $Logs "ngrok.log"
   Add-LogHeader -File $ngrokLog
@@ -104,16 +110,34 @@ ngrok http http://127.0.0.1:5000 *>&1 | Tee-Object -FilePath "$ngrokLog" -Append
 # 3) Notifier heartbeat (one-shot)
 New-TabOnce -Title "notifier" -Cmd "-m core.notifier_bot --ping session_boot" -LogFile (Join-Path $Logs "notifier.log")
 
-# 4) Risk Daemon (persistent)
-New-TabWatch -Title "risk_daemon" -Cmd "-m core.risk_daemon" -LogFile (Join-Path $Logs "risk_daemon.log")
+# 4) Portfolio Guard (only if you actually run it as a loop/daemon)
+if ($HasPortfolioGuard -and (Test-ModuleFile "bots\portfolio_guard.py")) {
+  New-TabWatch -Title "portfolio_guard" -Cmd "-m bots.portfolio_guard" -LogFile (Join-Path $Logs "portfolio_guard.log")
+} elseif ($HasPortfolioGuard) {
+  Write-Host "core/portfolio_guard.py present but isn't a loop daemon. Skipping tab (it’s a library in your stack)." -ForegroundColor DarkYellow
+} else {
+  Write-Host "portfolio_guard not found; skipping." -ForegroundColor DarkYellow
+}
 
-# 5) TP/SL Manager (persistent)
-New-TabWatch -Title "tp_sl_manager" -Cmd "-m bots.tp_sl_manager" -LogFile (Join-Path $Logs "tpsl.log")
+# 5) TP/SL Manager
+if ($HasTpSl) {
+  New-TabWatch -Title "tp_sl_manager" -Cmd "-m bots.tp_sl_manager" -LogFile (Join-Path $Logs "tpsl.log")
+} else {
+  Write-Host "bots/tp_sl_manager.py not found; skipping." -ForegroundColor DarkYellow
+}
 
-# 6) Trade Executor (persistent) — v1 if present
-New-TabWatch -Title "executor" -Cmd $ExecutorModule -LogFile (Join-Path $Logs "executor.log")
+# 6) Auto Executor
+if ($HasExecutor) {
+  New-TabWatch -Title "executor" -Cmd "-m bots.auto_executor" -LogFile (Join-Path $Logs "executor.log")
+} else {
+  Write-Host "bots/auto_executor.py not found; skipping." -ForegroundColor DarkYellow
+}
 
-# 7) PnL snapshot (one-shot)
-New-TabOnce -Title "pnl_snapshot" -Cmd "-m bots.pnl_daily --snapshot" -LogFile (Join-Path $Logs "pnl_snapshot.log")
+# 7) Watchdog (recommended)
+if ($HasWatchdog) {
+  New-TabWatch -Title "watchdog" -Cmd "-m ops.watchdog" -LogFile (Join-Path $Logs "watchdog.log")
+} else {
+  Write-Host "ops/watchdog.py not found; skipping watchdog." -ForegroundColor DarkYellow
+}
 
-Write-Host "Launched. Windows per service; logs in $Logs"
+Write-Host "Launched. One window per service; logs in $Logs" -ForegroundColor Green
