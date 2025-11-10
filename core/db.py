@@ -3,25 +3,20 @@
 """
 Base44 — Core DB (SQLite)
 
-Now with:
-- orders / executions (as before)
-- positions (latest snapshot per sub_uid+symbol)
-- guard_state (daily session anchors, running PnL, breaker mirror)
+Tables:
+- orders       (client order lifecycle)
+- executions   (fills tied to orders)
+- positions    (latest snapshot per sub_uid+symbol)
+- guard_state  (daily/session anchors, PnL, breaker mirror, attempt/cooldown)
 
-<<<<<<< HEAD
-API used by bots:
+Public API:
 - migrate()
-- insert_order(), set_order_state(), insert_execution()
+- insert_order(), set_order_state(), insert_execution(), list_orders(), get_open_orders(), counts()
 - upsert_position(), get_positions()
-- get_open_orders()
-- guard_load(), guard_update_pnl(delta_usd), guard_reset_day()
-=======
-Public API used by bots:
-- insert_order, set_order_state, insert_execution, list_orders, counts
-- upsert_position, get_positions
 - guard_load(), guard_update_pnl(delta_usd), guard_reset_day(start_equity_usd=0.0)
 - guard_set_breaker(active: bool, reason: str="")
->>>>>>> 60f2a78 (Auto-sync: file changes)
+- guard_update_attempts(delta:int=1)
+- guard_mark_loss(now_ts:int|None=None)
 
 All timestamps are epoch milliseconds. File path defaults to state/base44.db
 unless settings.DB_PATH is set.
@@ -31,11 +26,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from pathlib import Path
-<<<<<<< HEAD
-from typing import Optional, Dict, List, Any
-=======
 from typing import Optional, Any, Dict, List
->>>>>>> 60f2a78 (Auto-sync: file changes)
 
 # Settings import with tolerant casing
 try:
@@ -115,28 +106,23 @@ CREATE TABLE IF NOT EXISTS positions (
 );
 """
 
-<<<<<<< HEAD
-# Guard table had a missing 'updated_ts' in older drafts; we add it idempotently.
-SCHEMA_GUARD = """
-CREATE TABLE IF NOT EXISTS guard_state (
-  id                INTEGER PRIMARY KEY CHECK (id = 1),
-  session_start_ms  INTEGER NOT NULL,
-  start_equity_usd  REAL NOT NULL DEFAULT 0.0,
-  realized_pnl_usd  REAL NOT NULL DEFAULT 0.0,
-  breach            INTEGER NOT NULL DEFAULT 0
-=======
-# Note: legacy column "breach" retained for backward compat; new mirror uses breaker_on/breaker_reason.
+# guard_state:
+# - breach: legacy 0/1 flag
+# - breaker_on/reason: current breaker mirror
+# - attempts: count of signals pursued (live or shadow)
+# - last_loss_ts: epoch seconds of last negative realized PnL
 SCHEMA_GUARD = """
 CREATE TABLE IF NOT EXISTS guard_state (
   id               INTEGER PRIMARY KEY CHECK (id = 1),
   session_start_ms INTEGER NOT NULL,
   start_equity_usd REAL NOT NULL DEFAULT 0.0,
   realized_pnl_usd REAL NOT NULL DEFAULT 0.0,
-  breach           INTEGER NOT NULL DEFAULT 0,       -- legacy 0/1
-  breaker_on       INTEGER NOT NULL DEFAULT 0,       -- 0/1 current mirror
+  breach           INTEGER NOT NULL DEFAULT 0,
+  breaker_on       INTEGER NOT NULL DEFAULT 0,
   breaker_reason   TEXT DEFAULT '',
+  attempts         INTEGER NOT NULL DEFAULT 0,
+  last_loss_ts     INTEGER NOT NULL DEFAULT 0,
   updated_ts       INTEGER NOT NULL DEFAULT 0
->>>>>>> 60f2a78 (Auto-sync: file changes)
 );
 """
 
@@ -149,25 +135,15 @@ SCHEMA_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_pos_sym       ON positions(symbol);",
 ]
 
-<<<<<<< HEAD
-def _column_exists(table: str, col: str) -> bool:
-    c = _get_conn()
-    cur = c.execute(f"PRAGMA table_info({table})")
-    return any(str(r[1]).lower() == col.lower() for r in cur.fetchall())
-=======
 # ---------- migration helpers ----------
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 
 def _has_column(c: sqlite3.Connection, table: str, col: str) -> bool:
     cur = c.execute(f"PRAGMA table_info({table});")
-    return any(row[1] == col for row in cur.fetchall())
+    return any((row[1] or "").lower() == col.lower() for row in cur.fetchall())
 
 def _ensure_column(c: sqlite3.Connection, table: str, col: str, ddl_suffix: str) -> None:
     if not _has_column(c, table, col):
         c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl_suffix};")
->>>>>>> 60f2a78 (Auto-sync: file changes)
 
 def migrate() -> None:
     c = _get_conn()
@@ -176,36 +152,28 @@ def migrate() -> None:
         c.execute(SCHEMA_EXECUTIONS)
         c.execute(SCHEMA_POSITIONS)
         c.execute(SCHEMA_GUARD)
-        # add guard_state.updated_ts if missing
-        if not _column_exists("guard_state", "updated_ts"):
-            try:
-                c.execute("ALTER TABLE guard_state ADD COLUMN updated_ts INTEGER DEFAULT (CAST(strftime('%s','now') AS INTEGER)*1000)")
-            except Exception:
-                pass
+
         for ddl in SCHEMA_INDEXES:
             c.execute(ddl)
 
-        # Guard table incremental migrations for older DBs
+        # guard_state incremental migrations for older DBs
+        _ensure_column(c, "guard_state", "breach", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(c, "guard_state", "breaker_on", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(c, "guard_state", "breaker_reason", "TEXT DEFAULT ''")
+        _ensure_column(c, "guard_state", "attempts", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(c, "guard_state", "last_loss_ts", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(c, "guard_state", "updated_ts", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(c, "guard_state", "breach", "INTEGER NOT NULL DEFAULT 0")  # ensure legacy exists too
 
-        # Seed guard row if absent
+        # seed guard row if absent
         cur = c.execute("SELECT COUNT(*) FROM guard_state WHERE id=1")
         if (cur.fetchone() or [0])[0] == 0:
             now = _now_ms()
             c.execute(
-<<<<<<< HEAD
-                "INSERT INTO guard_state(id, session_start_ms, start_equity_usd, realized_pnl_usd, breach, updated_ts) VALUES (1, ?, 0.0, 0.0, 0, ?)",
-                (now, now),
-            )
-
-=======
                 """
                 INSERT INTO guard_state
-                (id, session_start_ms, start_equity_usd, realized_pnl_usd, breach, breaker_on, breaker_reason, updated_ts)
-                VALUES (1, ?, 0.0, 0.0, 0, 0, '', ?)
+                (id, session_start_ms, start_equity_usd, realized_pnl_usd,
+                 breach, breaker_on, breaker_reason, attempts, last_loss_ts, updated_ts)
+                VALUES (1, ?, 0.0, 0.0, 0, 0, '', 0, 0, ?)
                 """,
                 (now, now),
             )
@@ -213,7 +181,6 @@ def migrate() -> None:
 # Run migrations on import
 migrate()
 
->>>>>>> 60f2a78 (Auto-sync: file changes)
 # ---------- orders / executions ----------
 
 def insert_order(link_id: str, symbol: str, side: str, qty: float, price: Optional[float], tag: str, state: str = "NEW") -> None:
@@ -285,9 +252,8 @@ def list_orders(state: Optional[str] = None, limit: int = 100) -> List[Dict[str,
 
 def get_open_orders() -> List[Dict[str, Any]]:
     """
-    Compatibility helper for bots.reconciler expecting fields:
+    Compatibility helper for bots expecting fields:
       id (alias of link_id), symbol, state, tag
-    Only returns rows considered 'open' on our side.
     """
     c = _get_conn()
     cur = c.execute(
@@ -350,18 +316,15 @@ def guard_load() -> Dict[str, Any]:
     """
     Returns the single guard row as a dict. Keys:
     session_start_ms, start_equity_usd, realized_pnl_usd,
-    breach (legacy bool), breaker_on (bool), breaker_reason (str), updated_ts (ms)
+    breach (legacy bool), breaker_on (bool), breaker_reason (str),
+    attempts (int), last_loss_ts (epoch seconds), updated_ts (ms)
     """
     c = _get_conn()
-<<<<<<< HEAD
-    cur = c.execute("SELECT session_start_ms, start_equity_usd, realized_pnl_usd, breach, updated_ts FROM guard_state WHERE id=1")
-=======
     cur = c.execute("""
         SELECT session_start_ms, start_equity_usd, realized_pnl_usd,
-               breach, breaker_on, breaker_reason, updated_ts
+               breach, breaker_on, breaker_reason, attempts, last_loss_ts, updated_ts
           FROM guard_state WHERE id=1
     """)
->>>>>>> 60f2a78 (Auto-sync: file changes)
     row = cur.fetchone()
     if not row:
         migrate()
@@ -371,44 +334,26 @@ def guard_load() -> Dict[str, Any]:
         "start_equity_usd": float(row[1]),
         "realized_pnl_usd": float(row[2]),
         "breach": bool(row[3]),
-<<<<<<< HEAD
-        "updated_ts": int(row[4]) if row[4] is not None else 0,
-=======
         "breaker_on": bool(row[4]),
         "breaker_reason": (row[5] or ""),
-        "updated_ts": int(row[6]),
->>>>>>> 60f2a78 (Auto-sync: file changes)
+        "attempts": int(row[6]),
+        "last_loss_ts": int(row[7]),
+        "updated_ts": int(row[8]),
     }
 
 def _guard_touch(c: sqlite3.Connection) -> None:
     c.execute("UPDATE guard_state SET updated_ts=? WHERE id=1", (_now_ms(),))
 
 def guard_update_pnl(delta_usd: float) -> None:
-    ts = _now_ms()
     c = _get_conn()
     with c:
-        c.execute(
-<<<<<<< HEAD
-            "UPDATE guard_state SET realized_pnl_usd = realized_pnl_usd + ?, updated_ts=? WHERE id=1",
-            (float(delta_usd), ts),
-=======
-            "UPDATE guard_state SET realized_pnl_usd = realized_pnl_usd + ? WHERE id=1",
-            (float(delta_usd),),
->>>>>>> 60f2a78 (Auto-sync: file changes)
-        )
+        c.execute("UPDATE guard_state SET realized_pnl_usd = realized_pnl_usd + ? WHERE id=1", (float(delta_usd),))
         _guard_touch(c)
 
 def guard_reset_day(start_equity_usd: float = 0.0) -> None:
-<<<<<<< HEAD
-    ts = _now_ms()
-    c = _get_conn()
-    with c:
-        c.execute(
-            "UPDATE guard_state SET session_start_ms=?, start_equity_usd=?, realized_pnl_usd=0.0, breach=0, updated_ts=? WHERE id=1",
-            (ts, float(start_equity_usd), ts),
-=======
     """
-    Resets the day/session anchor. Clears legacy breach and current breaker flags.
+    Resets the day/session anchor. Clears legacy breach, breaker flags,
+    attempts counter, and cooldown timestamp.
     """
     c = _get_conn()
     now = _now_ms()
@@ -421,7 +366,9 @@ def guard_reset_day(start_equity_usd: float = 0.0) -> None:
                    realized_pnl_usd=0.0,
                    breach=0,
                    breaker_on=0,
-                   breaker_reason=''
+                   breaker_reason='',
+                   attempts=0,
+                   last_loss_ts=0
              WHERE id=1
             """,
             (now, float(start_equity_usd)),
@@ -438,6 +385,26 @@ def guard_set_breaker(active: bool, reason: str = "") -> None:
         c.execute(
             "UPDATE guard_state SET breaker_on=?, breaker_reason=?, breach=? WHERE id=1",
             (1 if active else 0, str(reason or ""), 1 if active else 0),
->>>>>>> 60f2a78 (Auto-sync: file changes)
         )
+        _guard_touch(c)
+
+def guard_update_attempts(delta: int = 1) -> None:
+    """
+    Increments the attempts counter used by LaunchGate for per-session budgets.
+    Positive or negative delta supported.
+    """
+    c = _get_conn()
+    with c:
+        c.execute("UPDATE guard_state SET attempts = MAX(0, attempts + ?) WHERE id=1", (int(delta),))
+        _guard_touch(c)
+
+def guard_mark_loss(now_ts: Optional[int] = None) -> None:
+    """
+    Records the time of last negative realized PnL, enabling LaunchGate cooldowns.
+    Provide epoch seconds in now_ts; defaults to current time if None.
+    """
+    ts = int(now_ts if now_ts is not None else time.time())
+    c = _get_conn()
+    with c:
+        c.execute("UPDATE guard_state SET last_loss_ts=? WHERE id=1", (ts,))
         _guard_touch(c)

@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Base44 — Auto Executor (merged v1)
-Breaker-aware, ownership-tagged, risk-sized; keeps your Bayesian nudge, feature logging,
-DB hooks, corr gate, and spread checks. Plays nice with TP/SL Manager and Portfolio Guard.
+Base44 — Auto Executor (merged v2, Phase-4 ready)
+- LaunchGate (canary.yaml): ALLOW_LIVE / SHADOW_ONLY / BLOCK
+- Breaker-aware, ownership-tagged, risk-sized
+- Feature logging, classifier, correlation gate, spread checks
+- DB hooks (orders/executions), Portfolio Guard risk pool
+- Shadow-trade recorder for AI setup memory
+- Session windows & risk buckets preserved
+- Attempts accounting hooks (optional)
 
 Signal source: signals/observed.jsonl (append-only)
 """
@@ -26,6 +31,18 @@ from core.feature_store import log_features
 from core.trade_classifier import classify as classify_trade
 from core.corr_gate import allow as corr_allow
 from core.sizing import bayesian_size, risk_capped_qty
+
+# Phase-4 Launch Gate (canary policy)
+try:
+    from core.launch_gate import LaunchGate, Decision
+    _gate_available = True
+except Exception:
+    _gate_available = False
+    LaunchGate = None  # type: ignore
+    class Decision:  # type: ignore
+        ALLOW_LIVE = "ALLOW_LIVE"
+        SHADOW_ONLY = "SHADOW_ONLY"
+        BLOCK = "BLOCK"
 
 # Preferred global guard
 try:
@@ -64,8 +81,11 @@ try:
     insert_order = getattr(_db_mod, "insert_order", None)
     set_order_state = getattr(_db_mod, "set_order_state", None)
     insert_execution = getattr(_db_mod, "insert_execution", None)
+    # Optional attempt accounting
+    guard_update_attempts = getattr(_db_mod, "guard_update_attempts", None)
 except Exception:
     insert_order = set_order_state = insert_execution = None
+    guard_update_attempts = None
 
 # Ownership tagging (prefer core.order_tag)
 def _owner_tag_build() -> str:
@@ -171,8 +191,9 @@ EX_MAX_GROSS_PCT = _get_env_float("EX_MAX_GROSS_PCT", 0.60)
 SEEN_FILE   = STATE_DIR / "executor_seen.json"      # orderLinkId registry
 OFFSET_FILE = STATE_DIR / "executor_offset.json"    # queue offset, for resilience
 REGIME_FILE = STATE_DIR / "regime_state.json"       # shared regime context
+SHADOW_FILE = STATE_DIR / "shadow_trades.jsonl"     # shadow-only audit for AI memory
 
-# Risk buckets + session windows config (new)
+# Risk buckets + session windows config (no news)
 EX_BUCKETS_JSON = os.getenv("EX_BUCKETS_JSON", "cfg/risk_buckets.json")
 EX_SESSIONS_JSON = os.getenv("EX_SESSIONS_JSON", "cfg/sessions.json")
 
@@ -335,8 +356,10 @@ def _qty_core(price: float, params: Dict) -> float:
       2) If params.stop_dist present → risk_capped sizing (uses remaining_risk_usd if available)
       3) Fallback to notional: EXEC_QTY_USDT / price
     Then scale by per-class risk_pct if provided (default 0.003).
+    Finally scale by optional size_multiplier (e.g., LaunchGate size_factor).
     """
     risk_pct = float(params.get("risk_pct") or 0.003)
+    size_mult = float(params.get("size_multiplier", 1.0))
     base_qty_usd = max(0.0, EXEC_QTY_USDT * (risk_pct / 0.003))
 
     if EXEC_QTY_BASE > 0:
@@ -361,7 +384,9 @@ def _qty_core(price: float, params: Dict) -> float:
     else:
         qty = base_qty_usd / max(price, 1e-9)
 
-    return max(0.0, qty)
+    qty = max(0.0, qty)
+    # Bayesian adjustment happens later; multiplier applies to final qty
+    return qty * max(0.0, size_mult)
 
 def _format_qty(qty: float) -> str:
     txt = f"{qty:.10f}".rstrip("0").rstrip(".")
@@ -457,6 +482,33 @@ def _save_entry_meta(link_id: str, symbol: str, side: str, setup_tag: Optional[s
         pass
 
 # ------------------------
+# Shadow-only recorder
+# ------------------------
+
+def _record_shadow_trade(link_id: str, symbol: str, side: str, params: Dict, features: Dict, reason: str) -> None:
+    """
+    Append a single-line JSON record for shadow decisions. Fuel for AI setup memory.
+    """
+    rec = {
+        "ts": int(time.time() * 1000),
+        "link": link_id,
+        "symbol": symbol,
+        "side": side,
+        "params": params,
+        "features": features,
+        "decision": "SHADOW_ONLY",
+        "reason": reason,
+        "account": (EXEC_ACCOUNT_UID or "MAIN"),
+        "owner_tag": OWNER_TAG,
+    }
+    try:
+        with open(SHADOW_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.warning("shadow write failed: %s", e)
+    log_event("executor", "shadow", symbol, EXEC_ACCOUNT_UID or "MAIN", {"reason": reason})
+
+# ------------------------
 # Placement
 # ------------------------
 
@@ -483,6 +535,7 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
     else:
         px = None  # market
 
+    # Base qty based on policy + multiplier (LaunchGate factor is already in params.size_multiplier)
     base_qty = _qty_core(price=px or mid, params=params)
     prior_p  = float(features.get("prior_win_p", PRIOR_WIN_P))
     edge_p   = float(features.get("edge_prob", EVIDENCE_WIN_P_FALLB))
@@ -491,7 +544,7 @@ def _place_entry(symbol: str, side: str, link_id: str, params: Dict, price_hint:
     qty_txt = _format_qty(qty_val)
     tif = "PostOnly" if (EXEC_POST_ONLY and maker_only and px is not None) else ("ImmediateOrCancel" if px is None else "GoodTillCancel")
 
-    # NEW: record entry meta for outcome watcher (setup tag + stop distance)
+    # Persist entry meta (setup tag + stop distance) for outcome watcher
     setup_tag = features.get("class") or params.get("tag") or "Unknown"
     stop_dist = None
     try:
@@ -579,6 +632,7 @@ def main() -> None:
 
     seen = _load_seen()
     pos = _read_offset()
+    gate = LaunchGate() if _gate_available else None
 
     while True:
         try:
@@ -670,6 +724,56 @@ def main() -> None:
                     log.warning("feature_store log failed: %s", e)
 
                 side = "Buy" if "LONG" in signal else "Sell"
+
+                # -----------------------
+                # Phase-4 decision: LaunchGate
+                # -----------------------
+                decision_action = Decision.ALLOW_LIVE
+                decision_reason = "gate_missing"
+                size_factor = 1.0
+                if gate is not None:
+                    # Map features for gate expectations
+                    meta = {
+                        "bias_adx":  float(features.get("bias_adx", features.get("adx_bias", 0) or 0)),
+                        "atr_pct":   float(features.get("atr_pct", features.get("atrp", 0) or 0)),
+                        "vol_zscore":float(features.get("vol_zscore", features.get("vol_z", 0) or 0)),
+                    }
+                    # Subaccount used by gate; default MAIN env if not set
+                    sub_uid = str(EXEC_ACCOUNT_UID or "MAIN")
+                    # calc_qty is fed roughly as notional-based qty to allow sizing cap logic in gate if needed
+                    calc_qty_hint = max(0.0, EXEC_QTY_USDT / 1.0)  # rough, price-agnostic
+                    dec = gate.decide(sub_uid, symbol, side, calc_qty_hint, meta)
+                    decision_action = dec.action
+                    decision_reason = dec.reason
+                    size_factor = float(getattr(dec, "size_factor", 1.0))
+
+                # Telemetry for the gate
+                tg_send(f"🚦 Gate • {symbol} • {side} • {decision_action} ({decision_reason})", priority="info")
+                log_event("executor", "launch_gate", symbol, EXEC_ACCOUNT_UID or "MAIN",
+                          {"action": decision_action, "reason": decision_reason, "size_factor": size_factor})
+
+                # Attempts accounting: count any pursued signal (live or shadow)
+                if callable(guard_update_attempts):
+                    try:
+                        guard_update_attempts(+1)  # type: ignore
+                    except Exception:
+                        pass
+
+                if decision_action == Decision.BLOCK:
+                    # Do nothing beyond logging
+                    seen[link_id] = int(time.time())
+                    _save_seen(seen)
+                    continue
+
+                if decision_action == Decision.SHADOW_ONLY:
+                    # Record the shadow trade and skip live placement
+                    _record_shadow_trade(link_id, symbol, side, params, features, decision_reason)
+                    seen[link_id] = int(time.time())
+                    _save_seen(seen)
+                    continue
+
+                # ALLOW_LIVE: apply size factor and place
+                params["size_multiplier"] = size_factor
 
                 ok, msg = _place_entry(symbol, side, link_id, params, hint_px, features)
                 seen[link_id] = int(time.time())
